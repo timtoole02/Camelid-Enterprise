@@ -1,0 +1,13 @@
+[package]
+name = "camelid-enterprise-engine-linux"
+description = "Linux engine backend: host capability detection; x86 AVX/VNNI and CUDA kernel ports land here."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "engine_linux"
+
+[dependencies]
+engine-core.workspace = true

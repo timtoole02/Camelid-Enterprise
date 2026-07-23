@@ -44,6 +44,25 @@ A replica declares its lane at startup and every response is attributable to it.
   `503` with `Retry-After`. There is no silent fallback to a faster, weaker
   execution mode.
 
+## Repository layout
+
+The engine port is organized so platform code never mixes:
+
+```
+crates/
+  engine-core/      platform-neutral: GGUF container parsing, shared types
+  engine-macos/     Apple Silicon backend (in progress — porting first)
+  engine-linux/     Linux backend (capability detection; kernels follow macOS)
+  engine-windows/   Windows backend (capability detection; kernels follow)
+  server/           the lane-attributed serving binary
+deploy/             Dockerfile and Kubernetes manifests (see deploy/README.md)
+```
+
+`engine-core` never inspects the host; anything keyed on detected hardware
+lives in exactly one platform crate, and the server links only the crate for
+the target OS. While the port proceeds, serving runs on the pinned upstream
+engine; ported modules take over subsystem by subsystem.
+
 ## Quickstart
 
 ```console

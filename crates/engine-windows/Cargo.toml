@@ -1,0 +1,13 @@
+[package]
+name = "camelid-enterprise-engine-windows"
+description = "Windows engine backend: host capability detection; kernel ports land here after macOS and Linux."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "engine_windows"
+
+[dependencies]
+engine-core.workspace = true

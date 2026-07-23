@@ -1,0 +1,13 @@
+[package]
+name = "camelid-enterprise-engine-macos"
+description = "macOS (Apple Silicon) engine backend: host capability detection; NEON kernel ports land here."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "engine_macos"
+
+[dependencies]
+engine-core.workspace = true

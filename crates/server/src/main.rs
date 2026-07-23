@@ -73,10 +73,17 @@ async fn serve(
         .into());
     }
     let config = lane::apply_deterministic().map_err(std::io::Error::other)?;
+    #[cfg(target_os = "macos")]
+    let host = engine_macos::probe();
+    #[cfg(target_os = "linux")]
+    let host = engine_linux::probe();
+    #[cfg(target_os = "windows")]
+    let host = engine_windows::probe();
     eprintln!(
-        "[lane] deterministic | engine pin {} | config vector sha256 {}",
+        "[lane] deterministic | engine pin {} | config vector sha256 {} | host {}",
         lane::ENGINE_PIN,
-        config.short()
+        config.short(),
+        host.summary()
     );
 
     let model = model.canonicalize()?;

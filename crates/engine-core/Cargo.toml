@@ -1,0 +1,16 @@
+[package]
+name = "camelid-enterprise-engine-core"
+description = "Platform-neutral engine core: GGUF container parsing, model configuration, and shared types."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "engine_core"
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,76 @@
+# Deterministic-lane replica pool for one model.
+#
+# The deterministic lane scales horizontally: each replica serves one model,
+# one generation at a time, so aggregate throughput is set by `replicas` and
+# per-tenant routing happens at the gateway/ingress above this Service.
+# Requests and limits are equal (Guaranteed QoS) on purpose — the lane's
+# behavior is scoped to a hardware class, so replicas should not float across
+# heterogeneous nodes or get throttled unpredictably. Pin node selection to
+# one instance type per pool.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: camelid-enterprise-deterministic
+  labels:
+    app: camelid-enterprise
+    lane: deterministic
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: camelid-enterprise
+      lane: deterministic
+  template:
+    metadata:
+      labels:
+        app: camelid-enterprise
+        lane: deterministic
+    spec:
+      # nodeSelector:
+      #   node.kubernetes.io/instance-type: <one instance type per pool>
+      containers:
+        - name: server
+          image: camelid-enterprise:0.1.0
+          args: ["--model", "/models/model.gguf", "--serving-receipts", "/receipts/serving.jsonl"]
+          env:
+            - name: CAMELID_ENTERPRISE_ADDR
+              value: "0.0.0.0:8181"
+          ports:
+            - containerPort: 8181
+              name: http
+          resources:
+            requests:
+              cpu: "8"
+              memory: 6Gi
+            limits:
+              cpu: "8"
+              memory: 6Gi
+          # Listening is not readiness: the model loads after bind, so probe
+          # for a non-empty model list before admitting traffic.
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "curl -sf http://127.0.0.1:8181/v1/models | grep -q '\"id\"'"]
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "curl -sf http://127.0.0.1:8181/v1/models | grep -q '\"id\"'"]
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            periodSeconds: 15
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: receipts
+              mountPath: /receipts
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: camelid-models
+            readOnly: true
+        - name: receipts
+          emptyDir: {}

@@ -265,12 +265,45 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "camelid",
+ "camelid-enterprise-engine-core",
+ "camelid-enterprise-engine-linux",
+ "camelid-enterprise-engine-macos",
+ "camelid-enterprise-engine-windows",
  "clap",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "camelid-enterprise-engine-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "camelid-enterprise-engine-linux"
+version = "0.1.0"
+dependencies = [
+ "camelid-enterprise-engine-core",
+]
+
+[[package]]
+name = "camelid-enterprise-engine-macos"
+version = "0.1.0"
+dependencies = [
+ "camelid-enterprise-engine-core",
+]
+
+[[package]]
+name = "camelid-enterprise-engine-windows"
+version = "0.1.0"
+dependencies = [
+ "camelid-enterprise-engine-core",
 ]
 
 [[package]]
