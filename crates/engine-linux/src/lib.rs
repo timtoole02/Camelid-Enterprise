@@ -7,6 +7,10 @@
 
 use engine_core::host::HostCapabilities;
 
+/// Detect this host's capabilities. The result participates in the replica's
+/// declared identity (startup banner, serving receipts): kernel routing keys
+/// on these features, so they are part of what a deterministic replica vouches
+/// for.
 pub fn probe() -> HostCapabilities {
     let mut simd: Vec<&'static str> = Vec::new();
     #[cfg(target_arch = "x86_64")]
@@ -31,6 +35,9 @@ pub fn probe() -> HostCapabilities {
         }
         if std::arch::is_aarch64_feature_detected!("i8mm") {
             simd.push("i8mm");
+        }
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            simd.push("dotprod");
         }
     }
     simd.sort_unstable();
