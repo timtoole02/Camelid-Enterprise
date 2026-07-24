@@ -79,11 +79,12 @@ async fn serve(
     let host = engine_linux::probe();
     #[cfg(target_os = "windows")]
     let host = engine_windows::probe();
+    let host_summary = host.summary();
     eprintln!(
         "[lane] deterministic | engine pin {} | config vector sha256 {} | host {}",
         lane::ENGINE_PIN,
         config.short(),
-        host.summary()
+        host_summary
     );
 
     let model = model.canonicalize()?;
@@ -93,6 +94,7 @@ async fn serve(
     let ctx = Attribution {
         lane: "deterministic",
         config_sha256: Arc::new(config.sha256),
+        host: Arc::new(host_summary),
         receipts: serving_receipts.map(Arc::new),
     };
     let router = camelid::api::router_with_state(state)

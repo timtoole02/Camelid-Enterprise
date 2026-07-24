@@ -1,5 +1,5 @@
 {
- "desc": "BASALT Phase 2 spot-check: blocks read straight out of the produced pilot-row NVFP4 GGUF (gemma-4-E4B-it-NVFP4-mm): t = index into tensors[], b = block index within that tensor (block = 64 elements, 36 wire bytes: d[4] UE4M3 scales then qs[32]); w = wire bytes base64; e = 64 expected f32 from the pin's dequantize_row_nvfp4 (concatenated lowercase %08x hex of IEEE-754 u32 bits, element order 0..63)",
+ "desc": "NVFP4 E4B spot-check: blocks read straight out of the produced pilot-row NVFP4 GGUF (gemma-4-E4B-it-NVFP4-mm): t = index into tensors[], b = block index within that tensor (block = 64 elements, 36 wire bytes: d[4] UE4M3 scales then qs[32]); w = wire bytes base64; e = 64 expected f32 from the pin's dequantize_row_nvfp4 (concatenated lowercase %08x hex of IEEE-754 u32 bits, element order 0..63)",
  "model": {
   "path": "<camelid>/models/gemma-4-E4B-it-NVFP4-mm.gguf",
   "sha256": "eb293344972e2b292a043b8e7649b9788dca915b034e5c2721cfc531cf9863d9",

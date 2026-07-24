@@ -1,7 +1,7 @@
 {
  "desc": "blocks read straight out of the NVFP4 GGUF: t = index into tensors[], b = block index within that tensor (block = 64 elements, 36 wire bytes: d[4] UE4M3 scales then qs[32]); w = wire bytes base64; e = 64 expected f32 from the pin's dequantize_row_nvfp4 (concatenated lowercase %08x hex of IEEE-754 u32 bits, element order 0..63)",
  "model": {
-  "path": "<camelid>/models/qwen3-0.6b-NVFP4-basalt-refusal.gguf",
+  "path": "<camelid>/models/qwen3-0.6b-NVFP4-refusal.gguf",
   "sha256": "7337b616141b2436f839b353fb40dc2f77023989316ea7d83624f4f45e2a9146",
   "gguf_version": 3,
   "alignment": 32,

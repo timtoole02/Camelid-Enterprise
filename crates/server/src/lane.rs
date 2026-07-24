@@ -50,8 +50,10 @@ const MUST_BE_UNSET: &[&str] = &[
 
 /// The applied, frozen configuration vector.
 pub struct ConfigVector {
-    /// SHA-256 over the canonical `KEY=VALUE` list (sorted), identifying this
-    /// exact vector in attribution headers and serving receipts.
+    /// SHA-256 over the canonical `KEY=VALUE` list **in declaration order**,
+    /// plus `engine_pin=<rev>`, identifying this exact vector in attribution
+    /// headers and serving receipts. Declaration order is load-bearing:
+    /// reordering `CANONICAL` changes the digest (see `compute_config_sha256`).
     pub sha256: String,
 }
 
@@ -84,6 +86,17 @@ pub fn apply_deterministic() -> Result<ConfigVector, String> {
         }
         std::env::set_var(key, value);
     }
+    Ok(ConfigVector {
+        sha256: compute_config_sha256(),
+    })
+}
+
+/// Compute the configuration-vector digest: SHA-256 over each `KEY=VALUE\n` of
+/// `CANONICAL` **in declaration order**, then `engine_pin=<ENGINE_PIN>`.
+/// Declaration order is part of the contract — reordering `CANONICAL` silently
+/// changes the published hash. Kept free of environment access so the digest can
+/// be pinned by a test without the fail-closed startup side effects.
+fn compute_config_sha256() -> String {
     let mut hasher = Sha256::new();
     for (key, value) in CANONICAL {
         hasher.update(key.as_bytes());
@@ -93,7 +106,45 @@ pub fn apply_deterministic() -> Result<ConfigVector, String> {
     }
     hasher.update(b"engine_pin=");
     hasher.update(ENGINE_PIN.as_bytes());
-    Ok(ConfigVector {
-        sha256: format!("{:x}", hasher.finalize()),
-    })
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the deterministic lane's configuration-vector digest. If this value
+    /// changes, the config vector changed: every replica's
+    /// `x-camelid-config-sha256` header and every serving receipt move with it,
+    /// and comparisons against any prior baseline (including cross-host) break.
+    /// Update this deliberately, never by accident.
+    #[test]
+    fn config_sha256_is_pinned() {
+        assert_eq!(
+            compute_config_sha256(),
+            "30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7",
+        );
+    }
+
+    /// The digest is over `CANONICAL` in DECLARATION order, not sorted order.
+    /// Guards against a well-meaning "sort the keys for stability" refactor,
+    /// which would silently republish a different hash under the same intent.
+    #[test]
+    fn config_sha256_is_declaration_order_not_sorted() {
+        let mut sorted = CANONICAL.to_vec();
+        sorted.sort();
+        let mut hasher = Sha256::new();
+        for (key, value) in &sorted {
+            hasher.update(key.as_bytes());
+            hasher.update(b"=");
+            hasher.update(value.as_bytes());
+            hasher.update(b"\n");
+        }
+        hasher.update(b"engine_pin=");
+        hasher.update(ENGINE_PIN.as_bytes());
+        let sorted_digest = format!("{:x}", hasher.finalize());
+        assert_ne!(compute_config_sha256(), sorted_digest);
+        // Documents the counterfactual: sorting yields this digest instead.
+        assert_eq!(&sorted_digest[..12], "42c63ead830c");
+    }
 }
