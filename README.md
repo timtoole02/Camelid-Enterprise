@@ -1,3 +1,10 @@
+> [!CAUTION]
+> **Work in progress — not ready for use.** This project is under active
+> development and is **not working end to end yet**. Do not try to install, build,
+> or deploy it expecting a functioning server. The commands and features below
+> describe the intended design and are not all implemented. Watch the repository
+> for a first release.
+
 <div align="center">
 
 # 🐪 Camelid Enterprise

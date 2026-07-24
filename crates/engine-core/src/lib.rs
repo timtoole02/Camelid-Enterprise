@@ -7,6 +7,7 @@
 //! hardware features lives in those crates, never here.
 
 pub mod error;
+pub mod forward;
 pub mod gguf;
 pub mod host;
 pub mod model;
