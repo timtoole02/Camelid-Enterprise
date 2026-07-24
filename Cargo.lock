@@ -272,7 +272,9 @@ dependencies = [
  "clap",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
