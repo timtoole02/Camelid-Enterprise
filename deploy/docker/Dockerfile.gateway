@@ -1,0 +1,20 @@
+# Multi-stage build of the transparent gateway.
+#
+# The gateway contains no model or application state. Configure exactly one
+# upstream origin at runtime: a replica on one box or a Kubernetes Service that
+# fronts an identical replica pool.
+
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release --bin camelid-enterprise-gateway
+
+FROM debian:bookworm-slim
+COPY --from=builder /build/target/release/camelid-enterprise-gateway /usr/local/bin/camelid-enterprise-gateway
+
+ENV CAMELID_GATEWAY_ADDR=0.0.0.0:8080
+EXPOSE 8080
+
+ENTRYPOINT ["camelid-enterprise-gateway", "serve"]
