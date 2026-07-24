@@ -13,6 +13,14 @@
 
 use super::blocks::{f16_bits_to_f32, f32_to_f16_bits, Q8_0Block, Q8_0_BLOCK_VALUES};
 
+/// A Q8_0 row-dot function: weight-row blocks against input-row blocks -> f32.
+///
+/// [`q8_0_dot_rows`] is the portable reference. A per-platform crate can supply
+/// an accelerated implementation with the identical result and pass it wherever
+/// the forward pass takes a `Q8DotRows`, so acceleration is chosen by the caller
+/// without `engine-core` ever depending on a platform crate.
+pub type Q8DotRows = fn(&[Q8_0Block], &[Q8_0Block]) -> f32;
+
 /// Quantize one chunk of exactly [`Q8_0_BLOCK_VALUES`] f32 values into a
 /// [`Q8_0Block`].
 ///

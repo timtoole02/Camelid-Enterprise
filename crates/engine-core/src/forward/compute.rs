@@ -12,7 +12,7 @@ use crate::forward::kv_cache::{LlamaKvCache, LlamaKvCachePlan};
 use crate::forward::rope::apply_rope;
 use crate::model::config::DenseLlamaDims;
 use crate::model::{LlamaModelConfig, LlamaLayerWeights, LlamaWeights};
-use crate::tensor::{dot_product, q8_0_dot_rows, quantize_q8_0_blocks, CpuTensor};
+use crate::tensor::{dot_product, q8_0_dot_rows, quantize_q8_0_blocks, CpuTensor, Q8DotRows};
 use crate::{EngineError, Result};
 
 /// A single row-major linear projection: `out[o] = dot(input, weight_row_o)`.
@@ -20,11 +20,11 @@ use crate::{EngineError, Result};
 /// `in_width` is taken from `input.len()`, so the projection is independent of
 /// whether the weight tensor's declared shape is `[in, out]` or `[out, in]` —
 /// the weight rows are always `in_width` elements each, row-major. Q8_0 weights
-/// quantize the input row once and dot it against every weight row through
-/// [`q8_0_dot_rows`]; that call is the single seam a platform crate can later
-/// replace with an accelerated kernel. Plain-f32 weights fall back to the
-/// portable [`dot_product`].
-fn linear_row(weight: &CpuTensor, input: &[f32]) -> Result<Vec<f32>> {
+/// quantize the input row once and dot it against every weight row through the
+/// supplied `q8_dot` — the single seam a platform crate accelerates by passing
+/// its own bit-identical kernel; [`q8_0_dot_rows`] is the portable default.
+/// Plain-f32 weights fall back to the portable [`dot_product`].
+fn linear_row(weight: &CpuTensor, input: &[f32], q8_dot: Q8DotRows) -> Result<Vec<f32>> {
     let in_width = input.len();
     if in_width == 0 {
         return Err(EngineError::ShapeMismatch(
@@ -50,7 +50,7 @@ fn linear_row(weight: &CpuTensor, input: &[f32]) -> Result<Vec<f32>> {
         let mut out = vec![0.0_f32; out_width];
         for (o, out_value) in out.iter_mut().enumerate() {
             let row = &blocks[o * blocks_per_row..(o + 1) * blocks_per_row];
-            *out_value = q8_0_dot_rows(row, &input_blocks);
+            *out_value = q8_dot(row, &input_blocks);
         }
         Ok(out)
     } else if !weight.data.is_empty() {
@@ -85,10 +85,25 @@ pub struct Decoder<'w> {
     dims: DenseLlamaDims,
     attention_head_count: usize,
     kv: LlamaKvCache,
+    q8_dot: Q8DotRows,
 }
 
 impl<'w> Decoder<'w> {
+    /// Build a decoder using the portable Q8_0 dot. Results are identical to
+    /// any [`Self::with_q8_dot`] kernel, since accelerated kernels are required
+    /// to be bit-identical to the portable reference.
     pub fn new(config: &'w LlamaModelConfig, weights: &'w LlamaWeights) -> Result<Self> {
+        Self::with_q8_dot(config, weights, q8_0_dot_rows)
+    }
+
+    /// Build a decoder with a caller-supplied Q8_0 dot kernel — the seam a
+    /// platform crate uses to accelerate the projections. The kernel must be
+    /// bit-identical to [`q8_0_dot_rows`]; only speed changes, never output.
+    pub fn with_q8_dot(
+        config: &'w LlamaModelConfig,
+        weights: &'w LlamaWeights,
+        q8_dot: Q8DotRows,
+    ) -> Result<Self> {
         let dims = DenseLlamaDims::from_config(config)?;
         let kv = LlamaKvCache::new(LlamaKvCachePlan::from_config(config)?)?;
         Ok(Self {
@@ -97,6 +112,7 @@ impl<'w> Decoder<'w> {
             dims,
             attention_head_count: config.attention_head_count as usize,
             kv,
+            q8_dot,
         })
     }
 
@@ -143,7 +159,7 @@ impl<'w> Decoder<'w> {
                 )?
             };
             let vocab = self.dims.vocab_size;
-            let data = linear_row(self.weights.output_projection(), &normed.data)?;
+            let data = linear_row(self.weights.output_projection(), &normed.data, self.q8_dot)?;
             Some(CpuTensor::from_f32("logits", vec![1, vocab], data)?)
         } else {
             None
@@ -204,9 +220,9 @@ impl<'w> Decoder<'w> {
         let attn_norm = hidden.rms_norm(&layer.attention_norm, eps, "attn_norm")?;
 
         // (2) Q/K/V projections.
-        let mut q = linear_row(&layer.attention_q, &attn_norm.data)?;
-        let mut k = linear_row(&layer.attention_k, &attn_norm.data)?;
-        let v = linear_row(&layer.attention_v, &attn_norm.data)?;
+        let mut q = linear_row(&layer.attention_q, &attn_norm.data, self.q8_dot)?;
+        let mut k = linear_row(&layer.attention_k, &attn_norm.data, self.q8_dot)?;
+        let v = linear_row(&layer.attention_v, &attn_norm.data, self.q8_dot)?;
 
         // Optional per-head QK RMS norm (Qwen3), applied BEFORE RoPE.
         if let (Some(q_norm), Some(k_norm)) = (&layer.attention_q_norm, &layer.attention_k_norm) {
@@ -249,7 +265,7 @@ impl<'w> Decoder<'w> {
         )?;
 
         // (6) Output projection and attention residual add.
-        let attn_out_data = linear_row(&layer.attention_output, &context)?;
+        let attn_out_data = linear_row(&layer.attention_output, &context, self.q8_dot)?;
         let attn_out = CpuTensor::from_f32("attn_out", vec![1, attn_out_data.len()], attn_out_data)?;
         let residual = hidden.add(&attn_out, "residual")?;
 
@@ -257,12 +273,12 @@ impl<'w> Decoder<'w> {
         let ffn_norm = residual.rms_norm(&layer.ffn_norm, eps, "ffn_norm")?;
 
         // (8) Dense SwiGLU FFN: gate/up (separate weights) -> silu(gate)*up -> down.
-        let gate = linear_row(&layer.ffn_gate, &ffn_norm.data)?;
-        let up = linear_row(&layer.ffn_up, &ffn_norm.data)?;
+        let gate = linear_row(&layer.ffn_gate, &ffn_norm.data, self.q8_dot)?;
+        let up = linear_row(&layer.ffn_up, &ffn_norm.data, self.q8_dot)?;
         let gate_tensor = CpuTensor::from_f32("gate", vec![1, gate.len()], gate)?;
         let up_tensor = CpuTensor::from_f32("up", vec![1, up.len()], up)?;
         let activated = gate_tensor.silu_mul(&up_tensor, "swiglu")?;
-        let ffn_out_data = linear_row(&layer.ffn_down, &activated.data)?;
+        let ffn_out_data = linear_row(&layer.ffn_down, &activated.data, self.q8_dot)?;
         let ffn_out = CpuTensor::from_f32("ffn_out", vec![1, ffn_out_data.len()], ffn_out_data)?;
 
         // (9) FFN residual add (base is the post-attention residual).
@@ -540,7 +556,7 @@ mod tests {
         .unwrap();
         let input: Vec<f32> = (0..32).map(|k| (k as f32 * 0.1) - 1.0).collect();
 
-        let out = linear_row(&weight, &input).unwrap();
+        let out = linear_row(&weight, &input, core_dot).unwrap();
         let input_blocks = core_quant(&input);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].to_bits(), core_dot(&blocks[0..1], &input_blocks).to_bits());
@@ -556,7 +572,7 @@ mod tests {
         )
         .unwrap();
         let input = [2.0_f32, 1.0, -4.0];
-        let out = linear_row(&weight, &input).unwrap();
+        let out = linear_row(&weight, &input, core_dot).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], dot_product(&weight.data[0..3], &input));
         assert_eq!(out[1], dot_product(&weight.data[3..6], &input));
