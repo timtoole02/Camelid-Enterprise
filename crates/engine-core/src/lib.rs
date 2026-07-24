@@ -9,6 +9,7 @@
 pub mod error;
 pub mod gguf;
 pub mod host;
+pub mod model;
 pub mod tensor;
 pub mod tokenizer;
 

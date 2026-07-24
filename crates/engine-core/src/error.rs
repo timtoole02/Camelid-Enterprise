@@ -33,6 +33,17 @@ pub enum EngineError {
     /// Distinct from InvalidTensorData: each tensor is internally fine, the
     /// combination requested of them is not.
     ShapeMismatch(String),
+    /// The GGUF declares a model architecture this engine does not implement,
+    /// or one whose declared form it refuses to run. Distinct from a container
+    /// violation: the file is well-formed, the model just is not one this
+    /// engine builds a forward pass for.
+    UnsupportedModelArchitecture(String),
+    /// Model configuration metadata is present but malformed or
+    /// self-inconsistent: a required scalar is missing, head counts do not
+    /// divide, or the vocabulary size cannot be established. Distinct from
+    /// InvalidGguf: the container framing is fine, the model-level metadata is
+    /// not usable.
+    InvalidModelMetadata(String),
     Io { path: PathBuf, source: std::io::Error },
 }
 
@@ -50,6 +61,10 @@ impl std::fmt::Display for EngineError {
             Self::TensorNotFound(name) => write!(f, "tensor not found: {name}"),
             Self::UnsupportedTensorType(msg) => write!(f, "unsupported tensor type: {msg}"),
             Self::ShapeMismatch(msg) => write!(f, "shape mismatch: {msg}"),
+            Self::UnsupportedModelArchitecture(msg) => {
+                write!(f, "unsupported model architecture: {msg}")
+            }
+            Self::InvalidModelMetadata(msg) => write!(f, "invalid model metadata: {msg}"),
             Self::Io { path, source } => write!(f, "io error on {}: {source}", path.display()),
         }
     }
