@@ -5,6 +5,7 @@ members = [
     "crates/engine-macos",
     "crates/engine-linux",
     "crates/engine-windows",
+    "crates/gateway",
     "crates/server",
 ]
 

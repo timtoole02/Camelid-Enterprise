@@ -78,9 +78,13 @@ cargo build --release --bin camelid-enterprise
 
 # Serve a local GGUF model
 ./target/release/camelid-enterprise serve --model /path/to/model.gguf
+
+# In another process, put the transparent gateway in front of the replica
+cargo run --release --bin camelid-enterprise-gateway -- serve \
+  --upstream http://127.0.0.1:8181
 ```
 
-The replica exposes the engine's OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, …) on `127.0.0.1:8181` by default.
+The replica exposes the engine's OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, …) on `127.0.0.1:8181` by default. With the gateway running, clients use `127.0.0.1:8080`; it preserves streaming bodies, status codes, and replica attribution without inspecting or retrying inference requests.
 
 ```bash
 curl http://127.0.0.1:8181/v1/chat/completions \
@@ -157,6 +161,7 @@ crates/
 ├── engine-macos/     Apple Silicon backend — NEON / dot-product kernels.
 ├── engine-linux/     Linux backend — x86 AVX/VNNI and CUDA (in progress).
 ├── engine-windows/   Windows backend (in progress).
+├── gateway/          Transparent streaming entry point in front of replicas.
 └── server/           The lane-attributed serving binary.
 deploy/               Dockerfile and Kubernetes manifests.
 ```

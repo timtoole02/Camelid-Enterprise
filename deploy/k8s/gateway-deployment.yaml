@@ -1,0 +1,50 @@
+# Transparent entry point in front of the deterministic replica Service.
+#
+# This release does not authenticate requests. Keep the gateway private until
+# the identity phase lands; do not expose this Deployment to an untrusted
+# network. Kubernetes performs replica-pool balancing through the upstream
+# Service, so the gateway itself owns no pool or health state.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: camelid-enterprise-gateway
+  labels:
+    app: camelid-enterprise-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: camelid-enterprise-gateway
+  template:
+    metadata:
+      labels:
+        app: camelid-enterprise-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: camelid-enterprise-gateway:0.1.0
+          env:
+            - name: CAMELID_GATEWAY_ADDR
+              value: "0.0.0.0:8080"
+            - name: CAMELID_GATEWAY_UPSTREAM
+              value: "http://camelid-enterprise-deterministic"
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            periodSeconds: 5
+          # Replica availability affects readiness, not gateway process health.
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 15
