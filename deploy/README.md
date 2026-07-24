@@ -20,10 +20,37 @@ opaque streaming request/response bodies, no retries, and no response rewriting.
 On Kubernetes, point it at the replica Service and let Kubernetes balance the
 identical pool. On one box, point it directly at the replica. Authentication and
 tenant-aware routing have not landed; keep both services on a trusted network.
+Only the OpenAI-compatible `/v1` inference surface is public through the gateway;
+replica `/api`, embedded WebUI, workspace, and model-lifecycle routes return 404.
+The gateway admits at most 256 concurrent request streams by default (including
+the full lifetime of streaming responses); set `CAMELID_GATEWAY_MAX_IN_FLIGHT`
+to tune that bound.
 
 When a replica's queue is full it returns `503` + `Retry-After`; treat that as
 the autoscaling signal (scale on queue-full rate or p95 latency, not CPU — a
 serialized replica at steady decode is *supposed* to sit near its CPU limit).
+
+## Gateway contract
+
+The gateway forwards only these replica routes:
+
+- `/v1/health`
+- `/v1/models` and `/v1/models/{model}`
+- `/v1/completions` and `/v1/chat/completions`
+- `/v1/embeddings`, `/v1/responses`, `/v1/messages`, `/v1/rerank`, and
+  `/v1/reranking` (compatibility responses are owned by the pinned engine)
+
+Everything else returns `404` at the gateway without contacting the replica.
+In particular, `/api/*`, legacy `/models/*`, workspace routes, and the embedded
+WebUI are replica-local and never public client paths.
+
+Request and response bodies remain streaming and opaque. The gateway removes
+HTTP hop-by-hop headers and strips client-supplied `Forwarded`, `X-Forwarded-*`,
+and `X-Real-IP` values because this release does not yet establish trusted
+client identity. It does not retry requests. The upstream connection pool keeps
+at most 32 idle connections for 30 seconds, and the configurable concurrency
+limit is held until a streaming response completes or disconnects. Saturation
+returns a typed `503` with `Retry-After: 1`.
 
 ## Docker
 
@@ -49,7 +76,8 @@ the binaries directly.
 
 ```console
 $ kubectl apply -f deploy/k8s/deployment.yaml -f deploy/k8s/service.yaml \
-  -f deploy/k8s/gateway-deployment.yaml -f deploy/k8s/gateway-service.yaml
+  -f deploy/k8s/gateway-deployment.yaml -f deploy/k8s/gateway-service.yaml \
+  -f deploy/k8s/replica-network-policy.yaml
 ```
 
 Adjust before applying:
@@ -67,3 +95,12 @@ Adjust before applying:
 - **Gateway probes** — readiness traverses the gateway to `/v1/models`, so it
   reflects replica availability. Liveness is TCP-only, so an unavailable model
   pool does not cause a gateway restart loop.
+- **NetworkPolicy enforcement** — the replica ingress policy permits port 8181
+  only from gateway-labeled pods in the same namespace (plus node traffic that
+  Kubernetes always allows for probes). The cluster CNI **must** enforce
+  `networking.k8s.io/v1` NetworkPolicy; otherwise applying the resource has no
+  filtering effect. Validate enforcement before treating the gateway as a
+  security boundary.
+- **Immutable application image** — the example uses the release tag for
+  readability. Production automation must replace it with the published image
+  digest (`image@sha256:...`) so a rollout cannot change bytes under one tag.

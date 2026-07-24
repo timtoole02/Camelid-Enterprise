@@ -4,17 +4,18 @@
 # upstream origin at runtime: a replica on one box or a Kubernetes Service that
 # fronts an identical replica pool.
 
-FROM rust:1-bookworm AS builder
+FROM rust:1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --release --bin camelid-enterprise-gateway
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 COPY --from=builder /build/target/release/camelid-enterprise-gateway /usr/local/bin/camelid-enterprise-gateway
 
 ENV CAMELID_GATEWAY_ADDR=0.0.0.0:8080
 EXPOSE 8080
 
+USER 65532:65532
 ENTRYPOINT ["camelid-enterprise-gateway", "serve"]

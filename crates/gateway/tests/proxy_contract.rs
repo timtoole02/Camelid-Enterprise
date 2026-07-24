@@ -4,7 +4,9 @@ use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use axum::{routing::any, Router};
 use bytes::Bytes;
-use camelid_enterprise_gateway::{router as gateway_router, UpstreamOrigin};
+use camelid_enterprise_gateway::{
+    router as gateway_router, router_with_max_in_flight, UpstreamOrigin,
+};
 use futures_util::stream;
 use http_body_util::BodyExt;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -12,7 +14,10 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -53,6 +58,7 @@ struct CapturedRequest {
     path_and_query: String,
     host: String,
     client_header: String,
+    forwarded_header_present: bool,
     body: Bytes,
 }
 
@@ -67,12 +73,23 @@ async fn capture_request(
         .to_str()
         .unwrap()
         .to_string();
+    let forwarded_header_present = [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-forwarded-proto",
+        "x-real-ip",
+    ]
+    .iter()
+    .any(|name| request.headers().contains_key(*name));
     let body = to_bytes(request.into_body(), 1024).await.unwrap();
     *captured.lock().unwrap() = Some(CapturedRequest {
         method,
         path_and_query,
         host,
         client_header,
+        forwarded_header_present,
         body,
     });
 
@@ -114,6 +131,12 @@ async fn preserves_request_and_replica_response_contract() {
         .header("host", "public-gateway.example")
         .header("content-type", "application/json")
         .header("x-client-test", "preserve-me")
+        .header("forwarded", "for=203.0.113.10;proto=https")
+        .header("x-forwarded-for", "203.0.113.10")
+        .header("x-forwarded-host", "spoofed.example")
+        .header("x-forwarded-port", "443")
+        .header("x-forwarded-proto", "https")
+        .header("x-real-ip", "203.0.113.10")
         .body(Body::from(request_body))
         .unwrap();
 
@@ -154,6 +177,7 @@ async fn preserves_request_and_replica_response_contract() {
     );
     assert_eq!(captured.host, upstream.addr.to_string());
     assert_eq!(captured.client_header, "preserve-me");
+    assert!(!captured.forwarded_header_present);
     assert_eq!(captured.body, request_body);
 }
 
@@ -226,6 +250,66 @@ async fn streams_replica_response_before_it_finishes() {
     assert_eq!(second, "data: second\n\n");
 }
 
+struct DisconnectAwareStream {
+    first_sent: bool,
+    dropped: Arc<Notify>,
+}
+
+impl futures_util::Stream for DisconnectAwareStream {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.first_sent {
+            Poll::Pending
+        } else {
+            self.first_sent = true;
+            Poll::Ready(Some(Ok(Bytes::from_static(b"data: first\n\n"))))
+        }
+    }
+}
+
+impl Drop for DisconnectAwareStream {
+    fn drop(&mut self) {
+        self.dropped.notify_one();
+    }
+}
+
+async fn disconnect_aware_sse(State(dropped): State<Arc<Notify>>) -> Response {
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(DisconnectAwareStream {
+            first_sent: false,
+            dropped,
+        }))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn client_disconnect_cancels_the_upstream_response_stream() {
+    let upstream_dropped = Arc::new(Notify::new());
+    let upstream = spawn_server(
+        Router::new()
+            .route("/v1/chat/completions", any(disconnect_aware_sse))
+            .with_state(Arc::clone(&upstream_dropped)),
+    )
+    .await;
+    let gateway = spawn_gateway(upstream.addr).await;
+    let request = Request::get(format!("http://{}/v1/chat/completions", gateway.addr))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = client().request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(first, "data: first\n\n");
+    drop(body);
+
+    tokio::time::timeout(Duration::from_secs(1), upstream_dropped.notified())
+        .await
+        .expect("dropping the client response must cancel the upstream stream");
+}
+
 #[derive(Clone)]
 struct RequestStreamState {
     first_chunk_seen: Arc<Notify>,
@@ -249,7 +333,7 @@ async fn streams_client_request_before_it_finishes() {
     let release_second = Arc::new(Notify::new());
     let upstream = spawn_server(
         Router::new()
-            .route("/upload", any(consume_streamed_request))
+            .route("/v1/chat/completions", any(consume_streamed_request))
             .with_state(RequestStreamState {
                 first_chunk_seen: Arc::clone(&first_chunk_seen),
             }),
@@ -275,7 +359,7 @@ async fn streams_client_request_before_it_finishes() {
             }
         },
     );
-    let request = Request::post(format!("http://{}/upload", gateway.addr))
+    let request = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
         .body(Body::from_stream(chunks))
         .unwrap();
     let response_task = tokio::spawn(client().request(request));
@@ -311,4 +395,90 @@ async fn returns_typed_bad_gateway_only_for_gateway_failure() {
         to_bytes(response.into_body(), 1024).await.unwrap(),
         r#"{"error":{"message":"upstream replica is unavailable","type":"gateway_error"}}"#
     );
+}
+
+#[tokio::test]
+async fn rejects_non_inference_routes_without_contacting_upstream() {
+    let upstream_calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(Router::new().fallback(any({
+        let upstream_calls = Arc::clone(&upstream_calls);
+        move || {
+            let upstream_calls = Arc::clone(&upstream_calls);
+            async move {
+                upstream_calls.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        }
+    })))
+    .await;
+    let app = gateway_router(UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap());
+
+    for path in [
+        "/api/models/unload",
+        "/api/models/load",
+        "/api/runtime/gpu",
+        "/api/agent/workspace/browse",
+        "/models/unload",
+        "/",
+        "/unknown",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::post(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "path: {path}");
+    }
+
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn concurrency_limit_is_held_for_the_full_response_stream() {
+    let release = Arc::new(Notify::new());
+    let upstream = spawn_server(
+        Router::new()
+            .route("/v1/chat/completions", any(delayed_sse))
+            .with_state(Arc::clone(&release)),
+    )
+    .await;
+    let app = router_with_max_in_flight(
+        UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap(),
+        1,
+    );
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/chat/completions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let rejected = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/chat/completions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(rejected.headers()["retry-after"], "1");
+
+    drop(first);
+    let admitted = app
+        .oneshot(
+            Request::get("/v1/chat/completions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admitted.status(), StatusCode::OK);
+    release.notify_waiters();
 }

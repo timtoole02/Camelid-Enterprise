@@ -10,14 +10,24 @@ use axum::http::header::{CONNECTION, CONTENT_TYPE, HOST};
 use axum::http::uri::{Authority, Scheme};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use axum::routing::any;
 use axum::{Json, Router};
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
+use pin_project_lite::pin_project;
 use std::fmt;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_IDLE_PER_HOST: usize = 32;
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct UpstreamOrigin {
@@ -75,21 +85,56 @@ impl UpstreamOrigin {
 struct GatewayState {
     upstream: UpstreamOrigin,
     client: Client<HttpConnector, Body>,
+    admission: Arc<Semaphore>,
 }
 
 pub fn router(upstream: UpstreamOrigin) -> Router {
+    router_with_max_in_flight(upstream, DEFAULT_MAX_IN_FLIGHT)
+}
+
+pub fn router_with_max_in_flight(upstream: UpstreamOrigin, max_in_flight: usize) -> Router {
+    assert!(max_in_flight > 0, "max_in_flight must be greater than zero");
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
     connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
     let mut client_builder = Client::builder(TokioExecutor::new());
     client_builder.retry_canceled_requests(false);
+    client_builder.pool_timer(TokioTimer::new());
+    client_builder.pool_idle_timeout(POOL_IDLE_TIMEOUT);
+    client_builder.pool_max_idle_per_host(MAX_IDLE_PER_HOST);
     let client = client_builder.build(connector);
     Router::new()
-        .fallback(proxy)
-        .with_state(GatewayState { upstream, client })
+        .route("/v1/health", any(proxy))
+        .route("/v1/models", any(proxy))
+        .route("/v1/models/:model", any(proxy))
+        .route("/v1/completions", any(proxy))
+        .route("/v1/chat/completions", any(proxy))
+        .route("/v1/embeddings", any(proxy))
+        .route("/v1/responses", any(proxy))
+        .route("/v1/messages", any(proxy))
+        .route("/v1/rerank", any(proxy))
+        .route("/v1/reranking", any(proxy))
+        .with_state(GatewayState {
+            upstream,
+            client,
+            admission: Arc::new(Semaphore::new(max_in_flight)),
+        })
 }
 
 async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Response {
+    let permit = match Arc::clone(&state.admission).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let mut response = gateway_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "gateway concurrency limit reached",
+            );
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("1"));
+            return response;
+        }
+    };
     let upstream_uri = match state.upstream.request_uri(request.uri()) {
         Ok(uri) => uri,
         Err(error) => {
@@ -103,6 +148,7 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
 
     *request.uri_mut() = upstream_uri;
     remove_hop_by_hop(request.headers_mut());
+    remove_untrusted_forwarding_headers(request.headers_mut());
     let host = HeaderValue::from_str(state.upstream.authority.as_str())
         .expect("a valid URI authority is a valid Host header");
     request.headers_mut().insert(HOST, host);
@@ -111,12 +157,53 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
             remove_hop_by_hop(&mut parts.headers);
-            Response::from_parts(parts, Body::new(body))
+            let body = Body::new(body);
+            Response::from_parts(parts, Body::new(PermitBody::new(body, permit)))
         }
         Err(error) => {
             tracing::warn!(%error, "upstream replica request failed");
             gateway_error(StatusCode::BAD_GATEWAY, "upstream replica is unavailable")
         }
+    }
+}
+
+pin_project! {
+    struct PermitBody<B> {
+        #[pin]
+        inner: B,
+        _permit: OwnedSemaphorePermit,
+    }
+}
+
+impl<B> PermitBody<B> {
+    fn new(inner: B, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            inner,
+            _permit: permit,
+        }
+    }
+}
+
+impl<B> HttpBody for PermitBody<B>
+where
+    B: HttpBody,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.project().inner.poll_frame(context)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -158,6 +245,19 @@ fn remove_hop_by_hop(headers: &mut HeaderMap) {
         "trailer",
         "transfer-encoding",
         "upgrade",
+    ] {
+        headers.remove(name);
+    }
+}
+
+fn remove_untrusted_forwarding_headers(headers: &mut HeaderMap) {
+    for name in [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-forwarded-proto",
+        "x-real-ip",
     ] {
         headers.remove(name);
     }
