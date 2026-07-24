@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest    # exercises engine-linux (x86_64)
+          - os: macos-latest     # exercises engine-macos (aarch64)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Dev-profile tests: logic and format parity are profile-independent,
+      # and the fat-LTO release profile is too slow for per-push CI.
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace -- -D warnings
+        continue-on-error: true # informational until the port stabilizes
