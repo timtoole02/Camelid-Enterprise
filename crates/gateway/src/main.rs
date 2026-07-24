@@ -3,6 +3,7 @@ use camelid_enterprise_gateway::{
 };
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 
 #[derive(Parser)]
 #[command(name = "camelid-enterprise-gateway", version, about)]
@@ -25,10 +26,9 @@ enum Command {
         #[arg(
             long,
             default_value_t = DEFAULT_MAX_IN_FLIGHT,
-            value_parser = parse_positive_usize,
             env = "CAMELID_GATEWAY_MAX_IN_FLIGHT"
         )]
-        max_in_flight: usize,
+        max_in_flight: NonZeroUsize,
     },
 }
 
@@ -47,22 +47,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn parse_positive_usize(value: &str) -> Result<usize, String> {
-    value
-        .parse::<usize>()
-        .ok()
-        .filter(|parsed| *parsed > 0)
-        .ok_or_else(|| "value must be a positive integer".to_string())
-}
-
 async fn serve(
     upstream: &str,
     addr: SocketAddr,
-    max_in_flight: usize,
+    max_in_flight: NonZeroUsize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream = UpstreamOrigin::parse(upstream)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, max_in_flight, "gateway listening");
+    tracing::info!(%addr, max_in_flight = max_in_flight.get(), "gateway listening");
     axum::serve(listener, router_with_max_in_flight(upstream, max_in_flight))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -90,5 +82,36 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_in_flight_must_be_nonzero() {
+        let result = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+            "--max-in-flight",
+            "0",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn max_in_flight_uses_the_pinned_default() {
+        let cli = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+        ])
+        .unwrap();
+        let Command::Serve { max_in_flight, .. } = cli.command;
+        assert_eq!(max_in_flight, DEFAULT_MAX_IN_FLIGHT);
     }
 }

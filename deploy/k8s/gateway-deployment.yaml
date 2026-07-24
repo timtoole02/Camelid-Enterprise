@@ -20,6 +20,9 @@ spec:
       labels:
         app: camelid-enterprise-gateway
     spec:
+      # Axum drains active streaming responses on SIGTERM. Give long model
+      # generations time to finish before kubelet sends SIGKILL.
+      terminationGracePeriodSeconds: 300
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -54,11 +57,11 @@ spec:
               memory: 256Mi
           readinessProbe:
             httpGet:
-              path: /v1/models
+              path: /healthz
               port: http
             periodSeconds: 5
-          # Replica availability affects readiness, not gateway process health.
           livenessProbe:
-            tcpSocket:
+            httpGet:
+              path: /healthz
               port: http
             periodSeconds: 15

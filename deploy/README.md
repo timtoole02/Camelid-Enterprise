@@ -43,6 +43,12 @@ The gateway forwards only these replica routes:
 Everything else returns `404` at the gateway without contacting the replica.
 In particular, `/api/*`, legacy `/models/*`, workspace routes, and the embedded
 WebUI are replica-local and never public client paths.
+`GET /healthz` is gateway-local and returns `204`; Kubernetes uses it for both
+readiness and liveness so replica saturation or temporary unavailability does
+not remove otherwise healthy gateway endpoints and amplify an outage.
+All gateway responses include permissive CORS visibility headers, matching the
+pinned replica API, so browser clients can inspect typed gateway `502`/`503`
+errors and route-level `404`/`405` failures. No credentials are enabled.
 
 Request and response bodies remain streaming and opaque. The gateway removes
 HTTP hop-by-hop headers and strips client-supplied `Forwarded`, `X-Forwarded-*`,
@@ -92,15 +98,23 @@ Adjust before applying:
 - **Gateway exposure** — `camelid-enterprise-gateway` is a `ClusterIP` Service.
   Keep it private in this unauthenticated release. Add an Ingress or external
   load balancer only after an access-control layer is in place.
-- **Gateway probes** — readiness traverses the gateway to `/v1/models`, so it
-  reflects replica availability. Liveness is TCP-only, so an unavailable model
-  pool does not cause a gateway restart loop.
+- **Gateway probes** — readiness and liveness use the local `/healthz` endpoint.
+  Replica availability is represented by the replica Deployment's own readiness
+  and by typed gateway `502` responses, not by removing healthy gateway pods.
+- **Shutdown drain** — both gateway and replica stop accepting connections on
+  SIGTERM and drain active streams. The examples grant 300 seconds before
+  kubelet may send SIGKILL; keep the replica window at least as long as the
+  gateway window, and size both above the longest permitted generation.
 - **NetworkPolicy enforcement** — the replica ingress policy permits port 8181
   only from gateway-labeled pods in the same namespace (plus node traffic that
   Kubernetes always allows for probes). The cluster CNI **must** enforce
   `networking.k8s.io/v1` NetworkPolicy; otherwise applying the resource has no
-  filtering effect. Validate enforcement before treating the gateway as a
-  security boundary.
+  filtering effect. Pod labels are selectors, not workload identity: namespace
+  RBAC must prevent untrusted principals from creating or relabeling pods as
+  `app=camelid-enterprise-gateway`. NetworkPolicy also cannot block access from
+  the node itself and may treat `hostNetwork` workloads as node traffic. Validate
+  CNI enforcement, namespace RBAC, and host access before treating the gateway
+  as a security boundary.
 - **Immutable application image** — the example uses the release tag for
   readability. Production automation must replace it with the published image
   digest (`image@sha256:...`) so a rollout cannot change bytes under one tag.

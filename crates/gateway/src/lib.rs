@@ -6,11 +6,14 @@
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::{CONNECTION, CONTENT_TYPE, HOST};
+use axum::http::header::{
+    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, CONNECTION, CONTENT_TYPE, HOST,
+};
 use axum::http::uri::{Authority, Scheme};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::any;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -18,6 +21,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use pin_project_lite::pin_project;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -27,7 +31,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IDLE_PER_HOST: usize = 32;
-pub const DEFAULT_MAX_IN_FLIGHT: usize = 256;
+pub const DEFAULT_MAX_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 
 #[derive(Clone, Debug)]
 pub struct UpstreamOrigin {
@@ -92,8 +96,7 @@ pub fn router(upstream: UpstreamOrigin) -> Router {
     router_with_max_in_flight(upstream, DEFAULT_MAX_IN_FLIGHT)
 }
 
-pub fn router_with_max_in_flight(upstream: UpstreamOrigin, max_in_flight: usize) -> Router {
-    assert!(max_in_flight > 0, "max_in_flight must be greater than zero");
+pub fn router_with_max_in_flight(upstream: UpstreamOrigin, max_in_flight: NonZeroUsize) -> Router {
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
     connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
@@ -104,21 +107,38 @@ pub fn router_with_max_in_flight(upstream: UpstreamOrigin, max_in_flight: usize)
     client_builder.pool_max_idle_per_host(MAX_IDLE_PER_HOST);
     let client = client_builder.build(connector);
     Router::new()
-        .route("/v1/health", any(proxy))
-        .route("/v1/models", any(proxy))
-        .route("/v1/models/:model", any(proxy))
-        .route("/v1/completions", any(proxy))
-        .route("/v1/chat/completions", any(proxy))
-        .route("/v1/embeddings", any(proxy))
-        .route("/v1/responses", any(proxy))
-        .route("/v1/messages", any(proxy))
-        .route("/v1/rerank", any(proxy))
-        .route("/v1/reranking", any(proxy))
+        .route("/healthz", get(gateway_health))
+        .route("/v1/health", get(proxy).options(proxy))
+        .route("/v1/models", get(proxy).options(proxy))
+        .route("/v1/models/:model", get(proxy).options(proxy))
+        .route("/v1/completions", post(proxy).options(proxy))
+        .route("/v1/chat/completions", post(proxy).options(proxy))
+        .route("/v1/embeddings", post(proxy).options(proxy))
+        .route("/v1/responses", post(proxy).options(proxy))
+        .route("/v1/messages", post(proxy).options(proxy))
+        .route("/v1/rerank", post(proxy).options(proxy))
+        .route("/v1/reranking", post(proxy).options(proxy))
+        .layer(middleware::from_fn(add_cors_response_headers))
         .with_state(GatewayState {
             upstream,
             client,
-            admission: Arc::new(Semaphore::new(max_in_flight)),
+            admission: Arc::new(Semaphore::new(max_in_flight.get())),
         })
+}
+
+async fn gateway_health() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+async fn add_cors_response_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    response
+        .headers_mut()
+        .insert(ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("*"));
+    response
 }
 
 async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Response {
@@ -171,16 +191,17 @@ pin_project! {
     struct PermitBody<B> {
         #[pin]
         inner: B,
-        _permit: OwnedSemaphorePermit,
+        permit: Option<OwnedSemaphorePermit>,
     }
 }
 
 impl<B> PermitBody<B> {
-    fn new(inner: B, permit: OwnedSemaphorePermit) -> Self {
-        Self {
-            inner,
-            _permit: permit,
-        }
+    fn new(inner: B, permit: OwnedSemaphorePermit) -> Self
+    where
+        B: HttpBody,
+    {
+        let permit = (!inner.is_end_stream()).then_some(permit);
+        Self { inner, permit }
     }
 }
 
@@ -195,7 +216,14 @@ where
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.project().inner.poll_frame(context)
+        let mut this = self.project();
+        let poll = this.inner.as_mut().poll_frame(context);
+        if matches!(&poll, Poll::Ready(None) | Poll::Ready(Some(Err(_))))
+            || this.inner.as_ref().is_end_stream()
+        {
+            this.permit.take();
+        }
+        poll
     }
 
     fn is_end_stream(&self) -> bool {

@@ -2,7 +2,8 @@ use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
-use axum::{routing::any, Router};
+use axum::routing::{any, post};
+use axum::Router;
 use bytes::Bytes;
 use camelid_enterprise_gateway::{
     router as gateway_router, router_with_max_in_flight, UpstreamOrigin,
@@ -14,11 +15,13 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::sync::oneshot;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tower::ServiceExt;
@@ -215,7 +218,7 @@ async fn streams_replica_response_before_it_finishes() {
     )
     .await;
     let gateway = spawn_gateway(upstream.addr).await;
-    let request = Request::get(format!("http://{}/v1/chat/completions", gateway.addr))
+    let request = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
         .body(Body::empty())
         .unwrap();
 
@@ -294,7 +297,7 @@ async fn client_disconnect_cancels_the_upstream_response_stream() {
     )
     .await;
     let gateway = spawn_gateway(upstream.addr).await;
-    let request = Request::get(format!("http://{}/v1/chat/completions", gateway.addr))
+    let request = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
         .body(Body::empty())
         .unwrap();
 
@@ -390,6 +393,8 @@ async fn returns_typed_bad_gateway_only_for_gateway_failure() {
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(response.headers()["content-type"], "application/json");
+    assert_eq!(response.headers()["access-control-allow-origin"], "*");
+    assert_eq!(response.headers()["access-control-expose-headers"], "*");
     assert!(!response.headers().contains_key("x-camelid-lane"));
     assert_eq!(
         to_bytes(response.into_body(), 1024).await.unwrap(),
@@ -419,6 +424,9 @@ async fn rejects_non_inference_routes_without_contacting_upstream() {
         "/api/runtime/gpu",
         "/api/agent/workspace/browse",
         "/models/unload",
+        "/v1%2fmodels",
+        "/v1/%2e%2e/api/models/unload",
+        "/v1/models%2f..%2f..%2fapi%2fmodels%2funload",
         "/",
         "/unknown",
     ] {
@@ -428,9 +436,111 @@ async fn rejects_non_inference_routes_without_contacting_upstream() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "path: {path}");
+        assert_eq!(response.headers()["access-control-allow-origin"], "*");
     }
 
     assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn rejects_wrong_methods_without_contacting_upstream() {
+    let upstream_calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(Router::new().fallback(any({
+        let upstream_calls = Arc::clone(&upstream_calls);
+        move || {
+            let upstream_calls = Arc::clone(&upstream_calls);
+            async move {
+                upstream_calls.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        }
+    })))
+    .await;
+    let app = gateway_router(UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap());
+
+    for (method, path) in [
+        (Method::POST, "/v1/models"),
+        (Method::DELETE, "/v1/models/model"),
+        (Method::GET, "/v1/completions"),
+        (Method::PATCH, "/v1/chat/completions"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "path: {path}"
+        );
+        assert_eq!(response.headers()["access-control-allow-origin"], "*");
+    }
+
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn forwards_head_and_cors_preflight_on_allowed_routes() {
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_server(Router::new().fallback(any({
+        let methods = Arc::clone(&methods);
+        move |request: Request| {
+            let methods = Arc::clone(&methods);
+            async move {
+                methods.lock().unwrap().push(request.method().clone());
+                StatusCode::NO_CONTENT
+            }
+        }
+    })))
+    .await;
+    let app = gateway_router(UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap());
+
+    for (method, path) in [
+        (Method::HEAD, "/v1/models"),
+        (Method::OPTIONS, "/v1/chat/completions"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    assert_eq!(*methods.lock().unwrap(), [Method::HEAD, Method::OPTIONS]);
+}
+
+#[tokio::test]
+async fn local_health_does_not_contact_upstream_or_consume_admission() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable = listener.local_addr().unwrap();
+    drop(listener);
+    let app = router_with_max_in_flight(
+        UpstreamOrigin::parse(&format!("http://{unavailable}")).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+    );
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
 }
 
 #[tokio::test]
@@ -444,13 +554,13 @@ async fn concurrency_limit_is_held_for_the_full_response_stream() {
     .await;
     let app = router_with_max_in_flight(
         UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap(),
-        1,
+        NonZeroUsize::new(1).unwrap(),
     );
 
     let first = app
         .clone()
         .oneshot(
-            Request::get("/v1/chat/completions")
+            Request::post("/v1/chat/completions")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -461,7 +571,7 @@ async fn concurrency_limit_is_held_for_the_full_response_stream() {
     let rejected = app
         .clone()
         .oneshot(
-            Request::get("/v1/chat/completions")
+            Request::post("/v1/chat/completions")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -469,11 +579,12 @@ async fn concurrency_limit_is_held_for_the_full_response_stream() {
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(rejected.headers()["retry-after"], "1");
+    assert_eq!(rejected.headers()["access-control-allow-origin"], "*");
 
     drop(first);
     let admitted = app
         .oneshot(
-            Request::get("/v1/chat/completions")
+            Request::post("/v1/chat/completions")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -481,4 +592,119 @@ async fn concurrency_limit_is_held_for_the_full_response_stream() {
         .unwrap();
     assert_eq!(admitted.status(), StatusCode::OK);
     release.notify_waiters();
+}
+
+#[tokio::test]
+async fn concurrency_limit_is_released_at_response_eof_before_body_drop() {
+    let upstream =
+        spawn_server(Router::new().route("/v1/chat/completions", post(|| async { "complete" })))
+            .await;
+    let app = router_with_max_in_flight(
+        UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+    );
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut completed_body = first.into_body();
+    while let Some(frame) = completed_body.frame().await {
+        frame.unwrap();
+    }
+
+    let admitted = app
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admitted.status(), StatusCode::OK);
+    drop(completed_body);
+}
+
+#[tokio::test]
+async fn concurrency_limit_is_released_for_an_immediately_complete_response() {
+    let upstream = spawn_server(Router::new().route(
+        "/v1/chat/completions",
+        post(|| async { StatusCode::NO_CONTENT }),
+    ))
+    .await;
+    let app = router_with_max_in_flight(
+        UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+    );
+
+    let completed = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::NO_CONTENT);
+
+    let admitted = app
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admitted.status(), StatusCode::NO_CONTENT);
+    drop(completed);
+}
+
+#[tokio::test]
+async fn graceful_shutdown_waits_for_an_active_response_stream() {
+    let release = Arc::new(Notify::new());
+    let upstream = spawn_server(
+        Router::new()
+            .route("/v1/chat/completions", any(delayed_sse))
+            .with_state(Arc::clone(&release)),
+    )
+    .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_addr = listener.local_addr().unwrap();
+    let app = gateway_router(UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap());
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    let request = Request::post(format!("http://{gateway_addr}/v1/chat/completions"))
+        .body(Body::empty())
+        .unwrap();
+    let response = client().request(request).await.unwrap();
+    let mut body = response.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(first, "data: first\n\n");
+
+    shutdown_tx.send(()).unwrap();
+    tokio::task::yield_now().await;
+    assert!(
+        !server.is_finished(),
+        "graceful shutdown must wait for the active response stream"
+    );
+
+    release.notify_one();
+    while let Some(frame) = body.frame().await {
+        frame.unwrap();
+    }
+    drop(body);
+    server.await.unwrap();
 }

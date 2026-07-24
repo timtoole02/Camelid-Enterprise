@@ -26,6 +26,10 @@ spec:
         app: camelid-enterprise
         lane: deterministic
     spec:
+      # The server drains active generations on SIGTERM. Keep this at least as
+      # long as the gateway drain window so a coordinated rollout cannot kill
+      # the upstream half of an otherwise draining client stream.
+      terminationGracePeriodSeconds: 300
       # nodeSelector:
       #   node.kubernetes.io/instance-type: <one instance type per pool>
       containers:
