@@ -24,9 +24,14 @@ use axum::{
 };
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+fn receipt_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Clone)]
 pub struct Attribution {
@@ -126,11 +131,13 @@ pub async fn attribute(
             "host": ctx.host.as_str(),
         });
         let log = Arc::clone(log);
-        // Best-effort, off the request path's async context. Write the whole
-        // record — JSON plus newline — in a single `write_all` so concurrent
-        // appends from simultaneous requests cannot interleave into a corrupt
-        // line.
+        // Best-effort, off the request path's async context. Serialize the
+        // whole-record append so simultaneous request tasks cannot interleave
+        // JSONL records within this process.
         tokio::task::spawn_blocking(move || {
+            let Ok(_guard) = receipt_write_lock().lock() else {
+                return;
+            };
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&*log) {
                 let mut record = line.to_string();
                 record.push('\n');
@@ -324,29 +331,35 @@ mod tests {
 
     /// With receipts enabled, each request appends exactly one JSONL line
     /// carrying method, path, status, lane, the full config digest, host, and a
-    /// numeric timestamp. Two requests must yield two lines — append, not
-    /// truncate — and concurrent appends must not corrupt a line.
+    /// numeric timestamp. Concurrent requests must yield complete, independently
+    /// parseable lines without truncation or interleaving.
     #[tokio::test]
     async fn receipts_append_one_line_per_request() {
+        const REQUESTS: usize = 64;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("receipts.jsonl");
         let app = Router::new()
-            .route("/v1/models", get(|| async { Json(serde_json::json!({ "object": "list" })) }))
-            .route(
-                "/v1/completions",
-                post(|| async { Json(serde_json::json!({ "id": "x" })) }),
-            )
+            .fallback(get(|| async { Json(serde_json::json!({ "object": "list" })) }))
             .layer(from_fn_with_state(ctx(Some(Arc::new(path.clone()))), attribute));
 
-        app.clone()
-            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        app.oneshot(Request::post("/v1/completions").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let mut requests = tokio::task::JoinSet::new();
+        for index in 0..REQUESTS {
+            let app = app.clone();
+            requests.spawn(async move {
+                app.oneshot(
+                    Request::get(format!("/contract-receipt/{index}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            });
+        }
+        while let Some(result) = requests.join_next().await {
+            result.unwrap();
+        }
 
-        let receipts = read_receipts(&path, 2).await;
+        let receipts = read_receipts(&path, REQUESTS).await;
         for r in &receipts {
             assert_eq!(r["lane"], "deterministic");
             assert_eq!(r["config_sha256"], TEST_SHA);
@@ -354,18 +367,14 @@ mod tests {
             assert_eq!(r["status"], 200);
             assert!(r["ts"].is_number(), "ts must be numeric: {r}");
         }
-        // The two append writes may land in either order, so match on the set.
-        let seen: std::collections::HashSet<(String, String)> = receipts
+        let seen: std::collections::HashSet<String> = receipts
             .iter()
-            .map(|r| {
-                (
-                    r["method"].as_str().unwrap().to_string(),
-                    r["path"].as_str().unwrap().to_string(),
-                )
-            })
+            .map(|receipt| receipt["path"].as_str().unwrap().to_string())
             .collect();
-        assert!(seen.contains(&("GET".to_string(), "/v1/models".to_string())));
-        assert!(seen.contains(&("POST".to_string(), "/v1/completions".to_string())));
+        assert_eq!(seen.len(), REQUESTS);
+        for index in 0..REQUESTS {
+            assert!(seen.contains(&format!("/contract-receipt/{index}")));
+        }
     }
 
     async fn read_receipts(path: &Path, expected: usize) -> Vec<serde_json::Value> {

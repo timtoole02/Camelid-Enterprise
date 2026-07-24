@@ -34,6 +34,9 @@ engine-linux.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 engine-windows.workspace = true
 
+[build-dependencies]
+toml = "0.8"
+
 [dev-dependencies]
 # Drive the attribution middleware through a real router (`ServiceExt::oneshot`)
 # and write receipts to a scratch dir. `tower`'s `ServiceExt` operates on the

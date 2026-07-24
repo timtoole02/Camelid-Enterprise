@@ -1,0 +1,616 @@
+//! Versioned route contract for the pinned replica API.
+//!
+//! `Contractual` routes are the client-facing surface Camelid Enterprise
+//! intentionally carries forward. `PinnedImplementation` routes are inventoried
+//! because they exist in the pinned engine, but are replica-private and receive
+//! no compatibility promise from Camelid Enterprise.
+
+use crate::ENGINE_PIN;
+
+pub const CONTRACT_ID: &str = "camelid-enterprise-replica-http-v1";
+pub const CONTRACT_ENGINE_PIN: &str = ENGINE_PIN;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Stability {
+    Contractual,
+    PinnedImplementation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Surface {
+    PublicInference,
+    PublicCompatibility,
+    ReplicaOperations,
+    WorkspaceApplication,
+    LegacyCompatibility,
+    Diagnostics,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpMethod {
+    Get,
+    Post,
+    Delete,
+}
+
+impl HttpMethod {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Delete => "DELETE",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RouteSpec {
+    pub path: &'static str,
+    /// Concrete path used by executable conformance checks for parameterized
+    /// routes. Equal to `path` for non-parameterized routes.
+    pub probe_path: &'static str,
+    pub methods: &'static [HttpMethod],
+    pub stability: Stability,
+    pub surface: Surface,
+}
+
+const GET: &[HttpMethod] = &[HttpMethod::Get];
+const POST: &[HttpMethod] = &[HttpMethod::Post];
+const GET_POST: &[HttpMethod] = &[HttpMethod::Get, HttpMethod::Post];
+const GET_DELETE: &[HttpMethod] = &[HttpMethod::Get, HttpMethod::Delete];
+const POST_DELETE: &[HttpMethod] = &[HttpMethod::Post, HttpMethod::Delete];
+
+macro_rules! route {
+    ($path:literal, $methods:expr, $stability:ident, $surface:ident) => {
+        RouteSpec {
+            path: $path,
+            probe_path: $path,
+            methods: $methods,
+            stability: Stability::$stability,
+            surface: Surface::$surface,
+        }
+    };
+    ($path:literal => $probe:literal, $methods:expr, $stability:ident, $surface:ident) => {
+        RouteSpec {
+            path: $path,
+            probe_path: $probe,
+            methods: $methods,
+            stability: Stability::$stability,
+            surface: Surface::$surface,
+        }
+    };
+}
+
+/// Every explicit route registered by `camelid::api::router_with_state` at
+/// [`CONTRACT_ENGINE_PIN`]. The embedded WebUI fallback is intentionally not a
+/// route contract and is documented separately.
+const ROUTES: &[RouteSpec] = &[
+    route!("/health", GET, PinnedImplementation, Diagnostics),
+    route!("/v1/health", GET, Contractual, PublicInference),
+    route!("/api/capabilities", GET, PinnedImplementation, Diagnostics),
+    route!(
+        "/api/runtime/gpu",
+        GET_POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/telemetry/stream",
+        GET,
+        PinnedImplementation,
+        Diagnostics
+    ),
+    route!("/execution-plan", GET, PinnedImplementation, Diagnostics),
+    route!(
+        "/api/execution-plan",
+        GET,
+        PinnedImplementation,
+        Diagnostics
+    ),
+    route!(
+        "/api/models/load",
+        POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/inspect",
+        POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/unload",
+        POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/current",
+        GET,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/verify",
+        GET_POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/metadata",
+        GET,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/tokenizer",
+        GET,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/tokenizer/encode",
+        POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/tokenizer/decode",
+        POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!("/tokenize", POST, PinnedImplementation, LegacyCompatibility),
+    route!(
+        "/detokenize",
+        POST,
+        PinnedImplementation,
+        LegacyCompatibility
+    ),
+    route!(
+        "/apply-template",
+        POST,
+        PinnedImplementation,
+        LegacyCompatibility
+    ),
+    route!("/models", GET, PinnedImplementation, LegacyCompatibility),
+    route!(
+        "/models/load",
+        POST,
+        PinnedImplementation,
+        LegacyCompatibility
+    ),
+    route!(
+        "/models/unload",
+        POST,
+        PinnedImplementation,
+        LegacyCompatibility
+    ),
+    route!(
+        "/props",
+        GET_POST,
+        PinnedImplementation,
+        LegacyCompatibility
+    ),
+    route!(
+        "/slots",
+        GET_POST,
+        PinnedImplementation,
+        LegacyCompatibility
+    ),
+    route!("/metrics", GET, PinnedImplementation, LegacyCompatibility),
+    route!(
+        "/completion",
+        POST,
+        PinnedImplementation,
+        LegacyCompatibility
+    ),
+    route!("/infill", POST, PinnedImplementation, LegacyCompatibility),
+    route!(
+        "/embedding",
+        POST,
+        PinnedImplementation,
+        LegacyCompatibility
+    ),
+    route!(
+        "/embeddings",
+        POST,
+        PinnedImplementation,
+        LegacyCompatibility
+    ),
+    route!("/rerank", POST, PinnedImplementation, LegacyCompatibility),
+    route!(
+        "/reranking",
+        POST,
+        PinnedImplementation,
+        LegacyCompatibility
+    ),
+    route!(
+        "/api/generation/sessions",
+        GET_POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/generation/preflight",
+        POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/agent/workspace/models",
+        GET,
+        PinnedImplementation,
+        WorkspaceApplication
+    ),
+    route!(
+        "/api/agent/workspace/threads",
+        GET,
+        PinnedImplementation,
+        WorkspaceApplication
+    ),
+    route!("/api/agent/workspace/threads/:id" => "/api/agent/workspace/threads/contract-probe", GET_DELETE, PinnedImplementation, WorkspaceApplication),
+    route!("/api/agent/workspace/threads/:id/compact" => "/api/agent/workspace/threads/contract-probe/compact", POST_DELETE, PinnedImplementation, WorkspaceApplication),
+    route!(
+        "/api/agent/workspace/browse",
+        GET,
+        PinnedImplementation,
+        WorkspaceApplication
+    ),
+    route!(
+        "/api/agent/workspace/sessions",
+        POST,
+        PinnedImplementation,
+        WorkspaceApplication
+    ),
+    route!("/api/agent/workspace/sessions/:id" => "/api/agent/workspace/sessions/contract-probe", GET_DELETE, PinnedImplementation, WorkspaceApplication),
+    route!("/api/agent/workspace/sessions/:id/events" => "/api/agent/workspace/sessions/contract-probe/events", GET, PinnedImplementation, WorkspaceApplication),
+    route!("/api/agent/workspace/sessions/:id/messages" => "/api/agent/workspace/sessions/contract-probe/messages", POST, PinnedImplementation, WorkspaceApplication),
+    route!("/api/agent/workspace/sessions/:id/decisions" => "/api/agent/workspace/sessions/contract-probe/decisions", POST, PinnedImplementation, WorkspaceApplication),
+    route!(
+        "/api/models/local",
+        GET,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/local/delete",
+        POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/runnable-receipt",
+        GET,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/runnable-smoke",
+        POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/catalog",
+        GET,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/catalog/install",
+        POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/catalog/downloads",
+        GET,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/catalog/cancel",
+        POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!(
+        "/api/models/catalog/ack",
+        POST,
+        PinnedImplementation,
+        ReplicaOperations
+    ),
+    route!("/v1/models", GET, Contractual, PublicInference),
+    route!("/v1/models/:model" => "/v1/models/contract-probe", GET, Contractual, PublicInference),
+    route!("/v1/completions", POST, Contractual, PublicInference),
+    route!("/v1/chat/completions", POST, Contractual, PublicInference),
+    route!("/v1/embeddings", POST, Contractual, PublicCompatibility),
+    route!("/v1/responses", POST, Contractual, PublicCompatibility),
+    route!("/v1/messages", POST, Contractual, PublicCompatibility),
+    route!("/v1/rerank", POST, Contractual, PublicCompatibility),
+    route!("/v1/reranking", POST, Contractual, PublicCompatibility),
+];
+
+pub fn contractual_routes() -> impl Iterator<Item = &'static RouteSpec> {
+    ROUTES
+        .iter()
+        .filter(|route| route.stability == Stability::Contractual)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::header::ALLOW;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Router;
+    use tower::ServiceExt;
+
+    const TEST_SHA: &str = "30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7";
+    const TEST_HOST: &str = "linux/x86_64 cores=8 simd=avx2+fma";
+
+    fn trace(path: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::TRACE)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn expected_allow(route: &RouteSpec) -> Vec<&'static str> {
+        let mut methods: Vec<&str> = route.methods.iter().map(|method| method.as_str()).collect();
+        if route.methods.contains(&HttpMethod::Get) {
+            methods.push("HEAD");
+        }
+        methods.sort_unstable();
+        methods
+    }
+
+    fn attributed_no_model_router() -> Router {
+        crate::attributed_router(
+            camelid::api::AppState::default(),
+            TEST_SHA.to_string(),
+            TEST_HOST.to_string(),
+            None,
+        )
+    }
+
+    async fn json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn assert_attribution(response: &axum::response::Response) {
+        assert_eq!(response.headers()["x-camelid-lane"], "deterministic");
+        assert_eq!(
+            response.headers()["x-camelid-config-sha256"],
+            &TEST_SHA[..12]
+        );
+        assert_eq!(response.headers()["x-camelid-host"], TEST_HOST);
+    }
+
+    #[test]
+    fn route_declarations_are_unique_and_well_formed() {
+        assert_eq!(
+            ROUTES.len(),
+            61,
+            "review the full pinned implementation inventory when routes change"
+        );
+        let mut paths = std::collections::HashSet::new();
+        for route in ROUTES {
+            assert!(paths.insert(route.path), "duplicate route: {}", route.path);
+            assert!(route.path.starts_with('/'));
+            assert!(route.probe_path.starts_with('/'));
+            assert!(!route.methods.is_empty());
+        }
+    }
+
+    #[test]
+    fn public_contract_is_exactly_the_declared_v1_surface() {
+        let actual: Vec<(&str, &str)> = contractual_routes()
+            .flat_map(|route| {
+                route
+                    .methods
+                    .iter()
+                    .map(move |method| (method.as_str(), route.path))
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                ("GET", "/v1/health"),
+                ("GET", "/v1/models"),
+                ("GET", "/v1/models/:model"),
+                ("POST", "/v1/completions"),
+                ("POST", "/v1/chat/completions"),
+                ("POST", "/v1/embeddings"),
+                ("POST", "/v1/responses"),
+                ("POST", "/v1/messages"),
+                ("POST", "/v1/rerank"),
+                ("POST", "/v1/reranking"),
+            ]
+        );
+    }
+
+    #[test]
+    fn contract_document_lists_every_public_method_and_path() {
+        let document = include_str!("../../../docs/contracts/replica-http-v1.md");
+        assert!(document.contains(CONTRACT_ID));
+        assert!(document.contains(CONTRACT_ENGINE_PIN));
+        for route in contractual_routes() {
+            for method in route.methods {
+                let documented_path = route.path.replace(":model", "{model}");
+                let row = format!("| `{}` | `{documented_path}` |", method.as_str());
+                assert!(
+                    document.contains(&row),
+                    "contract document is missing {row}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_router_conforms_to_declared_paths_and_methods() {
+        let app = camelid::api::router_with_state(camelid::api::AppState::default());
+        for route in ROUTES {
+            let response = app.clone().oneshot(trace(route.probe_path)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "undeclared TRACE unexpectedly accepted for {}",
+                route.path
+            );
+            let mut actual: Vec<&str> = response
+                .headers()
+                .get(ALLOW)
+                .unwrap_or_else(|| panic!("405 response missing Allow for {}", route.path))
+                .to_str()
+                .unwrap()
+                .split(',')
+                .map(str::trim)
+                .collect();
+            actual.sort_unstable();
+            assert_eq!(
+                actual,
+                expected_allow(route),
+                "method contract drift for {}",
+                route.path
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_model_health_is_live_but_not_generation_ready() {
+        let response = attributed_no_model_router()
+            .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_attribution(&response);
+        let body = json(response).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["engine"], "camelid");
+        assert_eq!(body["loaded_now"], false);
+        assert_eq!(body["generation_ready"], false);
+        assert!(body["active_model_id"].is_null());
+        assert_eq!(body["backend"], "none");
+        assert_eq!(body["engine_queue_depth"], 0);
+    }
+
+    #[tokio::test]
+    async fn no_model_discovery_is_an_empty_openai_list() {
+        let response = attributed_no_model_router()
+            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_attribution(&response);
+        let body = json(response).await;
+        assert_eq!(body, serde_json::json!({ "object": "list", "data": [] }));
+    }
+
+    #[tokio::test]
+    async fn missing_model_lookup_is_a_typed_attributed_404() {
+        let response = attributed_no_model_router()
+            .oneshot(
+                Request::get("/v1/models/not-loaded")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_attribution(&response);
+        let body = json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request");
+        assert_eq!(body["error"]["code"], "model_not_found");
+        assert_eq!(body["error"]["param"], "model");
+    }
+
+    #[tokio::test]
+    async fn compatibility_routes_fail_explicitly_instead_of_falling_back() {
+        for (path, code) in [
+            ("/v1/embeddings", "unsupported_embeddings"),
+            ("/v1/responses", "unsupported_responses"),
+            ("/v1/messages", "unsupported_messages"),
+            ("/v1/rerank", "unsupported_reranking"),
+            ("/v1/reranking", "unsupported_reranking"),
+        ] {
+            let response = attributed_no_model_router()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+            assert_attribution(&response);
+            let body = json(response).await;
+            assert_eq!(body["error"]["type"], "not_implemented", "{path}");
+            assert_eq!(body["error"]["code"], code, "{path}");
+            assert_eq!(body["error"]["param"], "input", "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_generation_json_is_a_typed_attributed_400() {
+        for path in ["/v1/completions", "/v1/chat/completions"] {
+            let response = attributed_no_model_router()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            assert_attribution(&response);
+            let body = json(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request", "{path}");
+            assert_eq!(body["error"]["code"], "malformed_json", "{path}");
+            assert!(body["error"]["param"].is_null(), "{path}");
+            assert_eq!(body["camelid_lane"], "deterministic", "{path}");
+            assert_eq!(
+                body["camelid_config_sha256"],
+                &TEST_SHA[..12],
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn head_and_cors_preflight_are_provided_by_the_pinned_router() {
+        let app = attributed_no_model_router();
+        let head = app
+            .clone()
+            .oneshot(Request::head("/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_attribution(&head);
+        assert!(to_bytes(head.into_body(), 1024).await.unwrap().is_empty());
+
+        let preflight = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/v1/chat/completions")
+                    .header("origin", "https://client.example")
+                    .header("access-control-request-method", "POST")
+                    .header("access-control-request-headers", "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert_eq!(preflight.headers()["access-control-allow-origin"], "*");
+        assert_eq!(preflight.headers()["access-control-allow-methods"], "*");
+        assert_eq!(preflight.headers()["access-control-allow-headers"], "*");
+    }
+}
