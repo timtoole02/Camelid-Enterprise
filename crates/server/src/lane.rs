@@ -147,11 +147,6 @@ mod tests {
         // Documents the counterfactual: sorting yields this digest instead.
         assert_eq!(&sorted_digest[..12], "42c63ead830c");
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     /// `apply_deterministic` reads and mutates process-global environment, so
     /// these phases run inside one serialized test rather than as separate
@@ -167,14 +162,11 @@ mod tests {
             std::env::remove_var(key);
         }
 
-        // Phase 1 — the frozen vector is exactly the documented value. This is
-        // the contract: any change to CANONICAL or ENGINE_PIN must break it.
-        // (Short form matches the README banner / attribution: `30d77c260803`.)
+        // Phase 1 — the applied vector is exactly the pinned digest (whose
+        // literal value lives in `config_sha256_is_pinned`), and its short form
+        // is the value published in the README banner / attribution surface.
         let config = apply_deterministic().expect("a clean environment must apply");
-        assert_eq!(
-            config.sha256,
-            "30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7",
-        );
+        assert_eq!(config.sha256, compute_config_sha256());
         assert_eq!(config.short(), "30d77c260803");
 
         // The vector is a property of CANONICAL + ENGINE_PIN, not of the
