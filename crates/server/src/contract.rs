@@ -6,60 +6,24 @@
 //! no compatibility promise from Camelid Enterprise.
 
 use crate::ENGINE_PIN;
+pub use replica_contract::{
+    contractual_routes, HttpMethod, RouteSpec, Stability, Surface, CONTRACT_ID, PUBLIC_ROUTES,
+};
 
-pub const CONTRACT_ID: &str = "camelid-enterprise-replica-http-v1";
 pub const CONTRACT_ENGINE_PIN: &str = ENGINE_PIN;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Stability {
-    Contractual,
-    PinnedImplementation,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Surface {
-    PublicInference,
-    PublicCompatibility,
-    ReplicaOperations,
-    WorkspaceApplication,
-    LegacyCompatibility,
-    Diagnostics,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HttpMethod {
-    Get,
-    Post,
-    Delete,
-}
-
-impl HttpMethod {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Get => "GET",
-            Self::Post => "POST",
-            Self::Delete => "DELETE",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RouteSpec {
-    pub path: &'static str,
-    /// Concrete path used by executable conformance checks for parameterized
-    /// routes. Equal to `path` for non-parameterized routes.
-    pub probe_path: &'static str,
-    pub methods: &'static [HttpMethod],
-    pub stability: Stability,
-    pub surface: Surface,
-}
-
+#[cfg(test)]
 const GET: &[HttpMethod] = &[HttpMethod::Get];
+#[cfg(test)]
 const POST: &[HttpMethod] = &[HttpMethod::Post];
+#[cfg(test)]
 const GET_POST: &[HttpMethod] = &[HttpMethod::Get, HttpMethod::Post];
+#[cfg(test)]
 const GET_DELETE: &[HttpMethod] = &[HttpMethod::Get, HttpMethod::Delete];
+#[cfg(test)]
 const POST_DELETE: &[HttpMethod] = &[HttpMethod::Post, HttpMethod::Delete];
 
+#[cfg(test)]
 macro_rules! route {
     ($path:literal, $methods:expr, $stability:ident, $surface:ident) => {
         RouteSpec {
@@ -84,9 +48,9 @@ macro_rules! route {
 /// Every explicit route registered by `camelid::api::router_with_state` at
 /// [`CONTRACT_ENGINE_PIN`]. The embedded WebUI fallback is intentionally not a
 /// route contract and is documented separately.
-const ROUTES: &[RouteSpec] = &[
+#[cfg(test)]
+const PRIVATE_ROUTES: &[RouteSpec] = &[
     route!("/health", GET, PinnedImplementation, Diagnostics),
-    route!("/v1/health", GET, Contractual, PublicInference),
     route!("/api/capabilities", GET, PinnedImplementation, Diagnostics),
     route!(
         "/api/runtime/gpu",
@@ -322,21 +286,11 @@ const ROUTES: &[RouteSpec] = &[
         PinnedImplementation,
         ReplicaOperations
     ),
-    route!("/v1/models", GET, Contractual, PublicInference),
-    route!("/v1/models/:model" => "/v1/models/contract-probe", GET, Contractual, PublicInference),
-    route!("/v1/completions", POST, Contractual, PublicInference),
-    route!("/v1/chat/completions", POST, Contractual, PublicInference),
-    route!("/v1/embeddings", POST, Contractual, PublicCompatibility),
-    route!("/v1/responses", POST, Contractual, PublicCompatibility),
-    route!("/v1/messages", POST, Contractual, PublicCompatibility),
-    route!("/v1/rerank", POST, Contractual, PublicCompatibility),
-    route!("/v1/reranking", POST, Contractual, PublicCompatibility),
 ];
 
-pub fn contractual_routes() -> impl Iterator<Item = &'static RouteSpec> {
-    ROUTES
-        .iter()
-        .filter(|route| route.stability == Stability::Contractual)
+#[cfg(test)]
+fn all_routes() -> impl Iterator<Item = &'static RouteSpec> {
+    PRIVATE_ROUTES.iter().chain(PUBLIC_ROUTES)
 }
 
 #[cfg(test)]
@@ -393,13 +347,15 @@ mod tests {
 
     #[test]
     fn route_declarations_are_unique_and_well_formed() {
+        assert_eq!(PUBLIC_ROUTES.len(), 10);
+        assert_eq!(PRIVATE_ROUTES.len(), 51);
         assert_eq!(
-            ROUTES.len(),
+            all_routes().count(),
             61,
             "review the full pinned implementation inventory when routes change"
         );
         let mut paths = std::collections::HashSet::new();
-        for route in ROUTES {
+        for route in all_routes() {
             assert!(paths.insert(route.path), "duplicate route: {}", route.path);
             assert!(route.path.starts_with('/'));
             assert!(route.probe_path.starts_with('/'));
@@ -454,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn pinned_router_conforms_to_declared_paths_and_methods() {
         let app = camelid::api::router_with_state(camelid::api::AppState::default());
-        for route in ROUTES {
+        for route in all_routes() {
             let response = app.clone().oneshot(trace(route.probe_path)).await.unwrap();
             assert_eq!(
                 response.status(),
@@ -575,11 +531,7 @@ mod tests {
             assert_eq!(body["error"]["code"], "malformed_json", "{path}");
             assert!(body["error"]["param"].is_null(), "{path}");
             assert_eq!(body["camelid_lane"], "deterministic", "{path}");
-            assert_eq!(
-                body["camelid_config_sha256"],
-                &TEST_SHA[..12],
-                "{path}"
-            );
+            assert_eq!(body["camelid_config_sha256"], &TEST_SHA[..12], "{path}");
         }
     }
 

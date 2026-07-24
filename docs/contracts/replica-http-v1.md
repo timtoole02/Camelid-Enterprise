@@ -11,10 +11,12 @@ This document defines the HTTP behavior Camelid Enterprise intentionally carries
 forward for one deterministic inference replica. It is not a promise that every
 route present in the pinned desktop engine is a stable Enterprise API.
 
-The machine-readable route registry in
-`crates/server/src/contract.rs` is the source of truth for paths, methods,
-classification, and the engine revision. Its tests drive the exact pinned
-`camelid::api::router_with_state`; they do not reimplement the engine API.
+The dependency-free public route registry in `crates/replica-contract` is the
+source of truth for contractual paths, methods, and classification, so replicas
+and gateways can share it without linking the inference engine. The private
+pinned-route inventory and executable conformance live in
+`crates/server/src/contract.rs`; they drive the exact pinned
+`camelid::api::router_with_state` and do not reimplement the engine API.
 
 ## Evidence labels
 
@@ -188,8 +190,9 @@ When the bounded generation queue rejects a job, the pinned engine returns HTTP
 `503`, error code `engine_queue_full`, and `Retry-After: 1`. This is the
 backpressure signal; callers must not assume automatic retry by the gateway.
 
-**Evidence:** malformed JSON and no-model errors are executable. Queue
-saturation is **pinned source** and remains an independent stress-test gap.
+**Evidence:** malformed JSON and no-model errors are executable without a
+model. Queue saturation, `Retry-After`, attributed error shape, and depth
+recovery are exercised by the explicit model-backed conformance test.
 
 ## Serving receipts
 
@@ -241,8 +244,13 @@ because they intentionally terminate the process.
 
 ## Replica-private pinned implementation inventory
 
-The complete machine-readable inventory is `contract::ROUTES`. These categories
-exist at the pinned engine revision but are **not** Enterprise public contracts:
+The complete private inventory is internal to the server contract module. Axum
+does not expose inverse route-tree introspection, so completeness is established
+by source review at the immutable engine revision and a pinned 61-route
+cardinality; executable checks prove every declared route and method exists.
+Changing the engine revision requires another full source inventory review.
+These categories exist at the pinned engine revision but are **not** Enterprise
+public contracts:
 
 - Diagnostics: `/health`, `/api/capabilities`, telemetry, execution plans.
 - Model/runtime operations: `/api/runtime/gpu`, `/api/models/*`, catalog,
@@ -289,3 +297,9 @@ CAMELID_ENTERPRISE_TEST_MODEL=/absolute/path/model.gguf \
   cargo test -p camelid-enterprise --test replica_contract_model \
   real_model_conforms_to_replica_http_v1 -- --ignored --exact --nocapture
 ```
+
+The GitHub Actions workflow `replica contract - model-backed` downloads one
+model artifact from an immutable repository revision, verifies its exact byte
+length and SHA-256, and runs that command serially. It runs on pull requests that
+change the contract/server ownership surface and by manual dispatch; unrelated
+pull requests do not pay the approximately 808 MB download and CPU stress cost.

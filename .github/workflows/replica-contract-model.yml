@@ -1,0 +1,55 @@
+name: replica contract - model-backed
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/replica-contract-model.yml
+      - Cargo.lock
+      - Cargo.toml
+      - crates/replica-contract/**
+      - crates/server/**
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MODEL_REVISION: 067b946cf014b7c697f3654f621d577a3e3afd1c
+  MODEL_FILENAME: Llama-3.2-1B-Instruct-Q4_K_M.gguf
+  MODEL_SIZE: "807694464"
+  MODEL_SHA256: 6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83
+
+jobs:
+  replica-contract-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download pinned model artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/${MODEL_REVISION}/${MODEL_FILENAME}"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${RUNNER_TEMP}/${MODEL_FILENAME}" "${url}"
+
+      - name: Verify model artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          model="${RUNNER_TEMP}/${MODEL_FILENAME}"
+          test "$(stat -c %s "${model}")" = "${MODEL_SIZE}"
+          echo "${MODEL_SHA256}  ${model}" | sha256sum --check --strict
+
+      - name: Run model-backed replica contract
+        env:
+          CAMELID_ENTERPRISE_TEST_MODEL: ${{ runner.temp }}/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+        run: >-
+          cargo test --locked -p camelid-enterprise
+          --test replica_contract_model
+          real_model_conforms_to_replica_http_v1
+          -- --ignored --exact --nocapture --test-threads=1

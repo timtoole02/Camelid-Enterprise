@@ -90,7 +90,8 @@ The versioned [Replica HTTP Contract v1](docs/contracts/replica-http-v1.md)
 defines the public route surface, attribution, health/readiness, typed errors,
 streaming, receipts, startup/shutdown behavior, evidence levels, and deliberately
 unspecified behavior. Its machine-readable registry and executable conformance
-tests are owned by `crates/server`.
+tests live in the dependency-free `crates/replica-contract` and the owning
+`crates/server` composition.
 
 ```bash
 curl http://127.0.0.1:8181/v1/chat/completions \
@@ -168,6 +169,7 @@ crates/
 ├── engine-linux/     Linux backend — x86 AVX/VNNI and CUDA (in progress).
 ├── engine-windows/   Windows backend (in progress).
 ├── gateway/          Transparent streaming entry point in front of replicas.
+├── replica-contract/ Dependency-free public route registry.
 └── server/           Lane-attributed replica + versioned HTTP contract.
 deploy/               Dockerfile and Kubernetes manifests.
 ```

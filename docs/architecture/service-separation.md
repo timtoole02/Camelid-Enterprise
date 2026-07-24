@@ -198,11 +198,12 @@ tokens for one model"; everything multi-user is layered on top.
 1. **Baseline & contracts — implemented.**
   `camelid-enterprise-replica-http-v1` separates the contractual `/v1` surface
   from the pinned engine's private implementation inventory. Its registry is
-  checked against the exact pinned router without invoking handlers; no-model
-  tests cover health, discovery, typed errors, and attribution. An explicit
+  dependency-free so replicas and gateways can share it, and is checked against
+  the exact pinned router without invoking handlers; no-model tests cover
+  health, discovery, typed errors, and attribution. An explicit
   model-backed test covers load, readiness, deterministic greedy output, and
-  SSE with a compatible local GGUF. Queue saturation remains source-verified
-  rather than independently stress-tested.
+  SSE with a compatible local GGUF, plus queue saturation, typed backpressure,
+  and depth recovery.
 2. **Gateway (pass-through first) — built.** A transparent fixed-origin gateway
   fronts the existing replica pool with no inference behavior change. It ships
   as a Rust binary, separate container, and private Kubernetes Service.

@@ -135,7 +135,7 @@ async fn real_model_conforms_to_replica_http_v1() {
     assert_eq!(raw["camelid_lane"], "deterministic");
 
     let stream = send(
-        app,
+        app.clone(),
         post_json(
             "/v1/chat/completions",
             json!({
@@ -168,4 +168,61 @@ async fn real_model_conforms_to_replica_http_v1() {
     for event in &events[..events.len() - 1] {
         serde_json::from_str::<Value>(event).expect("every data event before [DONE] is JSON");
     }
+
+    const CONCURRENT_REQUESTS: usize = 16;
+    let mut requests = tokio::task::JoinSet::new();
+    for index in 0..CONCURRENT_REQUESTS {
+        let app = app.clone();
+        let model_id = model_id.to_string();
+        requests.spawn(async move {
+            send(
+                app,
+                post_json(
+                    "/v1/chat/completions",
+                    json!({
+                        "model": model_id,
+                        "messages": [{
+                            "role": "user",
+                            "content": format!("Count briefly: {index}")
+                        }],
+                        "temperature": 0,
+                        "max_tokens": 8,
+                        "stream": false
+                    }),
+                ),
+            )
+            .await
+        });
+    }
+
+    let mut accepted = 0;
+    let mut rejected = 0;
+    while let Some(result) = requests.join_next().await {
+        let response = result.unwrap();
+        assert_attribution(&response, &expected_sha);
+        match response.status() {
+            StatusCode::OK => {
+                accepted += 1;
+                body_json(response).await;
+            }
+            StatusCode::SERVICE_UNAVAILABLE => {
+                rejected += 1;
+                assert_eq!(response.headers()["retry-after"], "1");
+                let body = body_json(response).await;
+                assert_eq!(body["error"]["type"], "runtime_unavailable");
+                assert_eq!(body["error"]["code"], "engine_queue_full");
+                assert!(body["error"]["param"].is_null());
+                assert_eq!(body["camelid_lane"], "deterministic");
+                assert_eq!(body["camelid_config_sha256"], &expected_sha[..12]);
+            }
+            status => panic!("unexpected queue-stress status: {status}"),
+        }
+    }
+    assert!(accepted > 0);
+    assert!(rejected > 0);
+    assert_eq!(accepted + rejected, CONCURRENT_REQUESTS);
+
+    let recovered = send(app, Request::get("/v1/health").body(Body::empty()).unwrap()).await;
+    assert_eq!(recovered.status(), StatusCode::OK);
+    assert_eq!(body_json(recovered).await["engine_queue_depth"], 0);
 }
