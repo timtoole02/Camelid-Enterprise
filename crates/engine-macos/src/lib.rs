@@ -6,6 +6,10 @@
 //! boundary — `engine-core` never inspects the host, and no other platform's
 //! code is compiled into a macOS build.
 
+pub mod q8_dot;
+
+pub use q8_dot::{q8_0_dot_rows, quantize_q8_0_block, quantize_q8_0_blocks};
+
 use engine_core::host::HostCapabilities;
 
 /// Detect this host's capabilities. The result participates in the replica's

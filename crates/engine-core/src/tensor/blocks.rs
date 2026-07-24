@@ -125,6 +125,9 @@ pub fn f16_bits_to_f32(bits: u16) -> f32 {
 
 // Quantization Constants
 pub const Q8_BLOCK_SIZE: usize = 32;
+/// Number of f32 values quantized into one Q8_0 block. Single source of truth
+/// aliased to [`Q8_BLOCK_SIZE`] so the two names can never diverge.
+pub const Q8_0_BLOCK_VALUES: usize = Q8_BLOCK_SIZE;
 pub const Q4_0_BLOCK_BYTES: usize = 2 + (Q8_BLOCK_SIZE / 2);
 pub const Q4_1_BLOCK_BYTES: usize = 4 + (Q8_BLOCK_SIZE / 2);
 pub const Q5_0_BLOCK_BYTES: usize = 2 + 4 + (Q8_BLOCK_SIZE / 2);

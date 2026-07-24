@@ -3,7 +3,7 @@ use engine_core::tensor::blocks::{
     NVFP4_WIRE_BYTES_PER_BLOCK,
 };
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use serde_json::Value;
 
 /// sha256 of the produced model artifact this fixture was sampled from.
