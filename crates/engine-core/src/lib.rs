@@ -9,6 +9,7 @@
 pub mod error;
 pub mod gguf;
 pub mod host;
+pub mod tensor;
 pub mod tokenizer;
 
 pub use error::{EngineError, Result};

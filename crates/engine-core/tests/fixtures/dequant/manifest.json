@@ -1,0 +1,40 @@
+{
+ "note": "ref_f32_bits are u32 bit patterns of the reference f32 output",
+ "fixtures": [
+  {
+   "qtype": "F32",
+   "n_elements": 256,
+   "block_bytes": 4
+  },
+  {
+   "qtype": "F16",
+   "n_elements": 256,
+   "block_bytes": 2
+  },
+  {
+   "qtype": "Q8_0",
+   "n_elements": 256,
+   "block_bytes": 34
+  },
+  {
+   "qtype": "Q4_0",
+   "n_elements": 256,
+   "block_bytes": 18
+  },
+  {
+   "qtype": "Q4_K",
+   "n_elements": 2048,
+   "block_bytes": 144
+  },
+  {
+   "qtype": "Q5_K",
+   "n_elements": 2048,
+   "block_bytes": 176
+  },
+  {
+   "qtype": "Q6_K",
+   "n_elements": 2048,
+   "block_bytes": 210
+  }
+ ]
+}

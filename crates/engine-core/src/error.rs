@@ -16,6 +16,23 @@ pub enum EngineError {
     /// Tokenizer metadata is valid but describes a scheme this engine does not
     /// support.
     UnsupportedTokenizer(String),
+    /// Tensor payload bytes are malformed for their declared type: misaligned
+    /// block lengths, byte counts that disagree with the element count, or
+    /// values the format forbids. Distinct from a container violation: the
+    /// GGUF framing is fine, the tensor data itself is not usable.
+    InvalidTensorData(String),
+    /// A tensor was requested by a name the loaded model does not contain.
+    /// Distinct from malformed data: the store is fine, the name misses.
+    TensorNotFound(String),
+    /// The tensor's storage type parsed fine but the requested load path has
+    /// no decoder for it. Distinct from a container violation: the type id is
+    /// legal GGUF, this engine just cannot decode it here.
+    UnsupportedTensorType(String),
+    /// Runtime operands do not fit together: wrong rank, disagreeing
+    /// dimensions, or data lengths that do not match a declared shape.
+    /// Distinct from InvalidTensorData: each tensor is internally fine, the
+    /// combination requested of them is not.
+    ShapeMismatch(String),
     Io { path: PathBuf, source: std::io::Error },
 }
 
@@ -29,6 +46,10 @@ impl std::fmt::Display for EngineError {
             }
             Self::InvalidTokenizerMetadata(msg) => write!(f, "invalid tokenizer metadata: {msg}"),
             Self::UnsupportedTokenizer(msg) => write!(f, "unsupported tokenizer: {msg}"),
+            Self::InvalidTensorData(msg) => write!(f, "invalid tensor data: {msg}"),
+            Self::TensorNotFound(name) => write!(f, "tensor not found: {name}"),
+            Self::UnsupportedTensorType(msg) => write!(f, "unsupported tensor type: {msg}"),
+            Self::ShapeMismatch(msg) => write!(f, "shape mismatch: {msg}"),
             Self::Io { path, source } => write!(f, "io error on {}: {source}", path.display()),
         }
     }
