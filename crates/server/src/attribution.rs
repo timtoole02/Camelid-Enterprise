@@ -96,8 +96,10 @@ pub async fn attribute(
                 ));
                 *failed.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                 // The response we manufacture to PROTECT attribution must itself
-                // carry the full attribution set — lane, config vector, and host.
+                // carry the full attribution set — lane, config vector, and host —
+                // and be a well-formed, labeled JSON error body.
                 let headers = failed.headers_mut();
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                 headers.insert("x-camelid-lane", HeaderValue::from_static(ctx.lane));
                 if let Ok(v) = HeaderValue::from_str(short) {
                     headers.insert("x-camelid-config-sha256", v);
@@ -124,10 +126,15 @@ pub async fn attribute(
             "host": ctx.host.as_str(),
         });
         let log = Arc::clone(log);
-        // Best-effort, off the request path's async context.
+        // Best-effort, off the request path's async context. Write the whole
+        // record — JSON plus newline — in a single `write_all` so concurrent
+        // appends from simultaneous requests cannot interleave into a corrupt
+        // line.
         tokio::task::spawn_blocking(move || {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&*log) {
-                let _ = writeln!(f, "{line}");
+                let mut record = line.to_string();
+                record.push('\n');
+                let _ = f.write_all(record.as_bytes());
             }
         });
     }
@@ -150,6 +157,8 @@ mod tests {
 
     const TEST_SHA: &str = "30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7";
     const TEST_HOST: &str = "linux/x86_64 cores=8 simd=avx2+fma";
+    const SSE_BODY: &str =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
 
     fn ctx(receipts: Option<Arc<PathBuf>>) -> Attribution {
         Attribution {
@@ -196,11 +205,12 @@ mod tests {
         assert_eq!(header(&resp, "x-camelid-config-sha256"), TEST_SHA[..12]);
         assert_eq!(header(&resp, "x-camelid-host"), TEST_HOST);
 
-        let body = read_body(resp).await;
+        let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
         assert!(
-            !body.contains("camelid_lane"),
-            "a non-completion body must not be rewritten: {body}"
+            body.get("camelid_lane").is_none(),
+            "a non-completion body must not be attributed: {body}"
         );
+        assert_eq!(body["object"], "list", "original fields must be preserved");
     }
 
     /// A JSON completion body gains `camelid_lane` and `camelid_config_sha256`
@@ -259,6 +269,25 @@ mod tests {
         assert_eq!(body, serde_json::json!(["a", "b"]));
     }
 
+    /// A streaming (`text/event-stream`) completion response is passed through
+    /// untouched — attribution never buffers or rewrites a stream — while the
+    /// identity headers are still set.
+    #[tokio::test]
+    async fn event_stream_completion_body_is_passed_through() {
+        let app = attributed(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { ([(CONTENT_TYPE, "text/event-stream")], SSE_BODY) }),
+        ));
+        let resp = app
+            .oneshot(Request::post("/v1/chat/completions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(header(&resp, "x-camelid-lane"), "deterministic");
+        assert_eq!(header(&resp, "x-camelid-config-sha256"), TEST_SHA[..12]);
+        assert_eq!(read_body(resp).await, SSE_BODY);
+    }
+
     /// A completion body larger than the attribution buffer limit cannot be
     /// buffered, so the middleware fails closed with a 500 that still carries
     /// the full attribution header set — the guarantee must not be droppable by
@@ -280,45 +309,75 @@ mod tests {
         assert_eq!(header(&resp, "x-camelid-lane"), "deterministic");
         assert_eq!(header(&resp, "x-camelid-config-sha256"), TEST_SHA[..12]);
         assert_eq!(header(&resp, "x-camelid-host"), TEST_HOST);
+        // The manufactured 500 must itself be a well-formed, labeled JSON error.
+        assert_eq!(header(&resp, "content-type"), "application/json");
+        let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(body["error"]["type"], "server_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("attribution buffer limit"),
+            "unexpected error body: {body}"
+        );
     }
 
-    /// With receipts enabled, one JSONL line per request is appended, carrying
-    /// method, path, status, lane, the full config digest, and host.
+    /// With receipts enabled, each request appends exactly one JSONL line
+    /// carrying method, path, status, lane, the full config digest, host, and a
+    /// numeric timestamp. Two requests must yield two lines — append, not
+    /// truncate — and concurrent appends must not corrupt a line.
     #[tokio::test]
-    async fn receipt_line_records_the_request() {
+    async fn receipts_append_one_line_per_request() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("receipts.jsonl");
         let app = Router::new()
             .route("/v1/models", get(|| async { Json(serde_json::json!({ "object": "list" })) }))
+            .route(
+                "/v1/completions",
+                post(|| async { Json(serde_json::json!({ "id": "x" })) }),
+            )
             .layer(from_fn_with_state(ctx(Some(Arc::new(path.clone()))), attribute));
 
-        let resp = app
+        app.clone()
             .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        app.oneshot(Request::post("/v1/completions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
 
-        // The receipt is written off the request path on a spawn_blocking task,
-        // so poll (bounded) for it rather than assuming it has landed.
-        let line = read_receipt(&path).await;
-        let receipt: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(receipt["method"], "GET");
-        assert_eq!(receipt["path"], "/v1/models");
-        assert_eq!(receipt["status"], 200);
-        assert_eq!(receipt["lane"], "deterministic");
-        assert_eq!(receipt["config_sha256"], TEST_SHA);
-        assert_eq!(receipt["host"], TEST_HOST);
+        let receipts = read_receipts(&path, 2).await;
+        for r in &receipts {
+            assert_eq!(r["lane"], "deterministic");
+            assert_eq!(r["config_sha256"], TEST_SHA);
+            assert_eq!(r["host"], TEST_HOST);
+            assert_eq!(r["status"], 200);
+            assert!(r["ts"].is_number(), "ts must be numeric: {r}");
+        }
+        // The two append writes may land in either order, so match on the set.
+        let seen: std::collections::HashSet<(String, String)> = receipts
+            .iter()
+            .map(|r| {
+                (
+                    r["method"].as_str().unwrap().to_string(),
+                    r["path"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert!(seen.contains(&("GET".to_string(), "/v1/models".to_string())));
+        assert!(seen.contains(&("POST".to_string(), "/v1/completions".to_string())));
     }
 
-    async fn read_receipt(path: &Path) -> String {
+    async fn read_receipts(path: &Path, expected: usize) -> Vec<serde_json::Value> {
         for _ in 0..200 {
             if let Ok(contents) = std::fs::read_to_string(path) {
-                if !contents.trim().is_empty() {
-                    return contents;
+                let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+                if lines.len() >= expected {
+                    return lines.iter().map(|l| serde_json::from_str(l).unwrap()).collect();
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        panic!("receipt was not written within the timeout");
+        panic!("expected {expected} receipt line(s) were not written within the timeout");
     }
 }
