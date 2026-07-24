@@ -45,9 +45,12 @@ macro_rules! route {
     };
 }
 
-/// Every explicit route registered by `camelid::api::router_with_state` at
-/// [`CONTRACT_ENGINE_PIN`]. The embedded WebUI fallback is intentionally not a
-/// route contract and is documented separately.
+/// Source-reviewed inventory of every explicit route registered by
+/// `camelid::api::router_with_state` at [`CONTRACT_ENGINE_PIN`]. Axum exposes no
+/// inverse route-tree introspection: tests prove every declaration exists with
+/// these methods, while the pinned count and immutable engine revision make a
+/// complete source re-review mandatory when the revision moves. The embedded
+/// WebUI fallback is intentionally not a route contract.
 #[cfg(test)]
 const PRIVATE_ROUTES: &[RouteSpec] = &[
     route!("/health", GET, PinnedImplementation, Diagnostics),
