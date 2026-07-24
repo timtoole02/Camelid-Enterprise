@@ -1,11 +1,18 @@
 //! Lane attribution: every response is attributable to the lane that produced it.
 //!
 //! Three locations, so no consumer misses it:
-//! - `x-camelid-lane` / `x-camelid-config-sha256` headers on every response
-//!   (including streams);
+//! - `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-host` headers on
+//!   every response (including streams);
 //! - `camelid_lane` / `camelid_config_sha256` fields injected into non-streaming
 //!   completion JSON bodies;
-//! - an optional append-only serving-receipt log (JSONL), one line per request.
+//! - an optional append-only serving-receipt log (JSONL), one line per request,
+//!   carrying the lane, config vector, and host identity.
+//!
+//! Host identity is attributed but deliberately NOT folded into the config
+//! vector hash: the config vector identifies a *configuration* (so two pools on
+//! different hardware classes stay comparable by hash), while `x-camelid-host`
+//! and the receipt's `host` field carry the hardware class the guarantee is
+//! scoped to. Config identity and host identity are different claims.
 
 use axum::{
     body::{to_bytes, Body},
@@ -25,6 +32,10 @@ const BODY_LIMIT: usize = 64 * 1024 * 1024;
 pub struct Attribution {
     pub lane: &'static str,
     pub config_sha256: Arc<String>,
+    /// Hardware-class identity for this replica (the same string the startup
+    /// banner prints, e.g. `linux/x86_64 cores=16 simd=...`). Attributed on
+    /// every response and receipt; never an input to `config_sha256`.
+    pub host: Arc<String>,
     pub receipts: Option<Arc<PathBuf>>,
 }
 
@@ -48,6 +59,9 @@ pub async fn attribute(
     );
     if let Ok(v) = HeaderValue::from_str(short) {
         resp.headers_mut().insert("x-camelid-config-sha256", v);
+    }
+    if let Ok(v) = HeaderValue::from_str(ctx.host.as_str()) {
+        resp.headers_mut().insert("x-camelid-host", v);
     }
 
     let is_json = resp
@@ -81,9 +95,16 @@ pub async fn attribute(
                     r#"{"error":{"message":"response exceeded the attribution buffer limit","type":"server_error"}}"#,
                 ));
                 *failed.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                failed
-                    .headers_mut()
-                    .insert("x-camelid-lane", HeaderValue::from_static(ctx.lane));
+                // The response we manufacture to PROTECT attribution must itself
+                // carry the full attribution set — lane, config vector, and host.
+                let headers = failed.headers_mut();
+                headers.insert("x-camelid-lane", HeaderValue::from_static(ctx.lane));
+                if let Ok(v) = HeaderValue::from_str(short) {
+                    headers.insert("x-camelid-config-sha256", v);
+                }
+                if let Ok(v) = HeaderValue::from_str(ctx.host.as_str()) {
+                    headers.insert("x-camelid-host", v);
+                }
                 resp = failed;
             }
         }
@@ -100,6 +121,7 @@ pub async fn attribute(
             "status": resp.status().as_u16(),
             "lane": ctx.lane,
             "config_sha256": ctx.config_sha256.as_str(),
+            "host": ctx.host.as_str(),
         });
         let log = Arc::clone(log);
         // Best-effort, off the request path's async context.
