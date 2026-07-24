@@ -97,3 +97,65 @@ pub fn apply_deterministic() -> Result<ConfigVector, String> {
         sha256: format!("{:x}", hasher.finalize()),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `apply_deterministic` reads and mutates process-global environment, so
+    /// these phases run inside one serialized test rather than as separate
+    /// `#[test]`s that the harness could interleave on parallel threads.
+    #[test]
+    fn deterministic_lane_contract() {
+        // Control the environment fully: clear every key this function reasons
+        // about so the outcome does not depend on the ambient environment.
+        for key in MUST_BE_UNSET {
+            std::env::remove_var(key);
+        }
+        for (key, _) in CANONICAL {
+            std::env::remove_var(key);
+        }
+
+        // Phase 1 — the frozen vector is exactly the documented value. This is
+        // the contract: any change to CANONICAL or ENGINE_PIN must break it.
+        // (Short form matches the README banner / attribution: `30d77c260803`.)
+        let config = apply_deterministic().expect("a clean environment must apply");
+        assert_eq!(
+            config.sha256,
+            "30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7",
+        );
+        assert_eq!(config.short(), "30d77c260803");
+
+        // The vector is a property of CANONICAL + ENGINE_PIN, not of the
+        // environment: re-applying (now that the canonical keys are set) is
+        // identical.
+        let reapplied = apply_deterministic().expect("re-apply must succeed");
+        assert_eq!(reapplied.sha256, config.sha256);
+
+        // Phase 2 — a MUST_BE_UNSET key present fails closed, naming the key.
+        std::env::set_var("CAMELID_QUEUE_DEPTH", "8");
+        let err = match apply_deterministic() {
+            Ok(_) => panic!("an excluded key must fail closed"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("CAMELID_QUEUE_DEPTH"),
+            "the error must name the offending key: {err}",
+        );
+        std::env::remove_var("CAMELID_QUEUE_DEPTH");
+
+        // Phase 3 — a canonical key overridden to a conflicting value fails
+        // closed; the same key at its canonical value is accepted.
+        std::env::set_var("CAMELID_DETERMINISTIC", "0");
+        let err = match apply_deterministic() {
+            Ok(_) => panic!("a conflicting override must fail closed"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("CAMELID_DETERMINISTIC"),
+            "the error must name the offending key: {err}",
+        );
+        std::env::set_var("CAMELID_DETERMINISTIC", "1");
+        apply_deterministic().expect("a canonical key at its canonical value must be accepted");
+    }
+}
