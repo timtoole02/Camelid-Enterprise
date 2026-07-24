@@ -40,7 +40,7 @@ $ curl -s http://127.0.0.1:8181/v1/chat/completions -d '{ … }' | jq '{camelid_
 LLM serving stacks quietly trade reproducibility for performance. Batching, speculative decoding, and per-deployment kernel tuning all change the numerics under a request, so the same prompt can produce different output depending on load, neighbors, and flags — and nothing in the response tells you which you got. For chat, that's fine. For evaluations, regression testing, caching, audit trails, and regulated workloads, it isn't.
 
 - **Reproducible output, on purpose.** On the deterministic lane, the same greedy request yields the identical token stream on every run — including across process restarts.
-- **Execution posture is declared, not accidental.** A replica commits to a lane at startup; the response carries which one produced it.
+- **Execution posture is declared, not accidental.** A replica declares its lane at startup; the response carries which one produced it.
 - **Fails closed.** A configuration that would move a replica off its declared posture is a startup error, not a silent degradation.
 - **Attribution everywhere.** Every response is tagged in headers, in the completion body, and in an optional audit receipt.
 - **Scales like a stateless service.** One replica serves one model; capacity is replica count. Docker and Kubernetes manifests are in the box.
@@ -49,10 +49,10 @@ LLM serving stacks quietly trade reproducibility for performance. Batching, spec
 
 A replica declares its lane at startup, and every response is attributable to it.
 
-| Lane | Status | What it promises |
+| Lane | Status | What it delivers |
 |---|---|---|
-| **`deterministic`** | ✅ **Shipped** | Greedy requests are reproducible: the same request yields the identical token stream on every run, within one hardware class and configuration. |
-| **`throughput`** | 🚧 Planned | Continuously batched execution for aggregate throughput, with no per-request reproducibility claim. |
+| **`deterministic`** | ✅ **Shipped** | Reproducible greedy requests: the same request yields the identical token stream on every run, within one hardware class and configuration. |
+| **`throughput`** | 🚧 Planned | Continuously batched execution, tuned for aggregate throughput rather than per-request reproducibility. |
 
 ## How the deterministic lane works
 
@@ -135,9 +135,9 @@ kubectl apply -f deploy/k8s/deployment.yaml -f deploy/k8s/service.yaml
 
 See [deploy/README.md](deploy/README.md) for the full scaling model, probe configuration, and sizing guidance.
 
-## Scope of the guarantee
+## Scope
 
-Reproducibility is promised for greedy decoding (`temperature: 0`), per hardware class and configuration vector, across process restarts. It is deliberately **not** promised across different hardware classes, thread counts, or engine revisions — those change the arithmetic, and pretending otherwise is how serving stacks end up with guarantees nobody can honor. The engine pin plus the configuration hash state exactly what a replica vouches for.
+Reproducibility holds for greedy decoding (`temperature: 0`), per hardware class and configuration vector, across process restarts. It does not extend across different hardware classes, thread counts, or engine revisions — those change the arithmetic, and the scope is drawn where the results actually hold rather than one step past it. The engine pin plus the configuration hash state exactly what a replica delivers.
 
 ## Repository layout
 
@@ -154,14 +154,14 @@ crates/
 deploy/               Dockerfile and Kubernetes manifests.
 ```
 
-`engine-core` never inspects the host; anything keyed on detected hardware lives in exactly one platform crate, and the server links only the crate for its target OS. Accelerated kernels are proven bit-identical to the portable reference on real hardware — acceleration never perturbs the determinism guarantee.
+`engine-core` never inspects the host; anything keyed on detected hardware lives in exactly one platform crate, and the server links only the crate for its target OS. Accelerated kernels are proven bit-identical to the portable reference on real hardware — acceleration delivers speed without changing a single output bit.
 
 ## Roadmap
 
 - **Throughput lane** — continuous batching behind the same attribution surface.
 - **Per-tenant lane routing** at the gateway.
 - **Engine port completion** — the forward pass and decode loop, landing subsystem by subsystem behind the pinned engine until the in-tree engine is stream-identical.
-- **Hardware-class-pinned CI** for the reproducibility guarantee.
+- **Hardware-class-pinned CI** that verifies reproducible results on every change.
 
 ## License
 
