@@ -96,8 +96,10 @@ pub async fn attribute(
                 ));
                 *failed.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                 // The response we manufacture to PROTECT attribution must itself
-                // carry the full attribution set — lane, config vector, and host.
+                // carry the full attribution set — lane, config vector, and host —
+                // and be a well-formed, labeled JSON error body.
                 let headers = failed.headers_mut();
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                 headers.insert("x-camelid-lane", HeaderValue::from_static(ctx.lane));
                 if let Ok(v) = HeaderValue::from_str(short) {
                     headers.insert("x-camelid-config-sha256", v);
@@ -124,13 +126,258 @@ pub async fn attribute(
             "host": ctx.host.as_str(),
         });
         let log = Arc::clone(log);
-        // Best-effort, off the request path's async context.
+        // Best-effort, off the request path's async context. Write the whole
+        // record — JSON plus newline — in a single `write_all` so concurrent
+        // appends from simultaneous requests cannot interleave into a corrupt
+        // line.
         tokio::task::spawn_blocking(move || {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&*log) {
-                let _ = writeln!(f, "{line}");
+                let mut record = line.to_string();
+                record.push('\n');
+                let _ = f.write_all(record.as_bytes());
             }
         });
     }
 
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{attribute, Attribution, BODY_LIMIT};
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
+    use axum::middleware::from_fn_with_state;
+    use axum::response::Response;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    const TEST_SHA: &str = "30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7";
+    const TEST_HOST: &str = "linux/x86_64 cores=8 simd=avx2+fma";
+    const SSE_BODY: &str =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+
+    fn ctx(receipts: Option<Arc<PathBuf>>) -> Attribution {
+        Attribution {
+            lane: "deterministic",
+            config_sha256: Arc::new(TEST_SHA.to_string()),
+            host: Arc::new(TEST_HOST.to_string()),
+            receipts,
+        }
+    }
+
+    /// Attach the middleware with a receiptless context.
+    fn attributed(router: Router) -> Router {
+        router.layer(from_fn_with_state(ctx(None), attribute))
+    }
+
+    fn header(resp: &Response, name: &str) -> String {
+        resp.headers()
+            .get(name)
+            .unwrap_or_else(|| panic!("missing header {name}"))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn read_body(resp: Response) -> String {
+        let bytes = to_bytes(resp.into_body(), BODY_LIMIT).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Every response carries lane, config-vector (12-char short form), and
+    /// host headers — even on a non-completion path, whose body is left alone.
+    #[tokio::test]
+    async fn headers_on_every_response_body_untouched_off_completion_paths() {
+        let app = attributed(Router::new().route(
+            "/v1/models",
+            get(|| async { Json(serde_json::json!({ "object": "list", "data": [] })) }),
+        ));
+        let resp = app
+            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(header(&resp, "x-camelid-lane"), "deterministic");
+        assert_eq!(header(&resp, "x-camelid-config-sha256"), TEST_SHA[..12]);
+        assert_eq!(header(&resp, "x-camelid-host"), TEST_HOST);
+
+        let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert!(
+            body.get("camelid_lane").is_none(),
+            "a non-completion body must not be attributed: {body}"
+        );
+        assert_eq!(body["object"], "list", "original fields must be preserved");
+    }
+
+    /// A JSON completion body gains `camelid_lane` and `camelid_config_sha256`
+    /// (matching the header short form), and its original fields survive.
+    #[tokio::test]
+    async fn completion_json_body_is_attributed_in_place() {
+        let app = attributed(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { Json(serde_json::json!({ "id": "chatcmpl-1", "choices": [] })) }),
+        ));
+        let resp = app
+            .oneshot(Request::post("/v1/chat/completions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let header_sha = header(&resp, "x-camelid-config-sha256");
+        let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(body["camelid_lane"], "deterministic");
+        assert_eq!(body["camelid_config_sha256"], TEST_SHA[..12]);
+        assert_eq!(body["camelid_config_sha256"].as_str().unwrap(), header_sha.as_str());
+        assert_eq!(body["id"], "chatcmpl-1", "original fields must be preserved");
+    }
+
+    /// A non-JSON completion body is passed through byte-for-byte; only headers
+    /// are added.
+    #[tokio::test]
+    async fn non_json_completion_body_is_passed_through() {
+        let app = attributed(Router::new().route(
+            "/v1/completions",
+            post(|| async { ([(CONTENT_TYPE, "text/plain")], "hello") }),
+        ));
+        let resp = app
+            .oneshot(Request::post("/v1/completions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(header(&resp, "x-camelid-host"), TEST_HOST);
+        assert_eq!(read_body(resp).await, "hello");
+    }
+
+    /// A JSON completion body that is not an object (here, an array) must not be
+    /// corrupted by the object-only injection path.
+    #[tokio::test]
+    async fn non_object_json_completion_body_is_preserved() {
+        let app = attributed(Router::new().route(
+            "/v1/completions",
+            post(|| async { Json(serde_json::json!(["a", "b"])) }),
+        ));
+        let resp = app
+            .oneshot(Request::post("/v1/completions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(header(&resp, "x-camelid-lane"), "deterministic");
+        let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(body, serde_json::json!(["a", "b"]));
+    }
+
+    /// A streaming (`text/event-stream`) completion response is passed through
+    /// untouched — attribution never buffers or rewrites a stream — while the
+    /// identity headers are still set.
+    #[tokio::test]
+    async fn event_stream_completion_body_is_passed_through() {
+        let app = attributed(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { ([(CONTENT_TYPE, "text/event-stream")], SSE_BODY) }),
+        ));
+        let resp = app
+            .oneshot(Request::post("/v1/chat/completions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(header(&resp, "x-camelid-lane"), "deterministic");
+        assert_eq!(header(&resp, "x-camelid-config-sha256"), TEST_SHA[..12]);
+        assert_eq!(read_body(resp).await, SSE_BODY);
+    }
+
+    /// A completion body larger than the attribution buffer limit cannot be
+    /// buffered, so the middleware fails closed with a 500 that still carries
+    /// the full attribution header set — the guarantee must not be droppable by
+    /// an oversized upstream body.
+    #[tokio::test]
+    async fn oversized_completion_body_fails_closed_but_stays_attributed() {
+        let app = attributed(Router::new().route(
+            "/v1/completions",
+            post(|| async {
+                ([(CONTENT_TYPE, "application/json")], vec![b'x'; BODY_LIMIT + 1])
+            }),
+        ));
+        let resp = app
+            .oneshot(Request::post("/v1/completions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(header(&resp, "x-camelid-lane"), "deterministic");
+        assert_eq!(header(&resp, "x-camelid-config-sha256"), TEST_SHA[..12]);
+        assert_eq!(header(&resp, "x-camelid-host"), TEST_HOST);
+        // The manufactured 500 must itself be a well-formed, labeled JSON error.
+        assert_eq!(header(&resp, "content-type"), "application/json");
+        let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(body["error"]["type"], "server_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("attribution buffer limit"),
+            "unexpected error body: {body}"
+        );
+    }
+
+    /// With receipts enabled, each request appends exactly one JSONL line
+    /// carrying method, path, status, lane, the full config digest, host, and a
+    /// numeric timestamp. Two requests must yield two lines — append, not
+    /// truncate — and concurrent appends must not corrupt a line.
+    #[tokio::test]
+    async fn receipts_append_one_line_per_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let app = Router::new()
+            .route("/v1/models", get(|| async { Json(serde_json::json!({ "object": "list" })) }))
+            .route(
+                "/v1/completions",
+                post(|| async { Json(serde_json::json!({ "id": "x" })) }),
+            )
+            .layer(from_fn_with_state(ctx(Some(Arc::new(path.clone()))), attribute));
+
+        app.clone()
+            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        app.oneshot(Request::post("/v1/completions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let receipts = read_receipts(&path, 2).await;
+        for r in &receipts {
+            assert_eq!(r["lane"], "deterministic");
+            assert_eq!(r["config_sha256"], TEST_SHA);
+            assert_eq!(r["host"], TEST_HOST);
+            assert_eq!(r["status"], 200);
+            assert!(r["ts"].is_number(), "ts must be numeric: {r}");
+        }
+        // The two append writes may land in either order, so match on the set.
+        let seen: std::collections::HashSet<(String, String)> = receipts
+            .iter()
+            .map(|r| {
+                (
+                    r["method"].as_str().unwrap().to_string(),
+                    r["path"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert!(seen.contains(&("GET".to_string(), "/v1/models".to_string())));
+        assert!(seen.contains(&("POST".to_string(), "/v1/completions".to_string())));
+    }
+
+    async fn read_receipts(path: &Path, expected: usize) -> Vec<serde_json::Value> {
+        for _ in 0..200 {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+                if lines.len() >= expected {
+                    return lines.iter().map(|l| serde_json::from_str(l).unwrap()).collect();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("expected {expected} receipt line(s) were not written within the timeout");
+    }
 }

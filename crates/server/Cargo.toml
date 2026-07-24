@@ -33,3 +33,11 @@ engine-linux.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 engine-windows.workspace = true
+
+[dev-dependencies]
+# Drive the attribution middleware through a real router (`ServiceExt::oneshot`)
+# and write receipts to a scratch dir. `tower`'s `ServiceExt` operates on the
+# `tower_service::Service` a `Router` already implements, so no version pinning
+# to axum's internal tower is required.
+tower = { version = "0.5", features = ["util"] }
+tempfile.workspace = true
