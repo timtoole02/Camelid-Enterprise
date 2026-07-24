@@ -26,3 +26,19 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --workspace -- -D warnings
         continue-on-error: true # informational until the port stabilizes
+
+  # The aarch64 feature-detection branches are #[cfg]-gated out of the x86_64
+  # test runners above, so they never compile there. Cross-check them so the
+  # ARM paths can't rot silently. `cargo check` does not link, so a target's
+  # prebuilt std (via rustup) is sufficient — no full cross toolchain needed.
+  # (macOS aarch64 is already exercised natively by the macos-latest runner.)
+  aarch64-cross-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc, aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p camelid-enterprise-engine-windows --target aarch64-pc-windows-msvc
+      - run: cargo check -p camelid-enterprise-engine-linux --target aarch64-unknown-linux-gnu
