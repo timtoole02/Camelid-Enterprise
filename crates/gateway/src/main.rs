@@ -52,6 +52,14 @@ enum Command {
         /// unauthenticated, unchanged from prior releases.
         #[arg(long, env = "CAMELID_GATEWAY_IDENTITY_DB")]
         identity_db: Option<PathBuf>,
+        /// Path to an append-only JSONL audit log. When set, the gateway
+        /// records one line per request it handles — including requests it
+        /// rejects for authentication or admission — carrying the request's
+        /// correlation id, the resolved principal (or null), method, path, and
+        /// status. Join it to a replica's serving receipts on `request_id` to
+        /// see which deterministic configuration served each caller's request.
+        #[arg(long, env = "CAMELID_GATEWAY_AUDIT_LOG")]
+        audit_log: Option<PathBuf>,
     },
     /// Create a user in the identity database and print its opaque principal id.
     CreateUser {
@@ -95,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_in_flight,
             max_connection_seconds,
             identity_db,
+            audit_log,
         } => {
             serve(
                 &upstream,
@@ -102,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_in_flight,
                 max_connection_seconds,
                 identity_db,
+                audit_log,
             )
             .await
         }
@@ -120,6 +130,7 @@ async fn serve(
     max_in_flight: NonZeroUsize,
     max_connection_seconds: u64,
     identity_db: Option<PathBuf>,
+    audit_log: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream = UpstreamOrigin::parse(upstream)?;
     let auth = match identity_db {
@@ -140,6 +151,13 @@ async fn serve(
             GatewayAuth::Disabled
         }
     };
+    let audit = match audit_log {
+        Some(path) => {
+            tracing::info!(path = %path.display(), "gateway request audit log enabled");
+            Some(Arc::new(path))
+        }
+        None => None,
+    };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let max_connection_duration = Duration::from_secs(max_connection_seconds);
     tracing::info!(
@@ -150,7 +168,7 @@ async fn serve(
     );
     camelid_enterprise_gateway::serve(
         listener,
-        router_with_options(upstream, max_in_flight, auth),
+        router_with_options(upstream, max_in_flight, auth, audit),
         max_connection_duration,
         shutdown_signal(),
     )
