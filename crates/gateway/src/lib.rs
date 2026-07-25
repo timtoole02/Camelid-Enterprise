@@ -23,7 +23,7 @@ use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -196,8 +196,8 @@ async fn gateway_health() -> StatusCode {
 
 async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Response {
     // Minted before anything can reject the request, so every audited outcome
-    // \u2014 including authentication and admission rejections \u2014 carries a
-    // correlation id. This is gateway-authoritative: any inbound
+    // (including authentication and admission rejections) carries a correlation
+    // id. This is gateway-authoritative: any inbound
     // `x-camelid-request-id` is overwritten below, never trusted, exactly as
     // the untrusted forwarding headers are stripped.
     let request_id = mint_request_id();
@@ -284,8 +284,17 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
 
 /// Records the audit line for a handled request, when auditing is enabled, and
 /// returns the response unchanged so it can wrap every return path in
-/// [`proxy`]. Only the response status is read here, which is available as soon
-/// as the upstream response head arrives; a streaming body is never touched.
+/// [`proxy`].
+///
+/// The recorded `status` is the response *head* status, known as soon as the
+/// upstream response head arrives; the streaming body is never buffered or
+/// touched. A response whose head is `200` but whose stream then errors or is
+/// cut short mid-generation is still recorded as `200`. This makes the audit
+/// log a request-**initiation** and correlation record — not a
+/// stream-completion or metering substrate: it cannot, on its own, distinguish
+/// a full generation from one truncated after three tokens. Metering must not
+/// be built on head status alone; that needs stream-completion accounting the
+/// gateway does not do here.
 fn audited(
     state: &GatewayState,
     request_id: &str,
@@ -300,6 +309,22 @@ fn audited(
     response
 }
 
+/// Serializes whole-record appends to the audit log within this process,
+/// mirroring the replica's receipt writer so both append-only JSONL logs share
+/// one safety model. `O_APPEND` makes a single `write` atomic, but `write_all`
+/// can issue more than one `write` on a short write, and the audit line and the
+/// receipt line are meant to be joined: a torn line loses the join at exactly
+/// the concurrency burst where auditing matters most. Taking the whole-record
+/// append under this lock removes that risk.
+///
+/// The gateway and the replica are separate processes writing separate files,
+/// so this lock is deliberately per-process and independent of the replica's
+/// receipt lock; there is no cross-process contention to coordinate.
+fn audit_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 /// Appends one JSONL audit line: `{ts, request_id, principal, method, path,
 /// status}`. `principal` is the resolved principal's opaque id, or JSON `null`
 /// when the request was unauthenticated (auth disabled) or rejected before a
@@ -307,9 +332,12 @@ fn audited(
 /// forwarded request, so this line joins to the replica's serving receipt.
 ///
 /// Best-effort and off the request's async context: a failed write must never
-/// fail the request. The whole record \u2014 JSON plus newline \u2014 is written in a
-/// single `write_all` so concurrent appends cannot interleave into a corrupt
-/// line.
+/// fail the request. The write is not awaited, so audit lines still queued in
+/// `spawn_blocking` when the process exits (for example on SIGTERM) are
+/// dropped, matching the best-effort, no-durability contract the receipt writer
+/// carries. The whole record (JSON plus newline) is written under
+/// `audit_write_lock` in a single `write_all` so concurrent appends cannot
+/// interleave into a corrupt line.
 fn write_audit_record(
     log: &Arc<PathBuf>,
     request_id: &str,
@@ -331,6 +359,15 @@ fn write_audit_record(
     });
     let log = Arc::clone(log);
     tokio::task::spawn_blocking(move || {
+        // Recover a poisoned lock instead of dropping every later audit line
+        // for the rest of the process's life. Each holder appends exactly one
+        // complete, newline-terminated record, so a panic while holding the
+        // lock cannot leave a partial line behind; treating a poisoned guard as
+        // usable is safe and keeps the audit trail alive after an unrelated
+        // one-off failure.
+        let _guard = audit_write_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -344,9 +381,12 @@ fn write_audit_record(
 }
 
 /// Mints an opaque, gateway-authoritative request correlation id. 128 bits of
-/// randomness make a collision between two records (and thus a mis-join to a
-/// serving receipt) negligible. The id is neither a secret nor an identity, so
-/// a fast, non-cryptographic source is sufficient.
+/// randomness make a collision between two records probabilistically negligible
+/// (a birthday bound around 2^64 mints), though not guaranteed unique, which is
+/// worth recording if this id is ever promoted to a billing key. The id is
+/// neither a secret nor a capability, so a fast, non-cryptographic source is
+/// sufficient; `fastrand`'s per-thread PRNG supplies the value only, never an
+/// ordering source.
 fn mint_request_id() -> String {
     format!("req_{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..))
 }

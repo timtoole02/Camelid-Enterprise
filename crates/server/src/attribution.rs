@@ -57,6 +57,12 @@ pub async fn attribute(
     // identity-blind while letting a serving receipt be joined to the gateway's
     // audit record. Absent when a client reaches the replica directly, in which
     // case the receipt records `null`.
+    //
+    // The replica records this value verbatim and cannot verify it: a client
+    // able to reach the replica directly can forge or collide a `req_<id>`.
+    // serde_json escaping keeps a forged value from corrupting the JSONL, so
+    // this is not an injection vector, but join integrity therefore rests on
+    // the deployment's replica network isolation, not on anything cryptographic.
     let request_id = req
         .headers()
         .get("x-camelid-request-id")

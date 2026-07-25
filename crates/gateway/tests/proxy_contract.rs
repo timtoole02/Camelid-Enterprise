@@ -1100,6 +1100,71 @@ async fn audit_log_records_both_forwarded_and_rejected_requests() {
     assert_eq!(forwarded_record["request_id"], upstream_request_id);
 }
 
+/// Under concurrent load the audit writer must produce exactly one complete,
+/// independently parseable line per request, each with a unique correlation id,
+/// proving the whole-record append is serialized (no torn or interleaved lines)
+/// and that minted ids do not collide.
+#[tokio::test]
+async fn audit_log_is_not_torn_by_concurrent_requests() {
+    const REQUESTS: usize = 48;
+    let upstream = spawn_server(Router::new().fallback(any(|| async {
+        Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .unwrap()
+    })))
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let gateway = spawn_gateway_with_audit(
+        upstream.addr,
+        GatewayAuth::Disabled,
+        Arc::new(audit_path.clone()),
+    )
+    .await;
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..REQUESTS {
+        let addr = gateway.addr;
+        tasks.spawn(async move {
+            client()
+                .request(
+                    Request::get(format!("http://{addr}/v1/models"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        assert_eq!(result.unwrap(), StatusCode::NO_CONTENT);
+    }
+
+    // read_audit_records parses every line; a torn line would panic here.
+    let records = read_audit_records(&audit_path, REQUESTS).await;
+    assert_eq!(
+        records.len(),
+        REQUESTS,
+        "each request must append exactly one parseable audit line"
+    );
+    let ids: std::collections::HashSet<&str> = records
+        .iter()
+        .map(|record| record["request_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        REQUESTS,
+        "every minted correlation id must be unique"
+    );
+    for record in &records {
+        assert_eq!(record["path"], "/v1/models");
+        assert_eq!(record["status"], 204);
+        assert!(record["principal"].is_null());
+    }
+}
+
 async fn read_audit_records(path: &std::path::Path, expected: usize) -> Vec<serde_json::Value> {
     for _ in 0..200 {
         if let Ok(contents) = std::fs::read_to_string(path) {

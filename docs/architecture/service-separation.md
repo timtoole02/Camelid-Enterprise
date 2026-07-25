@@ -229,6 +229,12 @@ tokens for one model"; everything multi-user is layered on top.
   own optional `--audit-log`, and the replica echoes that id into its serving
   receipt — so `gateway_audit ⨝ replica_receipt ON request_id` reconstructs
   "which principal's request was served by which deterministic configuration."
+  Two honest bounds on that log: the audited `status` is the response *head*,
+  not stream completion, so it is a correlation and request-initiation record,
+  not a metering substrate — it cannot distinguish a full generation from one
+  truncated mid-stream. And the replica echoes the correlation id verbatim, so
+  join integrity rests on replica network isolation (a client able to reach the
+  replica directly can forge one), not on anything cryptographic.
   Still missing: no way to require auth by default, no token expiry/rotation,
   no routing or quotas.
 
@@ -278,9 +284,12 @@ before the corresponding phase starts.
   the replica learning identity: the gateway mints an opaque, authoritative
   `x-camelid-request-id`, keeps identity in its own append-only audit log, and
   the replica records only that opaque id in its serving receipt. The two logs
-  join on `request_id`. Open follow-on: durable aggregation of these two
-  append-only logs (part of Phase 6), and whether the gateway audit log should
-  also capture request/response byte counts for metering.
+  join on `request_id`, and correlation integrity rests on replica network
+  isolation (the id is echoed verbatim and forgeable by a direct client), not
+  on cryptography. Open follow-on: the audit log records the response *head*
+  status only, so a durable **metering** substrate (Phase 6) still needs
+  stream-completion accounting and request/response byte counts the current log
+  does not capture; and durable aggregation of the two append-only logs.
 
 ---
 
