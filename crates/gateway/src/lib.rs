@@ -19,9 +19,11 @@ use hyper_util::rt::{TokioExecutor, TokioTimer};
 use identity::{IdentityError, PrincipalId, SqliteIdentityStore, TokenStore};
 use pin_project_lite::pin_project;
 use std::fmt;
+use std::io::Write;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -45,6 +47,13 @@ pub const DEFAULT_MAX_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 /// generations must complete within this bound. Size it to the slowest real
 /// completion the deployment expects, with margin.
 pub const DEFAULT_MAX_CONNECTION_DURATION: Duration = Duration::from_secs(300);
+/// Gateway-authoritative request correlation id header. The gateway sets this
+/// on every forwarded request, overwriting any value a client sent, and the
+/// replica records it in its serving receipt. A gateway audit record and the
+/// replica receipt that served the same request can then be joined on this id.
+/// The id is opaque: it carries no identity, so the replica stays
+/// identity-blind.
+const REQUEST_ID_HEADER: &str = "x-camelid-request-id";
 
 #[derive(Clone, Debug)]
 pub struct UpstreamOrigin {
@@ -104,6 +113,12 @@ struct GatewayState {
     client: Client<HttpConnector, Body>,
     admission: Arc<Semaphore>,
     auth: GatewayAuth,
+    /// Optional append-only JSONL audit sink. When set, the gateway records one
+    /// line per request it handles — `{ts, request_id, principal, method, path,
+    /// status}` — including requests it rejects for authentication or
+    /// admission. `None` disables auditing entirely. CORS preflight and
+    /// `/healthz` are answered before this path and are never audited.
+    audit: Option<Arc<PathBuf>>,
 }
 
 /// Whether the gateway requires every request to carry a bearer token that
@@ -123,7 +138,7 @@ pub fn router(upstream: UpstreamOrigin) -> Router {
 }
 
 pub fn router_with_max_in_flight(upstream: UpstreamOrigin, max_in_flight: NonZeroUsize) -> Router {
-    router_with_options(upstream, max_in_flight, GatewayAuth::Disabled)
+    router_with_options(upstream, max_in_flight, GatewayAuth::Disabled, None)
 }
 
 // This route table is a hand-maintained mirror of the pinned engine's public
@@ -135,6 +150,7 @@ pub fn router_with_options(
     upstream: UpstreamOrigin,
     max_in_flight: NonZeroUsize,
     auth: GatewayAuth,
+    audit: Option<Arc<PathBuf>>,
 ) -> Router {
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
@@ -170,6 +186,7 @@ pub fn router_with_options(
             client,
             admission: Arc::new(Semaphore::new(max_in_flight.get())),
             auth,
+            audit,
         })
 }
 
@@ -178,19 +195,29 @@ async fn gateway_health() -> StatusCode {
 }
 
 async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Response {
+    // Minted before anything can reject the request, so every audited outcome
+    // (including authentication and admission rejections) carries a correlation
+    // id. This is gateway-authoritative: any inbound
+    // `x-camelid-request-id` is overwritten below, never trusted, exactly as
+    // the untrusted forwarding headers are stripped.
+    let request_id = mint_request_id();
+    let method = request.method().to_string();
+    // Path only, never the query string: the audit log records which route was
+    // called, not caller-supplied query parameters.
+    let path = request.uri().path().to_string();
+
     // Authentication runs before admission is checked. Otherwise an
     // unauthenticated flood would consume in-flight permits (and the SQLite
     // lookup time behind each one) meant for legitimate authenticated
     // traffic before ever being rejected; a request that fails auth must
     // never take a permit at all.
-    if let GatewayAuth::RequireToken(store) = &state.auth {
-        match authenticate(store, request.headers()).await {
-            Ok(principal) => {
-                request.extensions_mut().insert(principal);
-            }
-            Err(response) => return response,
-        }
-    }
+    let principal = match &state.auth {
+        GatewayAuth::RequireToken(store) => match authenticate(store, request.headers()).await {
+            Ok(principal) => Some(principal),
+            Err(response) => return audited(&state, &request_id, None, &method, &path, response),
+        },
+        GatewayAuth::Disabled => None,
+    };
 
     let permit = match Arc::clone(&state.admission).try_acquire_owned() {
         Ok(permit) => permit,
@@ -206,16 +233,23 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
                 HeaderValue::from_str(&retry_after.to_string())
                     .expect("a small decimal integer is a valid header value"),
             );
-            return response;
+            return audited(&state, &request_id, principal.as_ref(), &method, &path, response);
         }
     };
     let upstream_uri = match state.upstream.request_uri(request.uri()) {
         Ok(uri) => uri,
         Err(error) => {
             tracing::error!(%error, "could not construct upstream request URI");
-            return gateway_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "gateway could not construct the upstream request",
+            return audited(
+                &state,
+                &request_id,
+                principal.as_ref(),
+                &method,
+                &path,
+                gateway_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "gateway could not construct the upstream request",
+                ),
             );
         }
     };
@@ -226,8 +260,15 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
     let host = HeaderValue::from_str(state.upstream.authority.as_str())
         .expect("a valid URI authority is a valid Host header");
     request.headers_mut().insert(HOST, host);
+    // Stamp the gateway-authoritative correlation id after the untrusted
+    // inbound headers have been stripped, so the replica receives exactly the
+    // id this gateway audits. `insert` replaces any client-supplied value.
+    request.headers_mut().insert(
+        REQUEST_ID_HEADER,
+        HeaderValue::from_str(&request_id).expect("a req_ hex id is a valid header value"),
+    );
 
-    match state.client.request(request).await {
+    let response = match state.client.request(request).await {
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
             remove_hop_by_hop(&mut parts.headers);
@@ -237,7 +278,117 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
             tracing::warn!(%error, "upstream replica request failed");
             gateway_error(StatusCode::BAD_GATEWAY, "upstream replica is unavailable")
         }
+    };
+    audited(&state, &request_id, principal.as_ref(), &method, &path, response)
+}
+
+/// Records the audit line for a handled request, when auditing is enabled, and
+/// returns the response unchanged so it can wrap every return path in
+/// [`proxy`].
+///
+/// The recorded `status` is the response *head* status, known as soon as the
+/// upstream response head arrives; the streaming body is never buffered or
+/// touched. A response whose head is `200` but whose stream then errors or is
+/// cut short mid-generation is still recorded as `200`. This makes the audit
+/// log a request-**initiation** and correlation record — not a
+/// stream-completion or metering substrate: it cannot, on its own, distinguish
+/// a full generation from one truncated after three tokens. Metering must not
+/// be built on head status alone; that needs stream-completion accounting the
+/// gateway does not do here.
+fn audited(
+    state: &GatewayState,
+    request_id: &str,
+    principal: Option<&PrincipalId>,
+    method: &str,
+    path: &str,
+    response: Response,
+) -> Response {
+    if let Some(log) = &state.audit {
+        write_audit_record(log, request_id, principal, method, path, response.status());
     }
+    response
+}
+
+/// Serializes whole-record appends to the audit log within this process,
+/// mirroring the replica's receipt writer so both append-only JSONL logs share
+/// one safety model. `O_APPEND` makes a single `write` atomic, but `write_all`
+/// can issue more than one `write` on a short write, and the audit line and the
+/// receipt line are meant to be joined: a torn line loses the join at exactly
+/// the concurrency burst where auditing matters most. Taking the whole-record
+/// append under this lock removes that risk.
+///
+/// The gateway and the replica are separate processes writing separate files,
+/// so this lock is deliberately per-process and independent of the replica's
+/// receipt lock; there is no cross-process contention to coordinate.
+fn audit_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Appends one JSONL audit line: `{ts, request_id, principal, method, path,
+/// status}`. `principal` is the resolved principal's opaque id, or JSON `null`
+/// when the request was unauthenticated (auth disabled) or rejected before a
+/// principal was established. `request_id` is the same id stamped on the
+/// forwarded request, so this line joins to the replica's serving receipt.
+///
+/// Best-effort and off the request's async context: a failed write must never
+/// fail the request. The write is not awaited, so audit lines still queued in
+/// `spawn_blocking` when the process exits (for example on SIGTERM) are
+/// dropped, matching the best-effort, no-durability contract the receipt writer
+/// carries. The whole record (JSON plus newline) is written under
+/// `audit_write_lock` in a single `write_all` so concurrent appends cannot
+/// interleave into a corrupt line.
+fn write_audit_record(
+    log: &Arc<PathBuf>,
+    request_id: &str,
+    principal: Option<&PrincipalId>,
+    method: &str,
+    path: &str,
+    status: StatusCode,
+) {
+    let line = serde_json::json!({
+        "ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+        "request_id": request_id,
+        "principal": principal.map(PrincipalId::as_str),
+        "method": method,
+        "path": path,
+        "status": status.as_u16(),
+    });
+    let log = Arc::clone(log);
+    tokio::task::spawn_blocking(move || {
+        // Recover a poisoned lock instead of dropping every later audit line
+        // for the rest of the process's life. Each holder appends exactly one
+        // complete, newline-terminated record, so a panic while holding the
+        // lock cannot leave a partial line behind; treating a poisoned guard as
+        // usable is safe and keeps the audit trail alive after an unrelated
+        // one-off failure.
+        let _guard = audit_write_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&*log)
+        {
+            let mut record = line.to_string();
+            record.push('\n');
+            let _ = file.write_all(record.as_bytes());
+        }
+    });
+}
+
+/// Mints an opaque, gateway-authoritative request correlation id. 128 bits of
+/// randomness make a collision between two records probabilistically negligible
+/// (a birthday bound around 2^64 mints), though not guaranteed unique, which is
+/// worth recording if this id is ever promoted to a billing key. The id is
+/// neither a secret nor a capability, so a fast, non-cryptographic source is
+/// sufficient; `fastrand`'s per-thread PRNG supplies the value only, never an
+/// ordering source.
+fn mint_request_id() -> String {
+    format!("req_{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..))
 }
 
 pin_project! {

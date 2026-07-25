@@ -59,8 +59,8 @@ deploy/
 |---|---|---|
 | **Serving replica** | `crates/server` (`camelid-enterprise` bin) | CLI (`serve`), binds an HTTP listener, applies the deterministic lane, stamps attribution, loads one model at startup. |
 | **Lane / config freeze** | `crates/server/src/lane.rs` | Applies a canonical env-var configuration vector, fails closed on any override, publishes its SHA-256. Engine pinned by revision (`ENGINE_PIN`). |
-| **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-host` on every response, injects fields into completion bodies, writes optional JSONL serving receipts. |
-| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin forwarding for an explicit `/v1` inference allowlist, with opaque streaming bodies, hop-by-hop header filtering, no retries, bounded concurrency (admission-controlled), and no response rewriting. Replica control routes are not exposed. Optionally enforces bearer-token auth (see below), checked before the admission permit is taken; unauthenticated pass-through remains the default. |
+| **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-host` on every response, injects fields into completion bodies, writes optional JSONL serving receipts (each carrying the gateway-stamped `request_id` when present, or `null` for direct-to-replica traffic). |
+| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin forwarding for an explicit `/v1` inference allowlist, with opaque streaming bodies, hop-by-hop header filtering, no retries, bounded concurrency (admission-controlled), and no response rewriting. Replica control routes are not exposed. Optionally enforces bearer-token auth (see below), checked before the admission permit is taken; unauthenticated pass-through remains the default. Stamps a gateway-authoritative `x-camelid-request-id` on every forwarded request (overwriting any client value) and, with `serve --audit-log <path>`, writes one JSONL audit line per handled request — including auth/admission rejections — as `{ts, request_id, principal, method, path, status}`. |
 | **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | The gateway exposes `/v1/health`, model discovery, completions/chat, and the pinned engine's compatibility endpoints. Replica-local `/api` model management remains private. Provided by the pinned engine crate, **not** by this repo. |
 | **Engine core** | `crates/engine-core` | GGUF container, model config, tensor/forward/tokenizer types. Host-agnostic. |
 | **Platform kernels** | `crates/engine-{macos,linux,windows}` | Runtime CPU feature detection (`probe()`), platform kernels. macOS port landing first; Linux/Windows currently capability-detection only. |
@@ -188,8 +188,11 @@ tokens for one model"; everything multi-user is layered on top.
 - The replica stays **stateless and single-model**. Multi-tenancy is a
   gateway/identity concern, never pushed into the replica.
 - **Attribution stays at the replica**, because only the replica knows the lane,
-  config vector, and host that produced a response. The gateway may *add*
-  request/user context to receipts but must not become the source of attribution.
+  config vector, and host that produced a response. The gateway may correlate
+  *its own* identity-bearing records to a receipt — via the opaque
+  `x-camelid-request-id` it stamps and the replica echoes into that receipt —
+  but must not become the source of attribution, and identity never enters the
+  replica's receipt or config vector.
 - **Determinism and fail-closed config** remain replica-local invariants and are
   not relaxed to make routing easier.
 
@@ -224,9 +227,21 @@ tokens for one model"; everything multi-user is layered on top.
   hop lets any on-path observer capture and replay one indefinitely. Enabling
   `--identity-db` without a TLS-terminating ingress/reverse proxy (or mTLS, or
   a genuinely trusted private network) in front of it is not a secure
-  deployment; the gateway logs a warning to this effect at startup. Still
-  missing: no way to require auth by default, no token expiry/rotation, no
-  per-request identity reaching receipts, no routing or quotas.
+  deployment; the gateway logs a warning to this effect at startup. Per-request
+  identity now reaches an audit trail without the replica learning identity:
+  the gateway stamps an opaque `x-camelid-request-id` on each forwarded
+  request, records `{ts, request_id, principal, method, path, status}` to its
+  own optional `--audit-log`, and the replica echoes that id into its serving
+  receipt — so `gateway_audit ⨝ replica_receipt ON request_id` reconstructs
+  "which principal's request was served by which deterministic configuration."
+  Two honest bounds on that log: the audited `status` is the response *head*,
+  not stream completion, so it is a correlation and request-initiation record,
+  not a metering substrate — it cannot distinguish a full generation from one
+  truncated mid-stream. And the replica echoes the correlation id verbatim, so
+  join integrity rests on replica network isolation (a client able to reach the
+  replica directly can forge one), not on anything cryptographic.
+  Still missing: no way to require auth by default, no token expiry/rotation,
+  no routing or quotas.
 
    **Rebase hazard:** this work is cut from `main` before admission control
    (a bounded in-flight semaphore) lands in the separate gateway-hardening
@@ -270,8 +285,16 @@ before the corresponding phase starts.
   organizations — while still allowing a fully offline single-box mode?
 - What datastore satisfies both "one box under a desk" and "data center scale"
   without an external managed dependency?
-- How is per-request user/tenant context threaded into serving receipts without
-  making the replica aware of identity?
+- **Resolved.** Per-request user/tenant context reaches an audit trail without
+  the replica learning identity: the gateway mints an opaque, authoritative
+  `x-camelid-request-id`, keeps identity in its own append-only audit log, and
+  the replica records only that opaque id in its serving receipt. The two logs
+  join on `request_id`, and correlation integrity rests on replica network
+  isolation (the id is echoed verbatim and forgeable by a direct client), not
+  on cryptography. Open follow-on: the audit log records the response *head*
+  status only, so a durable **metering** substrate (Phase 6) still needs
+  stream-completion accounting and request/response byte counts the current log
+  does not capture; and durable aggregation of the two append-only logs.
 
 ---
 

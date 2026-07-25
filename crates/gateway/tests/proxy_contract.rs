@@ -18,6 +18,7 @@ use identity::SqliteIdentityStore;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -62,6 +63,7 @@ async fn spawn_gateway_with_limits(
         max_in_flight,
         max_connection_duration,
         GatewayAuth::Disabled,
+        None,
     )
     .await
 }
@@ -72,6 +74,24 @@ async fn spawn_gateway_with_auth(upstream: SocketAddr, auth: GatewayAuth) -> Tes
         DEFAULT_MAX_IN_FLIGHT,
         Duration::from_secs(30),
         auth,
+        None,
+    )
+    .await
+}
+
+/// Spawns a gateway that writes its request audit log to `audit`, with the
+/// given authentication mode.
+async fn spawn_gateway_with_audit(
+    upstream: SocketAddr,
+    auth: GatewayAuth,
+    audit: Arc<PathBuf>,
+) -> TestServer {
+    spawn_gateway_with_options(
+        upstream,
+        DEFAULT_MAX_IN_FLIGHT,
+        Duration::from_secs(30),
+        auth,
+        Some(audit),
     )
     .await
 }
@@ -81,11 +101,12 @@ async fn spawn_gateway_with_options(
     max_in_flight: NonZeroUsize,
     max_connection_duration: Duration,
     auth: GatewayAuth,
+    audit: Option<Arc<PathBuf>>,
 ) -> TestServer {
     let upstream = UpstreamOrigin::parse(&format!("http://{upstream}")).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router = router_with_options(upstream, max_in_flight, auth);
+    let router = router_with_options(upstream, max_in_flight, auth, audit);
     let task = tokio::spawn(async move {
         camelid_enterprise_gateway::serve(
             listener,
@@ -938,4 +959,224 @@ async fn stalled_connection_is_closed_after_the_maximum_duration_and_releases_it
     );
 
     drop(first_body);
+}
+
+/// Upstream handler that records the `x-camelid-request-id` header the gateway
+/// forwarded (if any) and returns `204 No Content`.
+async fn capture_request_id(
+    State(seen): State<Arc<Mutex<Option<String>>>>,
+    request: Request,
+) -> Response {
+    *seen.lock().unwrap() = request
+        .headers()
+        .get("x-camelid-request-id")
+        .map(|value| value.to_str().unwrap().to_string());
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn stamps_a_gateway_request_id_on_every_forwarded_request() {
+    let seen = Arc::new(Mutex::new(None));
+    let upstream = spawn_server(
+        Router::new()
+            .fallback(any(capture_request_id))
+            .with_state(Arc::clone(&seen)),
+    )
+    .await;
+    let gateway = spawn_gateway(upstream.addr).await;
+    let request = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = client().request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let request_id = seen
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the gateway must stamp a request id on the forwarded request");
+    assert!(
+        request_id.starts_with("req_") && request_id.len() == "req_".len() + 32,
+        "unexpected correlation id shape: {request_id}"
+    );
+}
+
+#[tokio::test]
+async fn overwrites_a_client_supplied_request_id() {
+    let seen = Arc::new(Mutex::new(None));
+    let upstream = spawn_server(
+        Router::new()
+            .fallback(any(capture_request_id))
+            .with_state(Arc::clone(&seen)),
+    )
+    .await;
+    let gateway = spawn_gateway(upstream.addr).await;
+    let request = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .header("x-camelid-request-id", "req_spoofed-by-client")
+        .body(Body::empty())
+        .unwrap();
+
+    client().request(request).await.unwrap();
+
+    let request_id = seen.lock().unwrap().take().unwrap();
+    assert_ne!(
+        request_id, "req_spoofed-by-client",
+        "the gateway must not trust a client-supplied correlation id"
+    );
+    assert!(request_id.starts_with("req_"));
+}
+
+#[tokio::test]
+async fn audit_log_records_both_forwarded_and_rejected_requests() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+
+    let seen = Arc::new(Mutex::new(None));
+    let upstream = spawn_server(
+        Router::new()
+            .fallback(any(capture_request_id))
+            .with_state(Arc::clone(&seen)),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let gateway = spawn_gateway_with_audit(
+        upstream.addr,
+        GatewayAuth::RequireToken(Arc::new(store)),
+        Arc::new(audit_path.clone()),
+    )
+    .await;
+
+    // A request rejected before it is forwarded (no bearer token) must still be
+    // audited, with a null principal.
+    let rejected = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        client().request(rejected).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // A forwarded request records the resolved principal and the same
+    // correlation id the upstream received.
+    let authorized = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        client().request(authorized).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let upstream_request_id = seen.lock().unwrap().take().unwrap();
+
+    let records = read_audit_records(&audit_path, 2).await;
+
+    let rejected_record = records
+        .iter()
+        .find(|record| record["status"] == 401)
+        .expect("the rejected request must be audited");
+    assert!(
+        rejected_record["principal"].is_null(),
+        "a rejected request has no resolved principal: {rejected_record}"
+    );
+    assert_eq!(rejected_record["method"], "GET");
+    assert_eq!(rejected_record["path"], "/v1/models");
+    assert!(rejected_record["request_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("req_"));
+
+    let forwarded_record = records
+        .iter()
+        .find(|record| record["status"] == 204)
+        .expect("the forwarded request must be audited");
+    assert_eq!(forwarded_record["principal"], principal.to_string());
+    assert_eq!(forwarded_record["request_id"], upstream_request_id);
+}
+
+/// Under concurrent load the audit writer must produce exactly one complete,
+/// independently parseable line per request, each with a unique correlation id,
+/// proving the whole-record append is serialized (no torn or interleaved lines)
+/// and that minted ids do not collide.
+#[tokio::test]
+async fn audit_log_is_not_torn_by_concurrent_requests() {
+    const REQUESTS: usize = 48;
+    let upstream = spawn_server(Router::new().fallback(any(|| async {
+        Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .unwrap()
+    })))
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let gateway = spawn_gateway_with_audit(
+        upstream.addr,
+        GatewayAuth::Disabled,
+        Arc::new(audit_path.clone()),
+    )
+    .await;
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..REQUESTS {
+        let addr = gateway.addr;
+        tasks.spawn(async move {
+            client()
+                .request(
+                    Request::get(format!("http://{addr}/v1/models"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        assert_eq!(result.unwrap(), StatusCode::NO_CONTENT);
+    }
+
+    // read_audit_records parses every line; a torn line would panic here.
+    let records = read_audit_records(&audit_path, REQUESTS).await;
+    assert_eq!(
+        records.len(),
+        REQUESTS,
+        "each request must append exactly one parseable audit line"
+    );
+    let ids: std::collections::HashSet<&str> = records
+        .iter()
+        .map(|record| record["request_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        REQUESTS,
+        "every minted correlation id must be unique"
+    );
+    for record in &records {
+        assert_eq!(record["path"], "/v1/models");
+        assert_eq!(record["status"], 204);
+        assert!(record["principal"].is_null());
+    }
+}
+
+async fn read_audit_records(path: &std::path::Path, expected: usize) -> Vec<serde_json::Value> {
+    for _ in 0..200 {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let lines: Vec<&str> = contents.lines().filter(|line| !line.trim().is_empty()).collect();
+            if lines.len() >= expected {
+                return lines
+                    .iter()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("expected {expected} audit line(s) were not written within the timeout");
 }

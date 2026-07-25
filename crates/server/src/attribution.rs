@@ -6,7 +6,9 @@
 //! - `camelid_lane` / `camelid_config_sha256` fields injected into non-streaming
 //!   completion JSON bodies;
 //! - an optional append-only serving-receipt log (JSONL), one line per request,
-//!   carrying the lane, config vector, and host identity.
+//!   carrying the lane, config vector, host identity, and, when present, the
+//!   gateway-stamped request correlation id that joins the receipt to the
+//!   gateway's audit record.
 //!
 //! Host identity is attributed but deliberately NOT folded into the config
 //! vector hash: the config vector identifies a *configuration* (so two pools on
@@ -55,6 +57,22 @@ pub async fn attribute(
 ) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().to_string();
+    // Correlation id the gateway stamped on the forwarded request, if any. It
+    // is opaque and carries no identity, so recording it keeps the replica
+    // identity-blind while letting a serving receipt be joined to the gateway's
+    // audit record. Absent when a client reaches the replica directly, in which
+    // case the receipt records `null`.
+    //
+    // The replica records this value verbatim and cannot verify it: a client
+    // able to reach the replica directly can forge or collide a `req_<id>`.
+    // serde_json escaping keeps a forged value from corrupting the JSONL, so
+    // this is not an injection vector, but join integrity therefore rests on
+    // the deployment's replica network isolation, not on anything cryptographic.
+    let request_id = req
+        .headers()
+        .get("x-camelid-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
     let mut resp = next.run(req).await;
 
     let short = &ctx.config_sha256[..12];
@@ -123,6 +141,7 @@ pub async fn attribute(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0),
+            "request_id": request_id,
             "method": method,
             "path": path,
             "status": resp.status().as_u16(),
@@ -375,6 +394,10 @@ mod tests {
             assert_eq!(r["host"], TEST_HOST);
             assert_eq!(r["status"], 200);
             assert!(r["ts"].is_number(), "ts must be numeric: {r}");
+            assert!(
+                r["request_id"].is_null(),
+                "a request without a gateway correlation id must record null: {r}"
+            );
         }
         let seen: std::collections::HashSet<String> = receipts
             .iter()
@@ -384,6 +407,36 @@ mod tests {
         for index in 0..REQUESTS {
             assert!(seen.contains(&format!("/contract-receipt/{index}")));
         }
+    }
+
+    /// A request carrying the gateway's `x-camelid-request-id` correlation
+    /// header records that exact id in its receipt, so the receipt can be
+    /// joined to the gateway's audit record for the same request.
+    #[tokio::test]
+    async fn receipt_records_the_gateway_request_id_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { Json(serde_json::json!({ "object": "list" })) }),
+            )
+            .layer(from_fn_with_state(ctx(Some(Arc::new(path.clone()))), attribute));
+
+        app.oneshot(
+            Request::get("/v1/models")
+                .header("x-camelid-request-id", "req_0123456789abcdef0123456789abcdef")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let receipts = read_receipts(&path, 1).await;
+        assert_eq!(
+            receipts[0]["request_id"],
+            "req_0123456789abcdef0123456789abcdef"
+        );
     }
 
     async fn read_receipts(path: &Path, expected: usize) -> Vec<serde_json::Value> {
