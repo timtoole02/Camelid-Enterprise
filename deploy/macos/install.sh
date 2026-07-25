@@ -196,8 +196,10 @@ fi
 
 cat <<EOF
 
-Started. Listening is not readiness: the replica binds its port, then reads and
-loads the model, and serves nothing until that finishes.
+Started. Listening is not readiness: the replica reads and hashes the model whole
+BEFORE it binds its port -- a replica must never answer a request without being
+able to say what produced it -- then binds, then loads the model, and serves
+nothing until that load finishes.
 
     until curl -fsS --max-time 3 http://127.0.0.1:8181/v1/health \\
         | grep -q '"generation_ready":true'; do sleep 2; done

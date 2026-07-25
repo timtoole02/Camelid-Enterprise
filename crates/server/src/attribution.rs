@@ -7,8 +7,8 @@
 //!   / `x-camelid-model-sha256` / `x-camelid-host` / `x-camelid-worker-threads`
 //!   headers on every response (including streams);
 //! - `camelid_lane` / `camelid_config_sha256` / `camelid_admission_sha256` /
-//!   `camelid_model_sha256` / `camelid_worker_threads` fields injected into
-//!   non-streaming completion JSON bodies;
+//!   `camelid_model_sha256` / `camelid_host` / `camelid_worker_threads` fields
+//!   injected into non-streaming completion JSON bodies;
 //! - an optional append-only serving-receipt log (JSONL), one line per request,
 //!   carrying the same facts as `lane`, `config_sha256`, `admission_sha256`,
 //!   `model_sha256`, `host` and `worker_threads`.
@@ -30,9 +30,20 @@
 //!
 //! **Host identity** is attributed but deliberately NOT folded into the config
 //! vector hash: the config vector identifies a *configuration* (so two pools on
-//! different hardware classes stay comparable by hash), while `x-camelid-host`
-//! and the receipt's `host` field carry the hardware class the guarantee is
-//! scoped to.
+//! different hardware classes stay comparable by hash), while `x-camelid-host`,
+//! `camelid_host` and the receipt's `host` field carry the hardware class the
+//! guarantee is scoped to.
+//!
+//! It is on all three surfaces and not only on the header, which is a correction
+//! rather than a flourish. The hardware class is the axis the reproducibility
+//! scope is *stated over*: two replicas serving the same weights under the same
+//! configuration at the same pool width can emit different tokens when one has a
+//! SIMD feature the other lacks and the engine routes through a different
+//! kernel. With `camelid_host` absent, those two replicas' completion bodies
+//! were identical over every attribution field, so a client verifying
+//! attribution from the body — which is what the README demonstrates, and the
+//! only surface a response-body-shaped client library exposes without extra
+//! work — could not tell them apart on the one axis that had moved.
 //!
 //! **Model identity** is the content of the weights, and it is here because it
 //! is the one input that changes every token while changing nothing else. The
@@ -196,14 +207,26 @@ impl ModelIdentity {
     /// read-only model mount and a served surface with no route, and no request
     /// body, that can change which weights answer.
     ///
-    /// What it does not cover, stated rather than left to be inferred: it
-    /// compares length and, on unix, device and inode, so a **same-length,
-    /// in-place rewrite** of the file passes it. Replacement by rename is
-    /// caught, and that is the accident a build pipeline actually produces;
-    /// `dd conv=notrunc` over a live GGUF is not. Nor does one check cover the
-    /// process's life — it runs once, immediately after the startup load — so
-    /// against a writer who can reach the file, the answer is the read-only
-    /// mount, not this.
+    /// What it does not cover, stated rather than left to be inferred, and
+    /// stated at the size it actually is. It compares length and, on unix,
+    /// device and inode, so a **same-length, in-place rewrite** of the file
+    /// passes it. Replacement by rename is caught, and that is the accident a
+    /// build pipeline actually produces; `dd conv=notrunc` over a live GGUF is
+    /// not.
+    ///
+    /// And the exposure is not the interval this check sits in. It is tempting
+    /// to describe the gap as a hashing-versus-loading window, which would make
+    /// a rewrite outside that window harmless; it is not, because the load does
+    /// not finish reading the file. At the pinned engine, tensors are bound as
+    /// descriptors and their rows are read from a cached file handle inside the
+    /// forward pass, so the GGUF is a live input for as long as the process
+    /// serves. A same-length rewrite an hour into serving changes the tokens
+    /// while `x-camelid-model-sha256`, `camelid_model_sha256` and the receipt's
+    /// `model_sha256` all go on describing the bytes hashed at startup — and a
+    /// second replica legitimately serving those original bytes is then
+    /// byte-indistinguishable from this one. One check at startup cannot close
+    /// that; against a writer who can reach the file, the answer is the
+    /// read-only mount, which both deployments in this tree provide.
     pub fn verify_unchanged(&self, path: &Path) -> Result<(), String> {
         let meta = std::fs::metadata(path).map_err(|err| {
             format!("cannot re-check the model at {} after loading it: {err}", path.display())
@@ -313,6 +336,13 @@ impl Attribution {
     /// The digests go in at their published short length so a caller comparing
     /// the body against the header is comparing the same string, and the thread
     /// count goes in as a JSON number rather than a string because it is one.
+    ///
+    /// Every field the headers carry, and for the same reason the three surfaces
+    /// exist: a consumer that reads only one of them must not be missing a claim
+    /// the others make. `camelid_host` is here because the hardware class is the
+    /// axis the reproducibility scope is stated over, and nothing else in a
+    /// completion body varies with it — the engine's own metadata is derived
+    /// from the model and the configuration, and the timings are noise.
     fn inject(&self, value: &mut serde_json::Value) {
         let Some(obj) = value.as_object_mut() else {
             return;
@@ -321,6 +351,7 @@ impl Attribution {
         obj.insert("camelid_config_sha256".into(), self.short().into());
         obj.insert("camelid_admission_sha256".into(), self.admission_short().into());
         obj.insert("camelid_model_sha256".into(), self.model.short().into());
+        obj.insert("camelid_host".into(), self.host.as_str().into());
         obj.insert("camelid_worker_threads".into(), self.workers.count.into());
     }
 
@@ -487,6 +518,14 @@ mod tests {
         }
     }
 
+    /// The same replica on a different hardware class: only `host` moves.
+    fn ctx_on_host(host: &str, receipts: Option<Arc<PathBuf>>) -> Attribution {
+        Attribution {
+            host: Arc::new(host.to_string()),
+            ..ctx_full(TEST_MODEL_SHA, TEST_ADMISSION_SHA, receipts)
+        }
+    }
+
     /// Attach the middleware with a receiptless context.
     fn attributed(router: Router) -> Router {
         router.layer(from_fn_with_state(ctx(None), attribute))
@@ -506,8 +545,9 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
-    /// Every response carries lane, config vector, model digest, host and worker
-    /// width — even on a non-completion path, whose body is left alone.
+    /// Every response carries lane, config vector, admission policy, model
+    /// digest, host and worker width — even on a non-completion path, whose body
+    /// is left alone.
     #[tokio::test]
     async fn headers_on_every_response_body_untouched_off_completion_paths() {
         let app = attributed(Router::new().route(
@@ -624,7 +664,67 @@ mod tests {
         assert_eq!(one_body["camelid_worker_threads"], two_body["camelid_worker_threads"]);
     }
 
-    /// A JSON completion body gains all five fields, each matching its header
+    /// Two replicas on different hardware classes must not publish identical
+    /// attribution on any of the three surfaces — and the body is the one this
+    /// was wrong on.
+    ///
+    /// The hardware class is the axis the reproducibility scope is stated over.
+    /// Same weights, same configuration, same admission policy, same pool width,
+    /// one host with a SIMD feature the other lacks: the engine can route
+    /// through a different kernel and the two emit different tokens. Everything
+    /// else these two replicas publish is byte-identical, which is exactly what
+    /// makes `host` load-bearing rather than decorative, and exactly why leaving
+    /// it off the body left a client that verifies from the body — the surface
+    /// the README's own example reads — unable to see the axis that moved.
+    #[tokio::test]
+    async fn two_hosts_render_differently_everywhere_they_are_published() {
+        const OTHER_HOST: &str = "linux/x86_64 cores=8 simd=avx2+avx512f+avx512vnni+fma";
+
+        async fn responses(host: &str) -> (String, serde_json::Value, String) {
+            let dir = tempfile::tempdir().unwrap();
+            let receipts = dir.path().join("receipts.jsonl");
+            let app = Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    post(|| async { Json(serde_json::json!({ "id": "chatcmpl-1" })) }),
+                )
+                .layer(from_fn_with_state(
+                    ctx_on_host(host, Some(Arc::new(receipts.clone()))),
+                    attribute,
+                ));
+            let resp = app
+                .oneshot(Request::post("/v1/chat/completions").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let header_value = header(&resp, "x-camelid-host");
+            let body: serde_json::Value =
+                serde_json::from_str(&read_body(resp).await).unwrap();
+            let receipt = read_receipts(&receipts, 1).await.remove(0);
+            (header_value, body, receipt["host"].as_str().unwrap().to_string())
+        }
+
+        let (one_header, one_body, one_receipt) = responses(TEST_HOST).await;
+        let (two_header, two_body, two_receipt) = responses(OTHER_HOST).await;
+
+        assert_eq!(one_header, TEST_HOST);
+        assert_ne!(one_header, two_header, "the header must distinguish the hosts");
+        assert_eq!(one_body["camelid_host"], TEST_HOST);
+        assert_ne!(
+            one_body["camelid_host"], two_body["camelid_host"],
+            "the completion body must distinguish the hosts"
+        );
+        assert_eq!(one_receipt, TEST_HOST);
+        assert_ne!(one_receipt, two_receipt, "the receipt must distinguish the hosts");
+
+        // …while every other published field is identical, which is what makes
+        // this field the only thing that could have told them apart.
+        assert_eq!(one_body["camelid_config_sha256"], two_body["camelid_config_sha256"]);
+        assert_eq!(one_body["camelid_admission_sha256"], two_body["camelid_admission_sha256"]);
+        assert_eq!(one_body["camelid_model_sha256"], two_body["camelid_model_sha256"]);
+        assert_eq!(one_body["camelid_worker_threads"], two_body["camelid_worker_threads"]);
+    }
+
+    /// A JSON completion body gains all six fields, each matching its header
     /// where both are published, and its original fields survive.
     #[tokio::test]
     async fn completion_json_body_is_attributed_in_place() {
@@ -640,6 +740,7 @@ mod tests {
         let header_config = header(&resp, "x-camelid-config-sha256");
         let header_admission = header(&resp, "x-camelid-admission-sha256");
         let header_model = header(&resp, "x-camelid-model-sha256");
+        let header_host = header(&resp, "x-camelid-host");
         let header_threads = header(&resp, "x-camelid-worker-threads");
         let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
         assert_eq!(body["camelid_lane"], "deterministic");
@@ -649,12 +750,79 @@ mod tests {
         assert_eq!(body["camelid_admission_sha256"].as_str().unwrap(), header_admission);
         assert_eq!(body["camelid_model_sha256"], TEST_MODEL_SHA[..12]);
         assert_eq!(body["camelid_model_sha256"].as_str().unwrap(), header_model);
+        assert_eq!(body["camelid_host"], TEST_HOST);
+        assert_eq!(body["camelid_host"].as_str().unwrap(), header_host);
         // A number in the body, a decimal string on the wire — the same fact in
         // each format's own idiom.
         assert_eq!(body["camelid_worker_threads"], serde_json::json!(TEST_THREADS));
         assert!(body["camelid_worker_threads"].is_number(), "thread count must not be a string");
         assert_eq!(body["camelid_worker_threads"].as_u64().unwrap().to_string(), header_threads);
         assert_eq!(body["id"], "chatcmpl-1", "original fields must be preserved");
+    }
+
+    /// The three surfaces carry the same claims, derived rather than listed.
+    ///
+    /// This is the test that would have caught `camelid_host` being missing from
+    /// the body, and the reason it is written this way: every per-field test
+    /// checks the surfaces its own field is on, so a field that is on two of the
+    /// three passes all of them. Here the header set is read off the response
+    /// and each name is *mechanically* required to appear in the body and in the
+    /// receipt — `x-camelid-worker-threads` → `camelid_worker_threads` →
+    /// `worker_threads` — so a seventh header added to `stamp` alone fails here
+    /// without anyone remembering to extend a list.
+    ///
+    /// Values are checked with `starts_with` in the receipt's direction because
+    /// the digests are deliberately published short on the wire and full in the
+    /// receipt; the body carries the short form, so there it is equality.
+    #[tokio::test]
+    async fn every_attribution_header_has_a_matching_body_and_receipt_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipts = dir.path().join("receipts.jsonl");
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|| async { Json(serde_json::json!({ "id": "chatcmpl-1" })) }),
+            )
+            .layer(from_fn_with_state(ctx(Some(Arc::new(receipts.clone()))), attribute));
+        let resp = app
+            .oneshot(Request::post("/v1/chat/completions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let published: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .filter(|(name, _)| name.as_str().starts_with("x-camelid-"))
+            .map(|(name, value)| {
+                (name.as_str().to_string(), value.to_str().unwrap().to_string())
+            })
+            .collect();
+        assert!(published.len() >= 6, "expected the full header set: {published:?}");
+
+        let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        let receipt = read_receipts(&receipts, 1).await.remove(0);
+
+        /// A JSON value as the wire would spell it, so a number and a header
+        /// string compare as the one fact they are.
+        fn rendered(value: &serde_json::Value) -> String {
+            value.as_str().map(ToOwned::to_owned).unwrap_or_else(|| value.to_string())
+        }
+
+        for (name, value) in published {
+            let body_field = name.replace("x-camelid-", "camelid_").replace('-', "_");
+            let receipt_field = name.replace("x-camelid-", "").replace('-', "_");
+            let in_body = body
+                .get(&body_field)
+                .unwrap_or_else(|| panic!("{name} is published on the wire but not as {body_field} in the completion body"));
+            let in_receipt = receipt
+                .get(&receipt_field)
+                .unwrap_or_else(|| panic!("{name} is published on the wire but not as {receipt_field} in the receipt"));
+            assert_eq!(rendered(in_body), value, "{body_field} disagrees with {name}");
+            assert!(
+                rendered(in_receipt).starts_with(&value),
+                "{receipt_field} disagrees with {name}: {in_receipt} vs {value}"
+            );
+        }
     }
 
     /// A non-JSON completion body is passed through byte-for-byte; only headers
@@ -714,6 +882,47 @@ mod tests {
         assert_eq!(header(&resp, "x-camelid-model-sha256"), TEST_MODEL_SHA[..12]);
         assert_eq!(header(&resp, "x-camelid-worker-threads"), "6");
         assert_eq!(read_body(resp).await, SSE_BODY);
+    }
+
+    /// The stream is really passed through and not merely reassembled — the
+    /// claim `event_stream_completion_body_is_passed_through` makes and cannot
+    /// check.
+    ///
+    /// That test drives the router with `oneshot` and reads the body with
+    /// `to_bytes`, which collapses the stream inside the harness whether or not
+    /// the middleware collapsed it first, so it compares identical bytes in both
+    /// worlds: delete the `is_json` guard and it still passes, while in
+    /// production every streamed completion has become a single bounded blocking
+    /// read before the first token reaches the client.
+    ///
+    /// A stream past the buffer ceiling is where the two worlds disagree
+    /// observably. Passed through, it is served; drained through `to_bytes`, it
+    /// trips the limit and becomes the manufactured 500. That is also a real
+    /// case rather than a contrivance — a long generation's SSE stream is not
+    /// bounded by anything this middleware knows about, so buffering it is a
+    /// ceiling on how much a client may be sent.
+    #[tokio::test]
+    async fn a_stream_past_the_buffer_ceiling_is_still_passed_through() {
+        let streamed = vec![b'x'; BODY_LIMIT + 1];
+        let expected = streamed.len();
+        let app = attributed(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async move { ([(CONTENT_TYPE, "text/event-stream")], streamed) }),
+        ));
+        let resp = app
+            .oneshot(Request::post("/v1/chat/completions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a stream longer than the buffer was buffered, and failed closed as if the engine \
+             had produced an oversized JSON body"
+        );
+        assert_eq!(header(&resp, "x-camelid-model-sha256"), TEST_MODEL_SHA[..12]);
+        let bytes = to_bytes(resp.into_body(), BODY_LIMIT * 2).await.unwrap();
+        assert_eq!(bytes.len(), expected, "the stream must reach the client whole");
     }
 
     /// A completion body larger than the attribution buffer limit cannot be

@@ -51,7 +51,21 @@ spec:
       containers:
         - name: server
           image: camelid-enterprise:0.1.0
-          args: ["--model", "/models/model.gguf", "--serving-receipts", "/receipts/serving.jsonl"]
+          # --threads is passed explicitly and must stay in step with the cpu
+          # request/limit below. Left unset, the replica takes rayon's default,
+          # which on Linux is derived from the cgroup quota and the affinity
+          # mask — so editing the cpu limit, or scheduling onto a node with a
+          # different mask, would silently change the served width with no diff
+          # in this manifest and no change to config_sha256 or
+          # admission_sha256. The lane's output guarantee is scoped per width,
+          # and every replica behind one Service has to come up at the same one.
+          args:
+            - "--model"
+            - "/models/model.gguf"
+            - "--threads"
+            - "8"
+            - "--serving-receipts"
+            - "/receipts/serving.jsonl"
           env:
             - name: CAMELID_ENTERPRISE_ADDR
               value: "0.0.0.0:8181"
@@ -65,16 +79,22 @@ spec:
             limits:
               cpu: "8"
               memory: 6Gi
-          # Listening is not readiness: the model loads after bind, so probe
-          # for a non-empty model list before admitting traffic.
+          # Listening is not readiness: the model loads after the port is bound,
+          # so admit traffic only once the replica says it can generate.
+          #
+          # /v1/health, not /v1/models: a model whose runtime could not be built
+          # is still listed by /v1/models, so a probe that greps for an id
+          # admits a pod that fails every generation request. generation_ready
+          # additionally requires a live runtime. grep, not jq: the image ships
+          # no jq, and grep does not care what order the engine emits fields in.
           startupProbe:
             exec:
-              command: ["sh", "-c", "curl -sf http://127.0.0.1:8181/v1/models | grep -q '\"id\"'"]
+              command: ["sh", "-c", "curl -sf http://127.0.0.1:8181/v1/health | grep -q '\"generation_ready\":true'"]
             periodSeconds: 5
             failureThreshold: 60
           readinessProbe:
             exec:
-              command: ["sh", "-c", "curl -sf http://127.0.0.1:8181/v1/models | grep -q '\"id\"'"]
+              command: ["sh", "-c", "curl -sf http://127.0.0.1:8181/v1/health | grep -q '\"generation_ready\":true'"]
             periodSeconds: 10
           livenessProbe:
             httpGet:

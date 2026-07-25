@@ -44,13 +44,31 @@
 # CLASS IS SWEPT, THEN CORRECTED BY HAND. The sweep classifies by what sits next
 # to the literal, so it scores a key as unread whenever the engine reaches the
 # read through a helper -- a name returned from a function, or one assembled at
-# runtime from a role string. Ten rows were corrected that way and they point
-# first_site at the read, not at the literal the sweep found:
-# CAMELID_APPLE_ACCELERATE (read behind a flag helper), the two
+# runtime from a role string. Seventeen rows were corrected that way and they
+# point first_site at the read, not at the literal the sweep found.
+#
+# The first ten: CAMELID_APPLE_ACCELERATE (read behind a flag helper), the two
 # CAMELID_ZERO_*_DELTA keys (names returned from a match, then read), and the
 # seven CAMELID_RECTANGULAR_LINEAR_LAYOUT* keys (the per-role names are built
 # with format! and read through the built string, which is exactly why an
 # exact-name ban list could never have covered this family).
+#
+# Seven more, found by re-checking the classes rather than the names, all of
+# them read through one of the engine's boolean-flag helpers -- which take the
+# key as an argument, so the literal at the call site does not sit next to an
+# env::var and the sweep scored it WRITE_ONLY or MENTION_ONLY with site_count 0:
+# CAMELID_BENCH_UNCACHED_RUNTIME_PLAN, CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED
+# and the three CAMELID_X86_Q8_MATMUL_OWNER_{AVX2,VNNI,4X8} keys (all through
+# the q8 flag helpers in inference/q8_runtime.rs); CAMELID_Q8_SCHED_TELEMETRY
+# and CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES, which reach their reads
+# through a named const rather than the literal.
+#
+# Those seven were WRITE_ONLY or MENTION_ONLY, not DOC_ONLY, so no assertion was
+# wrong while they sat that way: the overlap guard filters DOC_ONLY only. They
+# were corrected because the OTHER guard, every_canonical_key_is_read_by_the
+# _engine, selects on class == "READ" -- so a canonical key misfiled the same way
+# would make that test pass while proving nothing, which is the same failure
+# mode, one class over.
 #
 # After those corrections no row is DOC_ONLY. That matters more than it looks:
 # DOC_ONLY is the one class the overlap guard filters out, so a key misfiled
@@ -71,7 +89,7 @@ CAMELID_ATTENTION_F32_BLOCKED_DOT	READ	inference.rs:23733	2
 CAMELID_ATTENTION_SCORE_SCALE	READ	inference/diagnostic_config.rs:231	1
 CAMELID_ATTN_COALESCED	READ	cuda_resident.rs:3216	1
 CAMELID_AUDIT_WEBHOOK	READ	chat/audit.rs:227	1
-CAMELID_BENCH_UNCACHED_RUNTIME_PLAN	WRITE_ONLY	main.rs:4008	0
+CAMELID_BENCH_UNCACHED_RUNTIME_PLAN	READ	inference/q8_runtime.rs:137	1
 CAMELID_COMMIT	READ	main.rs:4084	3
 CAMELID_CUDA_DEVICE	READ	cuda.rs:147	1
 CAMELID_CUDA_GRAPHS	READ	cuda_resident.rs:5568	1
@@ -202,7 +220,7 @@ CAMELID_PREFILL_CHUNK_TOKENS	READ	inference.rs:4845	1
 CAMELID_PREFILL_LAYER_MAJOR	READ	inference.rs:4870	1
 CAMELID_PREFILL_LAYER_MAJOR_ATTRIBUTION	READ	inference.rs:4655	1
 CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS	READ	inference.rs:4838	1
-CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES	WRITE_ONLY	inference.rs:4688	0
+CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES	READ	inference.rs:4708	2
 CAMELID_PREFILL_THREADS	READ	inference.rs:4915	1
 CAMELID_PREFILL_TIME	READ	metal.rs:12547	2
 CAMELID_PREFILL_TRACE	READ	metal.rs:11775	1
@@ -219,7 +237,7 @@ CAMELID_Q8_0_PACKED_4X4_DOT	READ	inference.rs:21650	2
 CAMELID_Q8_0_PACKED_4X8_DOT	READ	inference.rs:21662	2
 CAMELID_Q8_0_PACK_TRACE	READ	tensor/mod.rs:667	1
 CAMELID_Q8_ROW_DISPATCH	READ	inference.rs:16976	3
-CAMELID_Q8_SCHED_TELEMETRY	MENTION_ONLY	inference/q8_telemetry.rs:123	0
+CAMELID_Q8_SCHED_TELEMETRY	READ	inference/q8_telemetry.rs:195	2
 CAMELID_QUEUE_DEPTH	READ	api/engine.rs:63	1
 CAMELID_QWEN35_CUDA	READ	runnable/model.rs:1155	2
 CAMELID_QWEN35_CUDA_MAXPOS	READ	runnable/model.rs:1177	2
@@ -310,7 +328,7 @@ CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER	READ	execution_plan.rs:2445	1
 CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE	READ	execution_plan.rs:2446	2
 CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR	READ	execution_plan.rs:2447	2
 CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER	READ	execution_plan.rs:644	3
-CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED	WRITE_ONLY	inference/q8_runtime.rs:245	0
+CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED	READ	inference/q8_runtime.rs:245	1
 CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION	READ	execution_plan.rs:2431	1
 CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK	READ	execution_plan.rs:2430	3
 CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING	READ	execution_plan.rs:2429	1
@@ -319,9 +337,9 @@ CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL	READ	execution_plan.rs:2434	1
 CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER	READ	execution_plan.rs:2435	1
 CAMELID_X86_Q8_KERNEL	READ	execution_plan.rs:552	5
 CAMELID_X86_Q8_MATMUL_OWNER	READ	inference/q8_runtime.rs:23	1
-CAMELID_X86_Q8_MATMUL_OWNER_4X8	WRITE_ONLY	main.rs:4039	0
-CAMELID_X86_Q8_MATMUL_OWNER_AVX2	WRITE_ONLY	main.rs:4037	0
-CAMELID_X86_Q8_MATMUL_OWNER_VNNI	WRITE_ONLY	main.rs:4038	0
+CAMELID_X86_Q8_MATMUL_OWNER_4X8	READ	inference/q8_runtime.rs:314	1
+CAMELID_X86_Q8_MATMUL_OWNER_AVX2	READ	inference/q8_runtime.rs:308	1
+CAMELID_X86_Q8_MATMUL_OWNER_VNNI	READ	inference/q8_runtime.rs:311	1
 CAMELID_X86_Q8_OUTPUT_AMX_PREFILL	READ	execution_plan.rs:2427	1
 CAMELID_X86_Q8_OUTPUT_DECODE_OWNER	READ	execution_plan.rs:2448	1
 CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL	READ	execution_plan.rs:2426	1

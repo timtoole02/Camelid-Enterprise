@@ -20,9 +20,11 @@ COPY --from=builder /build/target/release/camelid-enterprise /usr/local/bin/came
 ENV CAMELID_ENTERPRISE_ADDR=0.0.0.0:8181
 EXPOSE 8181
 
-# Listening is not readiness — the model loads after bind. Probe for a
-# non-empty model list.
+# Listening is not readiness — the model loads after the port is bound. Probe
+# /v1/health rather than /v1/models: a model whose runtime could not be built is
+# still listed by /v1/models, so grepping for an id reports healthy on a replica
+# that fails every generation request.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=120s \
-    CMD curl -sf http://127.0.0.1:8181/v1/models | grep -q '"id"' || exit 1
+    CMD curl -sf http://127.0.0.1:8181/v1/health | grep -q '"generation_ready":true' || exit 1
 
 ENTRYPOINT ["camelid-enterprise", "serve"]

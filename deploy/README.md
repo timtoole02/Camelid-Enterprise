@@ -48,8 +48,8 @@ consumer that compares one of them has checked one of them.
 | `x-camelid-worker-threads` | is this the pool width the pool actually came up at? |
 
 Non-streaming completion bodies carry the same facts as `camelid_lane`,
-`camelid_config_sha256`, `camelid_admission_sha256`, `camelid_model_sha256` and
-`camelid_worker_threads`, and each serving receipt carries them with the digests
+`camelid_config_sha256`, `camelid_admission_sha256`, `camelid_model_sha256`,
+`camelid_host` and `camelid_worker_threads`, and each serving receipt carries them with the digests
 at full length. The gateway does not strip them — it removes only hop-by-hop
 headers and the names a `Connection` header nominates — so a probe *through* the
 gateway still sees the replica's own identity. Its contract tests pin that for
@@ -209,9 +209,14 @@ Adjust before applying:
 - **PVC** — the manifests expect a `camelid-models` claim holding the GGUF.
 - **Resources** — requests equal limits (Guaranteed QoS) on purpose; size to
   the model. Set the `nodeSelector` so one pool = one instance type.
-- **`--threads`** — not set in the shipped manifest, so each replica comes up at
-  its pool default. Set it explicitly, and identically, once the pool spans more
-  than one node shape.
+- **`--threads`** — set explicitly in the shipped manifest (`8`), matching the
+  cpu request/limit. Keep the two in step, and keep the value identical across
+  the pool and with any other artifact that starts a replica of it (the launchd
+  unit passes `--threads` too). Do not drop the flag: unset, the width comes
+  from the cgroup quota and the affinity mask, so editing the cpu limit or
+  landing on a differently-masked node changes the served width with no diff in
+  any manifest and no change to `config_sha256` or `admission_sha256` — a pool
+  that is really several pools wearing one Service.
 - **`enableServiceLinks: false`** — already set on the replica pod spec, and it
   must stay. Kubernetes derives legacy Docker-link variables from Service names
   and injects them into every pod scheduled *after* the Service exists; this
@@ -221,20 +226,24 @@ Adjust before applying:
   expensive: the first rollout's pods precede the Services and come up clean, and
   every rollout after it fails. The gateway Deployment deliberately does not set
   this — the gateway runs no admission scan.
-- **Probes** — listening is not readiness: the model loads after bind, so the
-  startup/readiness probes check for a non-empty `/v1/models` list.
-  `GET /v1/health` with `"generation_ready":true` is the stricter check, because
-  a model can be listed while its runtime is not usable; the manifests have not
-  moved to it yet. Do not add a `tcpSocket` readiness probe against the replica —
-  see [Starting and draining](#starting-and-draining).
+- **Probes** — listening is not readiness: the model loads after the port is
+  bound, so the startup and readiness probes ask `GET /v1/health` for
+  `"generation_ready":true`, and so does the container `HEALTHCHECK`. A model
+  whose runtime could not be built is still listed by `/v1/models`, so the
+  weaker "is anything listed?" probe admits a pod that fails every generation
+  request. Liveness stays on `/v1/models`: it asks whether the process still
+  answers, which is the question a restart is the right response to. Do not add
+  a `tcpSocket` readiness probe against the replica — see
+  [Starting and draining](#starting-and-draining).
 - **`terminationGracePeriodSeconds`** — defaults to 30, which is shorter than one
   generation. Raise it on the replica pod, and drain before deleting a pod rather
   than relying on it.
 - **Receipts** — the example writes JSONL serving receipts to an `emptyDir`;
   point it at durable storage if receipts are part of your audit trail. Note that
-  a receipt is written for *every* request, probes included: at roughly 350 bytes
-  a line and a probe every few seconds, a quiet replica still produces several MB
-  a day.
+  a receipt is written for *every* request, probes included: a health-probe line
+  is about 420 bytes, so the readiness probe alone (every 10s) writes roughly
+  3.6 MB a day, and the startup probe's 5s interval doubles the rate while it
+  runs.
 - **Gateway exposure** — `camelid-enterprise-gateway` is a `ClusterIP` Service.
   Keep it private in this unauthenticated release. Add an Ingress or external
   load balancer only after an access-control layer is in place.

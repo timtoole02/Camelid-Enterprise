@@ -90,8 +90,8 @@ const REFUSED_FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "RAYON_NUM_THREADS",
-        "sizes the process-global data-parallel worker pool, and several engine kernels take a \
-         different reduction structure when the resolved width is greater than one. The width it \
+        "sizes the process-global data-parallel worker pool, and several engine kernels select a \
+         different branch when the resolved width is greater than one. The width it \
          sets is published — x-camelid-worker-threads is read back from the pool, so a replica \
          running under this looks different from one that is not — and it is refused anyway, \
          because this replica declares its width through one documented flag. Use --threads, or \
@@ -101,10 +101,12 @@ const REFUSED_FOREIGN: &[(&str, &str)] = &[
         "RAYON_RS_NUM_CPUS",
         "the deprecated spelling of RAYON_NUM_THREADS, and a live one at the pinned rayon-core: \
          the pool falls through to it whenever the current name is unset or does not parse as a \
-         positive integer, so it sizes the same pool by the same rule and reaches the same \
-         kernels. Refused for the same reason, and named separately because refusing only the \
-         current spelling would leave the refusal bypassable by a synonym this replica never \
-         mentions. Use --threads, or CAMELID_ENTERPRISE_THREADS",
+         usize at all. An explicit RAYON_NUM_THREADS=0 is not such a case — it parses, and takes \
+         the host default without consulting this name — but on every path that does fall \
+         through, this name sizes the same pool by the same rule and reaches the same kernels. \
+         Refused for the same reason, and named separately because refusing only the current \
+         spelling would leave the refusal bypassable by a synonym this replica never mentions. \
+         Use --threads, or CAMELID_ENTERPRISE_THREADS",
     ),
 ];
 
@@ -199,15 +201,48 @@ struct Permit {
 /// bump, which is the work deny-by-default was adopted to stop doing.
 ///
 /// Admission is **not** a claim that a permitted variable cannot move the
-/// numerics, and one row here plainly does: `CAMELID_ENTERPRISE_THREADS` sizes
-/// the data-parallel pool, and several engine kernels take a different reduction
-/// structure above width one. It is permitted because the width it produces is
-/// read back from the pool and published on every response, which is the same
-/// test [`REFUSED_FOREIGN`]'s part 3 applies from the other side. The rule the
-/// two tables share, stated once: **a lever this replica publishes is a lever a
-/// client can check; a lever it neither publishes nor refuses is the hole.**
-/// Refusing an operator the one width control this binary documents would buy no
-/// visibility that its own published width does not already give.
+/// numerics. **Two** of these four rows bear on the output, and naming only the
+/// second of them — as this comment, `README.md` and the ADR all once did —
+/// leaves a reader concluding the other three are inert. They are not.
+///
+///   * `CAMELID_ENTERPRISE_MODEL` is the decisive one, and what it changes is
+///     the whole output rather than a reduction order: it names the weights, so
+///     two replicas started against different files emit different logits for
+///     every prompt. Neither digest here notices — the model file is in neither
+///     preimage, so `sha256` and `admission_sha256` come out byte-identical on
+///     both. `crates/server/tests/lane_environment.rs` asserts exactly that, so
+///     it is a pinned fact rather than a remark.
+///   * `CAMELID_ENTERPRISE_THREADS` sizes the process-global data-parallel pool.
+///     The output guarantee is scoped *per* width, because bit-exactness across
+///     widths is not established for the whole forward pass — so this row is
+///     admitted with no claim made in either direction, which is itself a reason
+///     a client needs the resolved width published rather than assumed. See the
+///     ADR before strengthening this either way; it is the record that states
+///     what the pin does and does not license here.
+///
+/// The other two carry no arithmetic: `CAMELID_ENTERPRISE_ADDR` picks a socket,
+/// and `CAMELID_ENTERPRISE_TEST_MODEL` is read only under `#[cfg(test)]`.
+///
+/// Both are admitted on one ground, and it is the same test
+/// [`REFUSED_FOREIGN`]'s part 3 applies from the other side: what each resolves
+/// to is read back from the thing that consumed it and published on every
+/// response — the loaded file's SHA-256 as `x-camelid-model-sha256`, the pool's
+/// resolved width as `x-camelid-worker-threads`. Two replicas started
+/// differently are therefore told apart from the outside without reading either
+/// environment. The rule the two tables share, stated once: **a lever this
+/// replica publishes is a lever a client can check; a lever it neither publishes
+/// nor refuses is the hole.** Refusing an operator the only way to name a model
+/// without argv, or the one width control this binary documents, would buy no
+/// visibility that the published model digest and the published width do not
+/// already give.
+///
+/// So the claim this list supports is the narrow one — **every admitted lever
+/// that bears on the output is published** — and never "nothing admitted can
+/// change the output". The second reading is false on the
+/// `CAMELID_ENTERPRISE_MODEL` row before it ever reaches the threads row, and a
+/// client checking `config_sha256` and `admission_sha256` alone has checked
+/// neither of them. `model_sha256` and `worker_threads` are not decoration
+/// beside the two digests; they are the other half of the identity.
 ///
 /// These names are inside the published admission digest, **in this order** —
 /// see [`ConfigVector::admission_sha256`] before adding, removing or reordering
@@ -230,7 +265,11 @@ struct Permit {
 const PERMITTED: &[Permit] = &[
     Permit {
         rule: Match::Exact("CAMELID_ENTERPRISE_MODEL"),
-        reason: "GGUF loaded at startup (--model); the only way to supply a model without argv",
+        reason: "GGUF loaded at startup (--model); the only way to supply a model without \
+                 argv. It selects the weights, so it moves every token — and neither published \
+                 digest is taken over the model file, so both stay identical across the swap. \
+                 Admitted because the loaded file's own SHA-256 is published on every response, \
+                 as x-camelid-model-sha256, which is what makes the swap visible",
     },
     Permit {
         rule: Match::Exact("CAMELID_ENTERPRISE_ADDR"),
@@ -239,10 +278,11 @@ const PERMITTED: &[Permit] = &[
     },
     Permit {
         rule: Match::Exact("CAMELID_ENTERPRISE_THREADS"),
-        reason: "worker-thread count (--threads). It moves the numerics — kernels reduce \
-                 differently above width one — and is admitted because the width it resolves to \
-                 is read back from the pool and published on every response, so two replicas \
-                 started differently are told apart from the outside",
+        reason: "worker-thread count (--threads). Engine kernels select a different branch above \
+                 width one, and whether that changes any emitted token is not established in \
+                 either direction; the row is admitted because the width it resolves to is read \
+                 back from the pool and published on every response, so two replicas started \
+                 differently are told apart from the outside",
     },
     Permit {
         rule: Match::Exact("CAMELID_ENTERPRISE_TEST_MODEL"),
@@ -648,7 +688,7 @@ pub(crate) fn compute_admission_sha256() -> String {
 ///      are not values it accepts from anyone else;
 ///   2. at model load, long after the scan, the engine's execution planner sets
 ///      and removes several dozen of its own managed keys from detected host CPU
-///      features. One of them is a key this module warns about by name.
+///      features. Three of them are keys this module warns about by name.
 ///
 /// So a startup scan structurally cannot observe what the planner does, and must
 /// not pretend to. This is a stated limit of the startup gate, not a gap to be
@@ -780,15 +820,106 @@ mod tests {
     /// changes what this replica would admit, and so changes this value. That is
     /// the point — under deny-by-default the allow list *is* the admission
     /// surface — but it means the value is an identity with the same retirement
-    /// cost as the configuration digest, and every published copy moves with it:
-    /// this constant, `docs/adr/0002-replica-identity-surface.md`, `README.md`
-    /// and `deploy/README.md`. Update it deliberately, never by accident.
+    /// cost as the configuration digest, and every published copy has to move
+    /// with it. The complete set, established by grepping the digest rather than
+    /// from memory:
+    ///
+    ///   * this constant, and the twelve-character form asserted in
+    ///     `crates/server/tests/lane_environment.rs`. Both fail loudly, so they
+    ///     are the half that looks after itself;
+    ///   * `README.md` — the sample startup line, the sample completion body,
+    ///     and the sample serving receipt;
+    ///   * `deploy/macos/README.md` — the sample startup line, the readiness
+    ///     check that greps `x-camelid-admission-sha256`, and the paragraph
+    ///     stating that this digest does *not* move at a pin bump;
+    ///   * `docs/adr/0002-replica-identity-surface.md` — the full digest, the
+    ///     twelve-character form, and the note on where removing the `RAYON_*`
+    ///     rows would land it.
+    ///
+    /// **Not `deploy/README.md`.** It publishes neither digest, so an editor
+    /// following the list arrives with nothing to change — and walks past
+    /// `deploy/macos/README.md`, which is the launchd guide for the platform
+    /// that actually serves and carries three copies of this value.
+    ///
+    /// Nor is `TEST_ADMISSION_SHA` in `crates/server/src/attribution.rs` a copy
+    /// of this claim. It holds today's value, so it greps like one, but all that
+    /// row is required to be is distinct from the test digests beside it; it
+    /// carries no assertion about the shipped policy and does not move when the
+    /// policy does.
+    ///
+    /// `the_published_digests_appear_in_every_document_that_publishes_them`
+    /// checks the three Markdown files below. It is a presence check, so it
+    /// catches the digest going stale in one of them; it cannot catch a copy
+    /// added to a *fourth* file, and the list above is what a reader has instead.
     #[test]
     fn admission_sha256_is_pinned() {
         assert_eq!(
             compute_admission_sha256(),
             "45121fb83fef631f8464c32dada6100b23f0a0af80347031f812803ee9ec2a09",
         );
+    }
+
+    /// Both digests are published in prose as well as on the wire, and the prose
+    /// copies are maintained by hand. Nothing else in this suite reads them, so
+    /// a policy edit that updates the two constants and one of the three
+    /// documents ships the other two asserting a digest no replica publishes —
+    /// and the suite stays green, because a stale Markdown string breaks no
+    /// assertion. This is that assertion.
+    ///
+    /// A presence check, at the length each document actually publishes, and
+    /// loose on purpose: it survives a document being rewritten around its
+    /// digests, and still fails the moment one is left behind at the old value.
+    /// What it cannot do is notice a *fourth* document acquiring a copy, which
+    /// is why the retirement list on `admission_sha256_is_pinned` exists and why
+    /// `deploy/README.md` is asserted about here rather than merely omitted —
+    /// naming that file was the mistake the list itself used to make.
+    #[test]
+    fn the_published_digests_appear_in_every_document_that_publishes_them() {
+        const README: &str = include_str!("../../../README.md");
+        const ADR: &str = include_str!("../../../docs/adr/0002-replica-identity-surface.md");
+        // Short form only: this document quotes the startup line, the readiness
+        // check and the pin-bump note, none of which carry a full digest.
+        const MACOS_DEPLOY: &str = include_str!("../../../deploy/macos/README.md");
+        // Publishes neither digest, and the retirement list says so. Asserted
+        // here so the list and the tree cannot drift apart in either direction.
+        const DEPLOY: &str = include_str!("../../../deploy/README.md");
+
+        let config = compute_config_sha256();
+        let admission = compute_admission_sha256();
+
+        for (path, text, full) in [
+            ("README.md", README, true),
+            ("docs/adr/0002-replica-identity-surface.md", ADR, true),
+            ("deploy/macos/README.md", MACOS_DEPLOY, false),
+        ] {
+            for (which, digest) in [("configuration", &config), ("admission", &admission)] {
+                let short = &digest[..12];
+                assert!(
+                    text.contains(short),
+                    "{path} publishes the {which} digest, but does not contain {short}. Either \
+                     that digest moved and this document was left behind — the whole failure \
+                     this test exists for — or the document stopped publishing it, in which case \
+                     the retirement list on admission_sha256_is_pinned has to stop naming it."
+                );
+                if full {
+                    assert!(
+                        text.contains(digest.as_str()),
+                        "{path} publishes the {which} digest at full length (in the sample \
+                         serving receipt), but does not contain {digest}."
+                    );
+                }
+            }
+        }
+
+        for (which, digest) in [("configuration", &config), ("admission", &admission)] {
+            assert!(
+                !DEPLOY.contains(&digest[..12]),
+                "deploy/README.md now publishes the {which} digest. That is allowed, but it is \
+                 no longer true that only three documents do: add it to the loop above and to \
+                 the retirement list on admission_sha256_is_pinned, or the next policy edit \
+                 leaves it stale with nothing to catch it."
+            );
+        }
     }
 
     /// The digest is over rule *names*, and the reasons beside them are prose
@@ -1468,7 +1599,9 @@ mod tests {
     ///
     /// The second name is the whole test. `rayon-core` falls through to
     /// `RAYON_RS_NUM_CPUS` whenever `RAYON_NUM_THREADS` is unset or does not
-    /// parse as a positive integer, so a scan that refused only the current
+    /// parse as a `usize` at all — an explicit `RAYON_NUM_THREADS=0` parses, and
+    /// short-circuits to the host default without reaching the deprecated name.
+    /// On every path that does fall through, a scan refusing only the current
     /// spelling refused nothing: the deprecated name sizes the same pool, flips
     /// the same width-greater-than-one kernel gates, and never appears in
     /// anything the replica prints. A refusal a synonym walks around is a hint.

@@ -32,6 +32,16 @@
 //! replica hashed before it bound its port is the file it answers from until it
 //! stops.
 //!
+//! That second filter fails closed, and the reason is the one defect this design
+//! is most likely to grow back. It has to *read* the body to check the field, so
+//! it has a parser, and the engine behind it has its own; a filter that forwards
+//! what its parser could not make sense of is only as strong as the agreement
+//! between the two. There is no such agreement to rely on — the engine's JSON
+//! extractor deserializes the first value in the buffer and never asks what
+//! follows it, so a single trailing byte is a parse error here and an ordinary
+//! request there. A generation body this filter cannot fully parse is therefore
+//! refused rather than handed on.
+//!
 //! It is not an access-control layer and must not be read as one. The engine
 //! applies a permissive CORS policy inside this filter, so every route admitted
 //! here is still readable and postable from any web origin by anyone who can
@@ -256,16 +266,17 @@ impl ServedModel {
         aliases.insert(id.clone());
         for path in [canonical, requested] {
             aliases.insert(path.to_string_lossy().into_owned());
-            for part in [path.file_name(), path.file_stem()] {
-                if let Some(part) = part {
-                    aliases.insert(part.to_string_lossy().into_owned());
-                }
+            for part in [path.file_name(), path.file_stem()].into_iter().flatten() {
+                aliases.insert(part.to_string_lossy().into_owned());
             }
         }
-        // An empty name is not a name. `file_stem` of a dotfile and a stray
-        // trailing separator can both produce one, and admitting it would let a
-        // request carrying `"model": ""` through on an accident of the path
-        // rather than on a rule.
+        // An empty name is not a name. A path with no components at all — what
+        // an empty `--model` argument parses to — stringifies to `""`, and
+        // admitting it would let a request carrying `"model": ""` through on an
+        // accident of the path rather than on a rule. (It is the *path* that can
+        // be empty, not its components: `file_name` and `file_stem` of a dotfile
+        // or of a path with a trailing separator are non-empty, which is why the
+        // test for this guard has to use an empty path to see it.)
         aliases.remove("");
         Self { id, aliases }
     }
@@ -292,12 +303,36 @@ impl ServedModel {
 /// file rather than a search for dangerous ones. An admitted name is **rewritten
 /// to the engine's own key** before the request continues, which is what makes
 /// the guarantee structural instead of a race against the engine's resolution
-/// order: after this middleware the field is either absent or an exact key in
-/// the engine's loaded-model map, so the branch that reads the filesystem is
-/// unreachable from a request body. A name that is not this model's is refused
-/// identically whether or not a file of that name exists — the same status, the
-/// same code, the same message — so the field stops being a way to ask the
-/// replica what is on its disk.
+/// order: after this middleware the field is either absent, `null`, or an exact
+/// key in the engine's loaded-model map, so the branch that reads the filesystem
+/// is unreachable from a request body. A name that is not this model's is
+/// refused identically whether or not a file of that name exists — the same
+/// status, the same code, the same message — so the field stops being a way to
+/// ask the replica what is on its disk.
+///
+/// The parse is strict and a body that fails it is **refused**, which is the
+/// part of this that is easy to get wrong and was wrong here. Both sides use the
+/// same JSON library, and that is not the same as using the same parser: the
+/// engine's extractor deserializes the first value in the buffer and never asks
+/// whether anything follows it, while a whole-input parse rejects the leftovers.
+/// So `{"model":"/some/other.gguf","prompt":"hi"}x` is a parse error here and an
+/// ordinary, fully-honoured request there, and forwarding what this filter could
+/// not parse handed that path straight to the resolution the filter exists to
+/// keep it away from — one byte, and the model digest on every subsequent
+/// response describes a file the replica is no longer answering from. Refusing
+/// is also what makes the guarantee survive a pin bump: it holds however the
+/// engine's extractor is spelled, rather than for as long as two parsers agree
+/// about the end of the input.
+///
+/// It is a behavior change and not only a hardening, so it is stated plainly:
+/// **a body carrying trailing content after the object is one the engine would
+/// have accepted, and this replica now answers `400`.** That is the point rather
+/// than a regrettable side effect — the trailing content is exactly what made
+/// the `model` field uncheckable — and nothing that builds a request with a JSON
+/// encoder produces one. The other bodies refused here, the ones that do not
+/// parse at all and the valid JSON that is not an object, the engine would have
+/// refused too; for those the difference is only which component says so, and
+/// only this one can say it before the resolver runs.
 ///
 /// Layered *inside* [`serve_only_the_lane`], so only requests already admitted
 /// by method and path get here, and inside attribution, so a refusal carries the
@@ -316,48 +351,60 @@ pub async fn pin_generation_to_the_served_model(
         return oversized_request();
     };
 
-    // Anything this cannot parse, the engine cannot parse either — it is the
-    // same parser — so there is no field to check and no swap to prevent.
-    // Forward the original bytes and let the engine give its own typed answer
-    // rather than inventing a second dialect of "malformed request".
-    let body = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(serde_json::Value::Object(mut object)) => match object.get("model") {
-            // A non-string value fails the engine's own deserialization before
-            // any resolution runs, so it is passed through to be refused there,
-            // in the engine's vocabulary.
-            None | Some(serde_json::Value::Null) => Body::from(bytes),
-            Some(serde_json::Value::String(requested)) => {
-                if !served.names_this_model(requested) {
-                    return not_this_replicas_model(&served);
-                }
-                if requested == &served.id {
-                    Body::from(bytes)
-                } else {
-                    object.insert("model".into(), served.id.as_str().into());
-                    match serde_json::to_vec(&serde_json::Value::Object(object)) {
-                        Ok(rewritten) => {
-                            // Only the length changed; the request is otherwise
-                            // the one that arrived.
-                            parts.headers.insert(
-                                CONTENT_LENGTH,
-                                HeaderValue::from_str(&rewritten.len().to_string())
-                                    .expect("a decimal length is a valid header value"),
-                            );
-                            Body::from(rewritten)
-                        }
-                        // Unreachable for a value that just parsed, and handled
-                        // rather than unwrapped. Forwarding the original bytes
-                        // is *not* the safe fallback here: the name admitted
-                        // above may be a path spelling, and unrewritten it would
-                        // reach the resolution this filter exists to keep it
-                        // away from.
-                        Err(_) => return could_not_rewrite(),
-                    }
-                }
+    // Whole input, or nothing. `from_slice` consumes one JSON value and then
+    // requires end-of-input, which is strictly more than the engine's extractor
+    // asks for — and the gap between the two is the bypass this refusal closes:
+    // a body the filter could not read used to be forwarded on the theory that
+    // the engine could not read it either, and the engine reads it fine.
+    let Ok(serde_json::Value::Object(mut object)) =
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+    else {
+        return uncheckable_request();
+    };
+
+    let rewrite_needed = match object.get("model") {
+        // The common case, and the one the engine answers from the model it has
+        // active — which, with the control plane withheld and this filter in
+        // front, is the one the replica hashed.
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::String(requested)) => {
+            if !served.names_this_model(requested) {
+                return not_this_replicas_model(&served);
             }
-            Some(_) => Body::from(bytes),
-        },
-        _ => Body::from(bytes),
+            // The engine's own key is already exact, so the body travels byte
+            // for byte; anything else admitted is an alias and is rewritten.
+            requested != &served.id
+        }
+        // A `model` that is not a string is not a name this replica answers to.
+        // It cannot reach the filesystem resolution — that branch takes a
+        // string — but it is refused rather than forwarded so that the invariant
+        // after this middleware is one sentence with no exceptions in it: the
+        // field is absent, `null`, or the engine's key.
+        Some(_) => return not_this_replicas_model(&served),
+    };
+
+    let body = if rewrite_needed {
+        object.insert("model".into(), served.id.as_str().into());
+        match serde_json::to_vec(&serde_json::Value::Object(object)) {
+            Ok(rewritten) => {
+                // Only the length changed; the request is otherwise the one that
+                // arrived.
+                parts.headers.insert(
+                    CONTENT_LENGTH,
+                    HeaderValue::from_str(&rewritten.len().to_string())
+                        .expect("a decimal length is a valid header value"),
+                );
+                Body::from(rewritten)
+            }
+            // Unreachable for a value that just parsed, and handled rather than
+            // unwrapped. Forwarding the original bytes is *not* the safe
+            // fallback here: the name admitted above may be a path spelling, and
+            // unrewritten it would reach the resolution this filter exists to
+            // keep it away from.
+            Err(_) => return could_not_rewrite(),
+        }
+    } else {
+        Body::from(bytes)
     };
 
     next.run(Request::from_parts(parts, body)).await
@@ -392,6 +439,36 @@ fn not_this_replicas_model(served: &ServedModel) -> Response {
     })
     .to_string();
     json_response(StatusCode::NOT_FOUND, body)
+}
+
+/// Refusal for a generation body this filter could not fully parse.
+///
+/// The fail-closed direction, and the one the size ceiling already takes: a body
+/// this filter cannot read is a body whose `model` field it cannot check, and a
+/// field it cannot check is a field it cannot vouch for. Forwarding it would put
+/// the decision back in the hands of whichever parser runs next, which is
+/// precisely the arrangement that let one trailing byte carry an arbitrary path
+/// into the engine's resolver.
+///
+/// `400` and a request-shaped error code, because that is what it is: the body
+/// is not a JSON object this replica can serve. Most bodies that land here the
+/// engine would have called malformed as well; the one that would not is an
+/// object with something stuck on the end of it, which is the case this refusal
+/// exists for and is the one the message calls out by name.
+fn uncheckable_request() -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": "a generation request body must be a single JSON object and nothing else. \
+                        This replica checks the model field of every generation request before \
+                        serving it, so a body it cannot parse in full is refused rather than \
+                        forwarded unchecked — including one that carries trailing bytes after an \
+                        otherwise valid object.",
+            "type": "invalid_request_error",
+            "code": "unparseable_request_body",
+        }
+    })
+    .to_string();
+    json_response(StatusCode::BAD_REQUEST, body)
 }
 
 /// Refusal for a checked request that could not be re-serialized.
@@ -755,13 +832,22 @@ mod tests {
         }
     }
 
-    /// An empty `file_stem` — a dotfile, a trailing separator — must not smuggle
-    /// an empty name onto the alias set, where `"model": ""` would match it on
-    /// an accident of the path rather than on a rule.
+    /// A path with no components at all must not smuggle an empty name onto the
+    /// alias set, where `"model": ""` would match it on an accident of the path
+    /// rather than on a rule.
+    ///
+    /// The input is the whole test. `Path::new("/models/")` and
+    /// `Path::new(".gguf")` look like the cases that produce an empty component
+    /// and do not — `file_name` and `file_stem` are `Some("models")` for the
+    /// first and `Some(".gguf")` for the second — so a version of this test
+    /// built on those passes with the guard it covers deleted. The empty path is
+    /// the only input that puts `""` on the set, via `to_string_lossy`, and it
+    /// is reachable: `--model ""` produces exactly it.
     #[test]
-    fn a_path_that_yields_an_empty_component_does_not_admit_the_empty_name() {
-        let served =
-            ServedModel::new("id".to_string(), Path::new("/models/"), Path::new(".gguf"));
+    fn a_path_with_no_components_does_not_admit_the_empty_name() {
+        let empty = Path::new("");
+        assert_eq!(empty.to_string_lossy(), "", "the input has to be able to produce an alias");
+        let served = ServedModel::new("id".to_string(), empty, empty);
         assert!(!served.names_this_model(""));
         assert!(served.names_this_model("id"));
     }
@@ -826,12 +912,29 @@ mod tests {
     /// The engine's own key is already exact, so the body travels byte for byte.
     /// Re-serializing a request nobody needed to change is a JSON round-trip
     /// this filter has no reason to impose.
+    ///
+    /// The literal is chosen so that the round trip is *visible*: interior
+    /// whitespace, keys in an order `serde_json` does not re-emit them in, and a
+    /// float with a trailing zero. That is the whole difficulty of testing a
+    /// pass-through — most JSON survives a round trip unchanged, and a literal
+    /// that does cannot tell a body that was forwarded from one that was parsed
+    /// and written back out. The final assertion pins that property of the
+    /// literal itself, so this test cannot quietly stop being able to fail.
     #[tokio::test]
     async fn a_request_naming_the_engines_key_is_forwarded_unchanged() {
-        let sent = format!(r#"{{"model":"{MODEL_ID}","prompt":"hi","temperature":1e-7}}"#);
+        let sent = format!(r#"{{"prompt":"hi", "model":"{MODEL_ID}", "temperature":0.10}}"#);
         let (status, body) = post_body("/v1/chat/completions", &sent).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, sent, "an exact match must not be rewritten");
+
+        let round_tripped =
+            serde_json::to_string(&serde_json::from_str::<serde_json::Value>(&sent).unwrap())
+                .unwrap();
+        assert_ne!(
+            round_tripped, sent,
+            "the literal must be one a re-serialization would change, or the assertion above \
+             holds whether or not the body was forwarded unchanged"
+        );
     }
 
     /// The common case: no `model` field at all. Forwarded byte for byte, and
@@ -850,25 +953,142 @@ mod tests {
         }
     }
 
-    /// Bodies this filter cannot make sense of are the engine's to reject, in
-    /// the engine's vocabulary. None of them can carry a model name past it: a
-    /// body that does not parse here does not parse there either — it is the
-    /// same parser — and a non-string `model` fails the engine's own
-    /// deserialization before any resolution runs.
+    /// A body this filter cannot fully parse is refused, not forwarded.
+    ///
+    /// This test used to assert the opposite, on a premise that reads as
+    /// obviously true and is false: that "a body that does not parse here does
+    /// not parse there either — it is the same parser". Both sides are
+    /// `serde_json`, and that is not the same as being the same parse. The
+    /// engine's extractor deserializes the first value in the buffer and never
+    /// asks what follows it, while the whole-input parse here rejects the
+    /// leftovers — so the first entry below was a parse error here, an ordinary
+    /// request there, and, forwarded, a `model` field going straight into the
+    /// engine's filesystem resolution with the replica's published model digest
+    /// still describing the file it had stopped answering from.
+    ///
+    /// The trailing bytes are varied because the ways to add one are: a stray
+    /// character, a NUL, a second JSON value, a comment. None of them changes
+    /// what the engine reads; all of them changed whether this filter could
+    /// read it.
     #[tokio::test]
-    async fn bodies_this_filter_cannot_check_are_forwarded_for_the_engine_to_reject() {
+    async fn a_body_this_filter_cannot_fully_parse_is_refused_rather_than_forwarded() {
         for sent in [
+            // Complete, valid, and then one byte more. The bypass.
+            "{\"model\":\"/models/other.gguf\",\"prompt\":\"hi\"}x",
+            "{\"model\":\"/models/other.gguf\",\"prompt\":\"hi\"}\0",
+            "{\"model\":\"/models/other.gguf\",\"prompt\":\"hi\"}{}",
+            "{\"model\":\"/models/other.gguf\",\"prompt\":\"hi\"}//x",
+            "{\"model\":\"/models/other.gguf\",\"prompt\":\"hi\"}]",
+            // Bodies that never parsed at all.
             "not json at all",
             "",
+            "{\"model\":\"/models/other.gguf\",\"prompt\":\"hi\"",
+            // Valid JSON that is not a generation request. It cannot carry the
+            // field this filter checks, and "cannot carry it" is exactly the
+            // reasoning that produced the bypass above — so it is refused on the
+            // same rule rather than exempted by a second judgement call.
             r#"["an","array"]"#,
             r#""a bare string""#,
-            r#"{"model":42,"prompt":"hi"}"#,
-            r#"{"model":["/models/other.gguf"],"prompt":"hi"}"#,
         ] {
             let (status, body) = post_body("/v1/chat/completions", sent).await;
-            assert_eq!(status, StatusCode::OK, "unexpected refusal for {sent}");
-            assert_eq!(body, sent, "the body must reach the engine unchanged");
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "a body this filter cannot check must not be forwarded: {sent:?}"
+            );
+            assert_ne!(body, sent, "the echo means the body reached the engine: {sent:?}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["error"]["code"], "unparseable_request_body");
+            assert_eq!(json["error"]["type"], "invalid_request_error");
         }
+    }
+
+    /// Trailing whitespace is not trailing content: a client that pretty-prints
+    /// its request body, or a shell that adds a newline, is sending the same
+    /// request and must be served.
+    #[tokio::test]
+    async fn trailing_whitespace_is_still_a_body_this_filter_can_check() {
+        let sent = format!("{{\n  \"model\": \"{MODEL_ID}\",\n  \"prompt\": \"hi\"\n}}\n");
+        let (status, body) = post_body("/v1/completions", &sent).await;
+        assert_eq!(status, StatusCode::OK, "unexpected refusal: {body}");
+        assert_eq!(body, sent);
+    }
+
+    /// A `model` that is not a string names nothing this replica serves, and is
+    /// refused like any other name it does not answer to.
+    ///
+    /// It could not have reached the engine's path resolution — that branch
+    /// takes a string — but "this value cannot reach the dangerous branch" is
+    /// the reasoning that produced the trailing-byte bypass, and it is not the
+    /// reasoning this filter runs on. The invariant it does run on has no
+    /// exceptions in it: what reaches the engine names this replica's weights or
+    /// names nothing.
+    #[tokio::test]
+    async fn a_model_field_that_is_not_a_string_is_refused() {
+        for sent in [
+            r#"{"model":42,"prompt":"hi"}"#,
+            r#"{"model":["/models/other.gguf"],"prompt":"hi"}"#,
+            r#"{"model":{"path":"/models/other.gguf"},"prompt":"hi"}"#,
+            r#"{"model":true,"prompt":"hi"}"#,
+        ] {
+            let (status, body) = post_body("/v1/chat/completions", sent).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "unexpected status for {sent}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["error"]["code"], "model_not_served");
+        }
+    }
+
+    /// The property all of the arms above add up to, asserted once over the
+    /// corpus rather than case by case: whatever reaches the engine from a
+    /// generation route names this replica's own weights or names nothing at
+    /// all. Anything else is refused before it gets there.
+    ///
+    /// Stated this way it survives the filter being rewritten. A test per arm
+    /// pins the arms; this pins the guarantee, and a new arm that forwards
+    /// something it should not fails here without anyone having to remember to
+    /// add a case.
+    #[tokio::test]
+    async fn nothing_reaching_the_engine_names_weights_this_replica_did_not_hash() {
+        let hostile = [
+            r#"{"model":"/models/other.gguf","prompt":"hi"}"#,
+            "{\"model\":\"/models/other.gguf\",\"prompt\":\"hi\"}x",
+            "{\"model\":\"/models/other.gguf\",\"prompt\":\"hi\"}\0",
+            "{\"model\":\"/models/other.gguf\",\"prompt\":\"hi\"}{}",
+            r#"{"model":"","prompt":"hi"}"#,
+            r#"{"model":42,"prompt":"hi"}"#,
+            r#"{"model":"/models/other.gguf","model":"/models/third.gguf","prompt":"hi"}"#,
+            "not json at all",
+        ];
+        let admitted = [
+            r#"{"prompt":"hi"}"#,
+            r#"{"model":null,"prompt":"hi"}"#,
+            r#"{"model":"Llama-3.2-1B-Instruct-Q8_0","prompt":"hi"}"#,
+            r#"{"model":"/models/Llama-3.2-1B-Instruct-Q8_0.gguf","prompt":"hi"}"#,
+        ];
+
+        let mut reached_the_engine = 0;
+        for sent in hostile.iter().chain(admitted.iter()) {
+            let (status, body) = post_body("/v1/completions", sent).await;
+            if status != StatusCode::OK {
+                continue;
+            }
+            reached_the_engine += 1;
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .unwrap_or_else(|_| panic!("the engine was handed unparsed bytes: {body:?}"));
+            match json.get("model") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::String(model)) => assert_eq!(
+                    model, MODEL_ID,
+                    "the engine was handed a model field this replica does not serve: {body}"
+                ),
+                other => panic!("the engine was handed a non-string model field: {other:?}"),
+            }
+        }
+        assert_eq!(
+            reached_the_engine,
+            admitted.len(),
+            "every admitted request must still be served, or this passes by refusing everything"
+        );
     }
 
     /// The filter claims the two generation routes and nothing else. A `model`

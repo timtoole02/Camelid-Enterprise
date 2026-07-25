@@ -93,10 +93,37 @@ fn apply_deterministic_end_to_end() {
     );
     std::env::remove_var("RAYON_RS_NUM_CPUS");
 
-    // A permitted variable does not block the start.
+    // A permitted variable does not block the start — and this is the row whose
+    // admission the two digests structurally cannot describe. Start twice
+    // against two different model paths: both starts succeed, and both digests
+    // come out byte-identical, because neither preimage contains the model file.
+    // The replicas nonetheless serve logits from different weights.
+    //
+    // That is the design, not a gap in it, and it is the reason the model digest
+    // is a third published field rather than more bytes in the first two: what
+    // tells these two replicas apart is `x-camelid-model-sha256`, taken from the
+    // file that was actually loaded. Admission publishes a policy; it has never
+    // promised that an admitted name is numerically inert. Any claim in this
+    // tree that reads "nothing admitted can change the output" is false here,
+    // one row before it reaches CAMELID_ENTERPRISE_THREADS.
     std::env::set_var("CAMELID_ENTERPRISE_MODEL", "/models/model.gguf");
     let permitted_start = apply_deterministic().expect("a permitted variable starts");
     assert_eq!(permitted_start.sha256, compute_config_sha256());
+    for (key, _) in CANONICAL {
+        std::env::remove_var(key);
+    }
+
+    std::env::set_var("CAMELID_ENTERPRISE_MODEL", "/models/other.gguf");
+    let other_weights = apply_deterministic().expect("any model path is equally permitted");
+    assert_eq!(
+        other_weights.sha256, permitted_start.sha256,
+        "the configuration digest does not distinguish two replicas started against different \
+         weights, and must not be read as if it did"
+    );
+    assert_eq!(
+        other_weights.admission_sha256, permitted_start.admission_sha256,
+        "neither does the admission digest: the policy admitted the same name both times"
+    );
     std::env::remove_var("CAMELID_ENTERPRISE_MODEL");
 
     for (key, _) in CANONICAL {

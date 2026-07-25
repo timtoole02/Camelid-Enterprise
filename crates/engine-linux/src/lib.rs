@@ -77,12 +77,23 @@ reported_features!(
 reported_features!(
     /// aarch64 features this crate reports.
     ///
-    /// `dotprod` is a live kernel gate. `neon` and `i8mm` are not — the engine
-    /// detects `neon` only to report it, and its one `i8mm` kernel gate also
-    /// requires an environment key this distribution's startup scan refuses.
-    /// Both stay because dropping them would retire a `simd=` string replicas
-    /// publish today, for no gain; the fixture records why each is here so the
-    /// distinction is written down rather than inferred from a list.
+    /// `dotprod` and `i8mm` are both live kernel gates. `i8mm` reads as if it
+    /// were not: its predicate also names an environment key, and this
+    /// distribution's startup scan refuses that key to an operator. But the
+    /// engine's own execution planner writes the key at model load, from the
+    /// same detected feature and long after the scan has run, so the branch is
+    /// reached by a stock replica. The fixture carries that derivation; it is
+    /// the kind of thing that is wrong by one inference and stays wrong for a
+    /// release.
+    ///
+    /// `neon` is detected only to be reported. It stays because dropping it
+    /// would retire a `simd=` string replicas publish today, for no gain.
+    ///
+    /// The `i8mm` route itself is compiled into the macOS aarch64 build, not
+    /// this one, so a Linux aarch64 host publishes the name without reaching
+    /// the branch. The vocabulary is keyed by architecture and stays uniform
+    /// across the platform crates on purpose: the fixture is what decides, and
+    /// a per-platform exception here is how the two lists start drifting.
     AARCH64_REPORTED_FEATURES,
     detect_aarch64,
     "aarch64",

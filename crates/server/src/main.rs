@@ -415,11 +415,26 @@ mod tests {
         path: &str,
         body: &str,
     ) -> axum::response::Response {
+        through(&served_router(), method, path, body).await
+    }
+
+    /// The same, against a stack the caller holds on to.
+    ///
+    /// `served_router()` builds fresh engine state every call, so two requests
+    /// through it are two replicas. A test about what one replica's state is
+    /// after a request has to send both through the same one.
+    async fn through(
+        stack: &axum::Router,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> axum::response::Response {
         use axum::body::Body;
         use axum::http::{header::CONTENT_TYPE, Request};
         use tower::ServiceExt;
 
-        served_router()
+        stack
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(method)
@@ -702,6 +717,87 @@ mod tests {
         }
     }
 
+    /// The same request, plus one byte, against the engine's real router: the
+    /// trailing-byte bypass, which is the shape the blocker actually took.
+    ///
+    /// The engine's JSON extractor deserializes the first value in the buffer
+    /// and never asks what follows it, so `{…}x` is exactly as good a request to
+    /// the engine as `{…}` — same `model` field, same on-demand load — while a
+    /// whole-input parse in the filter in front of it fails. A filter that
+    /// forwarded what it could not parse therefore refused the clean body and
+    /// served the one with a byte stuck on the end.
+    ///
+    /// The second half is the assertion that makes this more than a status-code
+    /// check: the *same stack* is then asked to generate with no `model` field
+    /// at all, and still answers from no model. That is what says nothing was
+    /// loaded on the way through — an on-demand load would have left the named
+    /// file active for every later request, which is what made the swap
+    /// permanent for the process lifetime rather than scoped to one request.
+    #[tokio::test]
+    async fn a_trailing_byte_cannot_carry_a_model_past_the_body_filter() {
+        use axum::body::to_bytes;
+        use axum::http::StatusCode;
+
+        let stack = served_router();
+        let elsewhere = std::fs::canonicalize("Cargo.toml").unwrap();
+        // One well-formed request per route — the engine refuses a body carrying
+        // both spellings before it looks at anything else, and a refusal for the
+        // wrong reason would pass this test without proving the request was
+        // stopped.
+        let clean = |path: &str| {
+            let mut body = serde_json::json!({
+                "model": elsewhere.to_string_lossy(),
+                "max_tokens": 1,
+            });
+            if path == "/v1/completions" {
+                body["prompt"] = "hi".into();
+            } else {
+                body["messages"] = serde_json::json!([{ "role": "user", "content": "hi" }]);
+            }
+            body.to_string()
+        };
+
+        for suffix in ["x", "\0", "{}", "//x", "]", " \t\nx"] {
+            for path in ["/v1/completions", "/v1/chat/completions"] {
+                let response =
+                    through(&stack, "POST", path, &format!("{}{suffix}", clean(path))).await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "POST {path} with {suffix:?} appended was not refused"
+                );
+                let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(json["error"]["code"], "unparseable_request_body");
+            }
+        }
+
+        // …and without the byte, the same request is refused by name — which is
+        // the pair that says the byte was the whole difference.
+        for path in ["/v1/completions", "/v1/chat/completions"] {
+            let response = through(&stack, "POST", path, &clean(path)).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["error"]["code"], "model_not_served");
+        }
+
+        let after = through(
+            &stack,
+            "POST",
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#,
+        )
+        .await;
+        let bytes = to_bytes(after.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["error"]["code"], "model_not_loaded",
+            "a request naming no model is being answered by weights something loaded on demand: \
+             {json}"
+        );
+    }
+
     /// The same refusal for a path that does not exist, byte for byte. The
     /// `model` field of an admitted request must not become a way to ask the
     /// replica what is on its disk, and the only thing that makes the two
@@ -732,7 +828,7 @@ mod tests {
         assert_eq!(
             present_body, missing_body,
             "an existing file and a missing one must be refused with the same bytes, or the \
-             model field is a filesystem oracle"
+             model field discloses what is on this replica's disk"
         );
     }
 

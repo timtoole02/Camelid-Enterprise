@@ -58,12 +58,12 @@ deploy/
 |---|---|---|
 | **Serving replica** | `crates/server` (`camelid-enterprise` bin) | CLI (`serve`), binds an HTTP listener, applies the deterministic lane, stamps attribution, loads one model at startup. |
 | **Lane / config freeze** | `crates/server/src/lane.rs` | Applies a canonical env-var configuration vector, fails closed on any override, publishes its SHA-256. Engine pinned by revision (`ENGINE_PIN`). |
-| **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-host` on every response, injects fields into completion bodies, writes optional JSONL serving receipts. |
+| **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps six headers on every response — `x-camelid-lane`, `-config-sha256`, `-admission-sha256`, `-model-sha256`, `-host`, `-worker-threads` — injects the same facts into completion bodies, writes optional JSONL serving receipts with the digests at full length. |
 | **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin HTTP forwarding with opaque streaming bodies, hop-by-hop header filtering, and no retries or response rewriting. Returns a typed `502` only when it cannot reach the upstream. |
-| **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/api/models/load`. Provided by the pinned engine crate, **not** by this repo. |
+| **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/health` and the engine's own control plane (`/api/models/load` and the rest). Provided by the pinned engine crate, **not** by this repo; the replica serves an allow list over it and refuses everything else, the control plane included (`crates/server/src/surface.rs`). |
 | **Engine core** | `crates/engine-core` | GGUF container, model config, tensor/forward/tokenizer types. Host-agnostic. |
 | **Platform kernels** | `crates/engine-{macos,linux,windows}` | Runtime CPU feature detection (`probe()`), platform kernels. macOS port landing first; Linux/Windows currently capability-detection only. |
-| **Deployment assets** | `deploy/` | Dockerfile (model mounted at runtime, not baked); K8s Deployment (Guaranteed QoS, one model per pool, startup/readiness probes on `/v1/models`) + Service. |
+| **Deployment assets** | `deploy/` | Dockerfile (model mounted at runtime, not baked); K8s Deployment (Guaranteed QoS, one model per pool, explicit `--threads`, startup/readiness probes on `/v1/health` for `generation_ready`) + Service. |
 
 ### 2.3 Properties that exist Today
 

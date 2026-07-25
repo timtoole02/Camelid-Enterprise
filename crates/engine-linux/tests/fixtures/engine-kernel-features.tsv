@@ -21,9 +21,23 @@
 #                routes_only_under_a_refused_key  selects a different kernel,
 #                                                 but only when an environment
 #                                                 key is set that the startup
-#                                                 admission scan refuses, so no
-#                                                 replica of this distribution
-#                                                 reaches the branch
+#                                                 admission scan refuses AND
+#                                                 that the engine's own
+#                                                 execution planner does not
+#                                                 write for itself at model
+#                                                 load. Both halves are load-
+#                                                 bearing: the planner sets and
+#                                                 removes several dozen managed
+#                                                 keys from detected host
+#                                                 features long after the scan
+#                                                 has run, so a key being
+#                                                 refused to an operator says
+#                                                 nothing on its own about
+#                                                 whether a replica reaches the
+#                                                 branch. No row is in this
+#                                                 class at the current pin; the
+#                                                 note on i8mm below is why the
+#                                                 one that was is not.
 #                reporting_only                   detected to be described, not
 #                                                 to be branched on
 #   published  what a probe must do:
@@ -42,13 +56,35 @@
 # coverage assertion pass, which is the one edit that would make this file
 # worse than no file.
 #
-# WHY `optional` EXISTS AT ALL. neon and i8mm are published today. Neither has
-# a live gate — neon is detected only for reporting, and the single i8mm kernel
-# gate also requires an environment key the startup scan refuses. Dropping them
-# would shrink a string replicas already publish, retiring a live identity to
-# tidy a list. They stay, with the reason in the table instead of in someone's
-# memory, and if a pin bump gives either a live gate the routing column moves
-# and the invariant above promotes it to required.
+# WHY `optional` EXISTS AT ALL. neon is published today and has no live gate:
+# the engine detects it only to describe the host. Dropping it would shrink a
+# string replicas already publish, retiring a live identity to tidy a list. It
+# stays, with the reason in the table instead of in someone's memory, and if a
+# pin bump gives it a live gate the routing column moves and the invariant above
+# promotes it to required.
+#
+# WHY i8mm IS NOT `optional`. It was, and the classification was false. The gate
+# at the site below is `env_flag_enabled("CAMELID_MAC_Q8_PREFILL_I8MM") &&
+# is_aarch64_feature_detected!("i8mm")`, and the startup admission scan does
+# refuse that key to an operator — but the engine's execution planner writes it
+# "on" itself, from the same detected feature, whenever it plans a supported
+# Apple-silicon Q8_0 row (engine src/execution_plan.rs:470-472, applied at
+# src/api/mod.rs:6847). That write happens at model load, after the scan, which
+# the lane's `apply_deterministic` documentation names as a structural limit of
+# the startup gate rather than a gap to be closed there. So a stock replica does
+# take the branch: two hosts differing only in i8mm run different prefill
+# kernels once the row threshold is met, and under the old classification no
+# probe was required to publish the name that tells them apart. Any future row
+# whose predicate names an environment key has to be classified against the
+# engine's managed-key list, not against this distribution's allow list alone.
+#
+# The routing column describes the engine, not any one platform crate's build.
+# The i8mm gate is compiled only into the macOS aarch64 build, so a Linux or
+# Windows aarch64 host does not reach it; this table is keyed by architecture,
+# so `required` asks every aarch64 probe for the name anyway. That is the
+# conservative direction. A probe that publishes a name nothing routes on where
+# it runs costs one name in a string; a probe that omits one that does route
+# costs the identity its whole purpose.
 #
 # The amx and avx_vnni rows are `no` for a different reason worth keeping
 # visible: the engine reads them from the kernel's CPU flag file rather than
@@ -81,5 +117,5 @@ x86_64	avx512dq	reporting_only	no	src/gait/mod.rs:313
 x86_64	avx512vbmi	reporting_only	no	src/gait/mod.rs:319
 x86_64	avx512vl	reporting_only	no	src/gait/mod.rs:310
 aarch64	dotprod	routes_by_default	required	src/inference/cpu_neon.rs:434
-aarch64	i8mm	routes_only_under_a_refused_key	optional	src/inference.rs:21785
+aarch64	i8mm	routes_by_default	required	src/inference.rs:21785
 aarch64	neon	reporting_only	optional	src/gait/mod.rs:335

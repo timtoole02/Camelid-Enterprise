@@ -81,8 +81,18 @@ reported_features!(
     /// mapping exists upstream but has not reached stable. So the `i8mm` probe
     /// is a no-op here today. It stays declared so the feature lights up on its
     /// own once the flag ships, rather than this crate silently under-reporting
-    /// at that moment; the shared fixture permits it either way, which is what
-    /// lets one table describe two platforms whose detection backends differ.
+    /// at that moment.
+    ///
+    /// The fixture now *requires* `i8mm` on aarch64 rather than permitting it:
+    /// the engine's one gate on that feature also names an environment key, but
+    /// the key is one the engine's own execution planner writes at model load,
+    /// so the branch is default-reachable and the name is part of the routing
+    /// identity. That gate is compiled into the macOS aarch64 build only, so it
+    /// is not a branch a Windows host takes — which is why a detection backend
+    /// that cannot see `i8mm` does not make this platform's replicas ambiguous
+    /// about a kernel they could have run. It does mean this crate declares a
+    /// required name it cannot yet report, and that is a runtime shortfall
+    /// against a declarative table, invisible from any runner this project has.
     AARCH64_REPORTED_FEATURES,
     detect_aarch64,
     "aarch64",
@@ -109,15 +119,53 @@ pub fn probe() -> HostCapabilities {
     }
 }
 
-#[cfg(all(test, target_os = "windows"))]
+/// Exercises `probe` itself, as opposed to the vocabulary it draws from.
+///
+/// Not gated on `target_os`. It was, and for as long as it was it ran nowhere:
+/// this project had no Windows runner, so the only test that touched the
+/// Windows probe was compiled by no job — the anti-pattern the module below
+/// names as the reason it is ungated. There is a Windows job now, and it runs
+/// this. The gate stays off anyway, because nothing in `probe` is Windows-only
+/// code — the `os` field is a constant and the detection arms are keyed by
+/// `target_arch` — so the check costs nothing on the other runners, and a
+/// crate's tests should not become unrun by the deletion of one CI job.
+///
+/// What running it off Windows proves: `probe` returns the shape the identity
+/// is rendered from, and the architecture-keyed detection arm compiles and
+/// resolves against whatever backend that host has. What it does not prove, and
+/// what only the Windows job settles: that `IsProcessorFeaturePresent` reports
+/// what the vocabulary above claims. The assertions are written so that they
+/// are true statements on either host rather than true-by-vacuity on one.
+#[cfg(test)]
 mod tests {
     #[test]
     fn probe_reports_this_host() {
         let caps = super::probe();
-        assert_eq!(caps.os, "windows");
+        assert_eq!(
+            caps.os, "windows",
+            "this crate's probe speaks for Windows on whatever host it is built on"
+        );
         assert!(caps.logical_cores >= 1);
+        assert_eq!(caps.arch, std::env::consts::ARCH);
         #[cfg(target_arch = "aarch64")]
         assert!(caps.simd.contains(&"neon"), "aarch64 always has NEON");
+    }
+
+    /// Sorted and free of duplicates: `simd` is compared for string equality
+    /// between replicas, so two hosts with the same features must render it
+    /// identically. `probe` sorts but does not deduplicate, which is why the
+    /// vocabularies themselves are checked for uniqueness in the shared
+    /// vocabulary module rather than relying on this one — it can only see the
+    /// running host. engine-linux has had this check since it landed; this
+    /// crate did not, because its test module was gated onto a runner that does
+    /// not exist.
+    #[test]
+    fn the_reported_set_is_sorted_and_unique() {
+        let simd = super::probe().simd;
+        let mut expected = simd.clone();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(simd, expected);
     }
 }
 
@@ -125,17 +173,18 @@ mod tests {
 ///
 /// Deliberately not gated on `target_os`. Nothing in it runs Windows code or
 /// executes an instruction — it compares two `const`s against a table — so it
-/// holds on the Linux and macOS runners, which are the only ones this project
-/// has. Gating it on Windows would be a test that exists and never runs, which
+/// holds on every runner rather than only the one that can run Windows code.
+/// Gating it on Windows would narrow a check that costs nothing to widen, which
 /// is how the parity between this crate and engine-linux went unenforced while
 /// a comment asserted it.
 ///
 /// What it proves: this crate's declared vocabulary satisfies the same bounds
 /// engine-linux's does, against the same file, so the two cannot diverge on any
 /// architecture where the fixture leaves no room. What it does not prove: that
-/// this crate's *detection* fires on a real Windows host. Windows's backend
-/// exposes a narrower aarch64 set than it declares, which is stated on the
-/// vocabulary above and is not observable from here.
+/// this crate's *detection* fires on a real Windows host. That is a question for
+/// the Windows job, and even there only for the architecture that job runs on —
+/// the narrower aarch64 flag set stated on the vocabulary above is not settled
+/// by an x86-64 Windows runner any more than by a Linux one.
 #[cfg(test)]
 mod vocabulary_matches_the_engine {
     use super::{AARCH64_REPORTED_FEATURES, X86_64_REPORTED_FEATURES};

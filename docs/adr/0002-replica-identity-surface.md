@@ -22,10 +22,16 @@ That invitation was broader than the digest could honour, in four independent
 ways.
 
 **The digest was under-defended.** Admission was a ban list: ten named
-environment variables the lane refused to start under. The engine reads **265
-distinct `CAMELID_*` keys** at this pin and writes eight more it never reads
-(`crates/server/tests/fixtures/engine-env-keys.tsv`, 282 rows). A ban list of ten
-against a namespace of hundreds does not fail loudly when it is incomplete; it
+environment variables the lane refused to start under. The engine touches **282
+distinct `CAMELID_*` keys** at this pin, **at least 272** of which it reads on
+some path (`crates/server/tests/fixtures/engine-env-keys.tsv`, 282 rows). Read
+that as a floor and not a census: the fixture's `class` column is swept for
+string literals and then corrected by hand, and a key reached through a helper is
+exactly what the sweep misses — `CAMELID_X86_Q8_MATMUL_OWNER_AVX2` reaches
+`env::var` through `q8_0_env_flag_enabled_default_on_fail_closed`, and
+`CAMELID_Q8_SCHED_TELEMETRY` through `env_flag_enabled`, while the column records
+both as never read. A ban list of ten against a namespace of hundreds does not
+fail loudly when it is incomplete; it
 fails silently, because the keys it misses are exactly the ones nobody
 classified. Several of the unclassified ones — the normalization epsilon, rotary
 pairing and direction, the attention score scale, linear accumulation order,
@@ -414,10 +420,19 @@ is built, and before the engine state because constructing it spawns the engine'
 handle, and the first read of the pool's width fixes it — a sizing call after
 that point fails rather than resizes.
 
-The number is the width of the *global* pool. The engine derives narrower or
-wider phase-specific pools from it at first generation, so this is not a promise
-that every kernel runs at this width; it is the one number those are derived from,
-and the number that differs between two replicas started differently.
+The number is the width of the *global* pool, and that is all it is. The engine
+may install narrower or wider phase-specific pools at first generation, so this
+is not a promise that every kernel runs at this width — and on one platform it is
+not even the number the others are derived from. At this pin the engine's wider
+prefill pool is built on Windows/x86_64 only, and it targets
+`available_parallelism()` rather than the global width; it declines to widen only
+when `CAMELID_PREFILL_THREADS` or `CAMELID_THREADS` is set, and this distribution
+refuses both, so the widen-by-default arm always fires there. `--threads 2` on a
+16-core Windows host publishes `x-camelid-worker-threads: 2` while prefill runs
+16 threads wide. The identity stays externally checkable — `x-camelid-host`
+carries `cores=16` next to it — but the field means "the width the global pool
+came up at", not "the width every phase runs at". On macOS and Linux no such pool
+is built and the global width is the whole story.
 
 Two shapes were considered and rejected. A **composite runtime string**
 (`threads=8;cores=8;os=…;arch=…;simd=…`) would answer "are these two replicas the
@@ -453,7 +468,8 @@ declared set satisfies both bounds the fixture imposes today, but nothing enforc
 it, and macOS is the platform actually serving.
 
 Falsifiable: `attribution::tests::headers_on_every_response_body_untouched_off_completion_paths`
-pins all five headers; `the_worker_width_renders_the_same_in_both_encodings`
+pins all six headers — lane, config digest, admission digest, model digest, host
+and worker width; `the_worker_width_renders_the_same_in_both_encodings`
 pins the number/string pair; `main::tests::an_unsized_pool_still_publishes_a_resolved_width`
 asserts the published width is read from rayon in the no-flag case too, and
 `a_zero_width_pool_is_refused_before_anything_is_built` asserts `--threads 0` is
@@ -486,7 +502,7 @@ So the questions get separate fields, and none impersonates another:
 - **`config_sha256`** — *is this the configuration I audited?* Constant across a
   conforming fleet. Diffing it detects a configuration or engine-pin change.
 - **`admission_sha256`** — *would this replica have refused what I think it
-  refuses?* Constant across a conforming fleet. Not yet published (§1).
+  refuses?* Constant across a conforming fleet.
 - **`model_sha256`** — *are these the weights I audited?* Varies per deployment
   by nature.
 - **`host`** and **`worker_threads`** — *is this the same machine, at the same
@@ -503,7 +519,8 @@ recording: the engine documents its prefill matmul as parallelizing over
 independent output rows with serial per-row accumulation, so the thread count does
 not change that kernel's numeric result. Width is an operational identity, not an
 input to the configuration vector. That claim is the engine's, about one kernel,
-and this record does not extend it to the whole forward pass — see §Open
+and this record does not extend it to the whole forward pass — nor does it claim
+the reverse anywhere, which §7 is careful about for the same reason. See §Open
 questions.
 
 ### 6. Declaration order of the configuration vector is load-bearing
@@ -539,20 +556,51 @@ each naming a consumer inside this binary or its own test suite:
 | `CAMELID_ENTERPRISE_THREADS` | `--threads` |
 | `CAMELID_ENTERPRISE_TEST_MODEL` | this workspace's gated tests; read only under `#[cfg(test)]`, never on the serving path |
 
-**Admission is not a claim that a permitted variable cannot move the numerics**,
-and one row plainly does: `CAMELID_ENTERPRISE_THREADS` sizes the data-parallel
-pool, and several engine kernels reduce differently above width one. Two replicas
-started with different values of it emit different tokens while publishing the
-same `config_sha256`. That is by design of the list, not a gap in it, and the
-rule that decides it is the same one the foreign-refusal bar states from the
-other side: **a lever this replica publishes is a lever a client can check; a
-lever it neither publishes nor refuses is the hole.** The resolved width is read
-back from the pool and published on every response, so this one is checkable, and
-refusing an operator the single width control the binary documents would buy no
-visibility that the published width does not already give. Anyone tempted to
-strengthen "deny-by-default" into "nothing admitted can change the output" should
-read §Scope in `README.md` first: reproducibility is scoped per worker-pool
-width, and this is why.
+**Admission is not a claim that a permitted variable cannot move the numerics.**
+One row is admitted without any claim being made in either direction:
+`CAMELID_ENTERPRISE_THREADS` sizes the process-global data-parallel pool, and the
+output guarantee is scoped per width because bit-exactness across widths has not
+been established for the whole forward pass.
+
+What must *not* be asserted here is the opposite — that two widths produce
+different tokens. Nothing in this repository measures that, and reading the pin
+gives no branch that would produce it: every width gate on this lane's serving
+path partitions disjoint output rows or groups and accumulates serially within
+each chunk, which is bit-exact by construction. The Q8 projection kernels run the
+same per-chunk closure in their parallel and their serial arm; the parallel
+attention-context arm runs the same per-row fill as the serial one; the linear
+accumulator's parallel arm sums each output element over the same inputs in the
+same order the serial arm does; the parallel input-quantize path quantizes each
+row independently and concatenates in row order.
+
+Two of those live behind engine keys — `CAMELID_PARALLEL_LINEAR` and
+`CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE` — and it would be wrong to record them
+as unreachable on that ground: the scan refuses them from an operator, but the
+engine's own planner writes both **on** at model load, after the scan has run
+(§8(a)). They are live on a serving replica whatever the operator did, which is
+why the argument above has to be about what the branch computes rather than
+about whether it can be entered.
+
+What would break the pattern is a site where the width sizes the *chunking*
+rather than merely selecting a branch, because then the reduction tree would
+change shape with the pool. There is one such site at this pin and it is a
+bench-only entry point, reached from no serving path.
+
+All of that is a review of branches, not a measurement of the forward pass, so it
+does not license widening the scope either — it licenses saying nothing. See
+§Open questions.
+
+The row is admitted on the rule the foreign-refusal bar states from the other
+side: **a lever this replica publishes is a lever a client can check; a lever it
+neither publishes nor refuses is the hole.** The resolved width is read back from
+the pool and published on every response, so this one is checkable whether or not
+it moves an output bit, and refusing an operator the single width control the
+binary documents would buy no visibility the published width does not already
+give. Anyone tempted to strengthen "deny-by-default" into "nothing admitted can
+change the output" should read §Scope in `README.md` first — and note the
+deliberate interposition exception below, which makes any claim of that shape
+false as worded. The claim the published wording carries is
+published-or-refused, never cannot-change.
 
 The entry bar is a named consumer in a namespace the engine does not touch.
 `CAMELID_ENTERPRISE_` is free at the pin, and
@@ -573,8 +621,8 @@ pattern arm at all. `the_computed_key_family_is_refused_without_a_rule_for_it`
 asserts this against a role that exists nowhere in the engine.
 
 The second reason is maintenance. A ban list must be re-derived against the
-engine's key set at every pin bump — 265 read keys to reclassify, with silence as
-the failure mode. An allow list survives a bump untouched.
+engine's key set at every pin bump — several hundred read keys to reclassify,
+with silence as the failure mode. An allow list survives a bump untouched.
 
 Four consequences of the posture, each deliberate:
 
@@ -618,21 +666,27 @@ refusal aimed at an actor who already controls the process image would buy
 nothing and would invite the reader to mistake a startup scan for a sandbox.
 
 - **`VECLIB_MAXIMUM_THREADS`** sizes Apple vecLib's internal BLAS pool. Accelerate
-  is the only native library the engine links, and it is reached from several
-  macOS sites — `cblas_sgemv` for dense f32 linear rows above a size floor, and
+  is the only *math* library the engine calls into — the dependency graph links
+  other native code, bundled SQLite among it, but nothing else that arithmetic
+  the guarantee is stated over passes through — and it is reached from several
+  macOS sites: `cblas_sgemv` for dense f32 linear rows above a size floor, and
   `cblas_sgemm` from the CPU tensor matmul with no floor and no environment gate
   in front of it. vecLib's documented response to this variable is to change how
   it blocks and parallelizes those calls, which moves f32 summation order. That
   last step is a property of the platform's BLAS, not something the engine pin
   proves; what the pin establishes is that the engine calls into vecLib. Nothing
   this replica publishes reports vecLib's pool width.
-- **`RAYON_NUM_THREADS`** sizes the process-global data-parallel pool, and several
-  engine kernels take a different reduction structure when the resolved width is
-  greater than one.
+- **`RAYON_NUM_THREADS`** sizes the process-global data-parallel pool — the same
+  pool `--threads` owns — and several engine kernels take a different branch when
+  the resolved width is greater than one. Whether that branch changes any output
+  bit is the open question above; what is not open is that this name sets the
+  width behind the flag that declares it.
 - **`RAYON_RS_NUM_CPUS`** is the deprecated spelling of that name, and a live one
-  at the pinned `rayon-core`: `get_num_threads` falls through to it whenever
-  `RAYON_NUM_THREADS` is unset or does not parse as a positive integer. It sizes
-  the same pool by the same rule and reaches the same kernels.
+  at the pinned `rayon-core`: `get_num_threads` falls through to it when
+  `RAYON_NUM_THREADS` is unset or unparseable. An explicit `0` does *not* fall
+  through — it short-circuits to the host default — so the fallthrough is
+  narrower than "any value that is not a positive integer". It sizes the same
+  pool by the same rule and reaches the same kernels.
 
 **Why both spellings, and why the pair is now kept on a different ground than it
 was added on.** Refusing only the current name was a defect rather than a
@@ -646,8 +700,11 @@ spelling it honours gets its own row, its own digest line and its own test.
 Part three of the entry bar has meanwhile stopped holding for both rows: §4
 ships, the resolved width **is** published on every response, and it is read back
 from the pool, so a replica running under either name no longer looks identical
-to one that is not. Part three is an entry bar, not a survival condition, and the
-rows now stand on a narrower ground stated in their own text — this replica
+to one that is not. Part two is not established either, for the reason §7 gives
+above: the width gates on this lane's serving path are structured so the result
+does not depend on the width, and no measurement here says otherwise. Part three
+is an entry bar, not a survival condition,
+and the rows now stand on a narrower ground stated in their own text — this replica
 declares its worker width through one documented flag, and an undocumented second
 spelling of that same setting is refused for the reason `CAMELID_THREADS` is.
 That is an ergonomic rule, not a soundness one, and saying so is the point: a row
@@ -682,9 +739,11 @@ model load the engine's execution planner sets and removes **42 managed keys** i
 the process environment, choosing values from detected host CPU features. Four of
 the forty-two are additionally read back as passthrough — they are a subset, not
 a further four. A startup scan structurally cannot observe this: it
-happens later, and it is the engine configuring itself, which is legitimate. One
-of those managed keys is a key the lane's own advisory table warns about, so a
-post-load re-scan would refuse on the engine's own writes.
+happens later, and it is the engine configuring itself, which is legitimate.
+**Three** of those managed keys are names the lane's own advisory table warns
+about — `CAMELID_PARALLEL_LINEAR`, `CAMELID_MAC_Q8_PREFILL_I8MM` and
+`CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE` — so a post-load re-scan would refuse on
+the engine's own writes, and the overlap is systematic rather than a one-off.
 
 This is why the scan is single-shot, and why that precondition is a doc comment on
 the function rather than tribal knowledge. **Do not add a periodic re-scan, a
@@ -797,11 +856,14 @@ after the gate deserves the same treatment rather than a footnote here.
   act on it.
 - **Every generation request body is now buffered before it is served.** It was
   already buffered by the engine's own JSON extractor, so the cost is a second
-  pass over the bytes rather than a new one, and a body above 64 MiB — the same
-  ceiling the attribution middleware applies to responses — is refused with
-  `413 request_too_large` instead of being forwarded unchecked. A request that
-  names the engine's own key, or no model at all, is forwarded byte for byte;
-  only an admitted *alias* is re-serialized.
+  pass over the bytes rather than a new one, and a body above **2 MiB** is
+  refused with `413 request_too_large` instead of being forwarded unchecked. That
+  ceiling is `surface::REQUEST_BODY_LIMIT`, and it is the limit the engine's own
+  extractor applies — deliberately *not* the attribution middleware's 64 MiB,
+  which bounds a response the engine produced and is a different party and a
+  different risk. A client sizing its request budget should read 2 MiB. A
+  request that names the engine's own key, or no model at all, is forwarded byte
+  for byte; only an admitted *alias* is re-serialized.
 - **Receipts became trustworthy rather than merely present.** A receipt records
   the startup model digest and nothing re-derives it per request, so before §3's
   body filter a generation served from swapped weights was attributed in the
@@ -869,11 +931,23 @@ own output:
    bump that adds a control-plane route adds it *refused*, which is the intended
    default but worth confirming rather than assuming.
 6. **`config_sha256`** — it *will* change, because the pin is inside the preimage.
-   Update the constant in `config_sha256_is_pinned`, then every published copy:
-   this record, `README.md`, `deploy/macos/README.md`. `admission_sha256` does
-   **not** move at a pin bump; that is the point of §1. When the admission policy
-   itself changes, its published copies are the constant in
-   `admission_sha256_is_pinned`, this record, `README.md` and `deploy/README.md`.
+   Update the constant in `config_sha256_is_pinned` and the short form asserted by
+   `crates/server/tests/lane_environment.rs`, then every copy published in prose:
+   **this record, `README.md` and `deploy/macos/README.md`** — the last of which
+   greps the value literally inside a copy-pasteable operator probe, so a stale
+   copy there fails against a conforming replica rather than merely reading wrong.
+   `admission_sha256` does **not** move at a pin bump; that is the point of §1.
+   When the admission policy itself changes, its published copies are the constant
+   in `admission_sha256_is_pinned`, the short form in that same integration test,
+   and **the same three documents**. `deploy/README.md` names the headers and
+   describes what each answers but quotes no digest value, so there is nothing in
+   it to update; if that ever stops being true, add it to this list.
+   `the_published_digests_appear_in_every_document_that_publishes_them` holds all
+   four of those statements — the three documents and the absence — so a
+   forgotten document fails the suite rather than shipping. Values that appear in
+   test fixtures — `attribution.rs`, the gateway contract suite — stand in for a
+   digest rather than publishing one, but `grep` for the retiring value is still
+   the cheapest way to be sure nothing was missed.
 7. **The frozen vector itself** — a canonical key the new engine no longer reads
    is dead weight inside a public digest, which is what
    `every_canonical_key_is_read_by_the_engine` exists to catch.
@@ -882,14 +956,21 @@ own output:
 
 ## Open questions
 
-**Whether the published copies of the digests should be checked by a test.** Both
-values are maintained by hand across this record, `README.md`, `deploy/README.md`
-and `deploy/macos/README.md`, and a pin bump or a policy edit is exactly the
-moment a hand-maintained copy gets missed. A test that `include_str!`s each file
-and asserts the current digest appears in it is cheap and is the idiom this
-codebase already uses everywhere else. Note that any such test must cope with a
-truncated form in prose. This is more pressing now that there are two digests and
-four documents rather than one and three.
+**Whether the published copies of the digests should be checked by a test.**
+Answered, and the answer is yes. **Twenty** hand-maintained literals sit across
+this record, `README.md` and `deploy/macos/README.md` — and the two inside that
+last file's readiness probe are executable, so a missed edit there ships an
+operator check that fails against a correctly-built replica.
+`lane::tests::the_published_digests_appear_in_every_document_that_publishes_them`
+`include_str!`s all three and asserts the current digests appear in each, at the
+length that document publishes, so a policy edit that updates the constants and
+forgets a document now fails the suite instead of shipping.
+
+What remains open is narrower and worth stating rather than assuming away: it is
+a presence check, so it cannot notice a **fourth** document acquiring a copy. The
+same test asserts that `deploy/README.md` contains neither digest, which pins
+that file's status in both directions; nothing pins it for a file nobody has
+written yet. The retirement list in §6 is what a reader has instead.
 
 **Whether the served surface should carry the admission policy in full.** The
 digest answers "is this the policy I audited?" and nothing else; an operator who
@@ -903,7 +984,8 @@ reconsidering separately.
 **Which engine keys remain unclassified.** All of them, and that is the design.
 Deny-by-default does not classify keys — it refuses everything unnamed, so
 exhaustive classification stopped being a prerequisite for safety. The advisory
-table annotates a few dozen of the 265 read keys purely so refusals are legible.
+table annotates a few dozen of the hundreds of keys the engine reads, purely so
+refusals are legible.
 It is not coverage, does not aspire to coverage, and growing it is a diagnostics
 improvement rather than a safety one. **Do not turn it back into an enforcement
 mechanism.**
@@ -919,9 +1001,24 @@ distribution.
 **Whether reproducibility across thread counts holds beyond the prefill matmul.**
 `README.md` scopes the guarantee away from differing thread counts; the engine
 documents its prefill matmul as bit-exact across them. Both can be true if the
-decode path or another kernel is not, but the two statements should not be left
-standing side by side now that the width is a published field. Resolve it by
-checking the decode path, not by assertion.
+decode path or another kernel is not, and the width is a published field, so the
+two statements should not be left standing side by side.
+
+Partly narrowed, not resolved. A read of every width-gated branch on this lane's
+serving path at this pin finds each one partitioning disjoint output rows or
+groups, with accumulation serial inside a chunk and the same arithmetic on both
+arms — the shape that is bit-exact by construction — and the only site where the
+width sizes the chunking itself is a bench-only entry point off the serving path.
+That is a review of branches, which is weaker than a measurement in three ways
+worth naming: it says nothing about arithmetic performed inside a library the
+engine calls (vecLib blocks and parallelizes its own way, which is why
+`VECLIB_MAXIMUM_THREADS` has a refusal row); it does not cover the phase-specific
+pool §4 describes on Windows/x86_64, which runs at a width the published number
+does not name; and it is a snapshot of one revision that a pin bump invalidates.
+So the scope stays where it is, and §7 makes no claim in the other direction
+either. Resolve it by generating at two widths and comparing token streams, on
+the platform that serves; until then the honest position is that the width is
+published, not that it is inert.
 
 **Whether the model digest should be re-verified while serving.** It is computed
 once, before the port binds; §3 removes the routes *and the request field* that

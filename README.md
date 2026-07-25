@@ -38,12 +38,13 @@ $ camelid-enterprise serve --model /srv/models/Llama-3.2-1B-Instruct-Q8_0.gguf
 [lane] model loaded as 'Llama 3.2 1B Instruct'; replica ready
 
 $ curl -s http://127.0.0.1:8181/v1/chat/completions -d '{ … }' \
-    | jq '{camelid_lane, camelid_config_sha256, camelid_admission_sha256, camelid_model_sha256, camelid_worker_threads}'
+    | jq '{camelid_lane, camelid_config_sha256, camelid_admission_sha256, camelid_model_sha256, camelid_host, camelid_worker_threads}'
 {
   "camelid_lane": "deterministic",
   "camelid_config_sha256": "30d77c260803",
   "camelid_admission_sha256": "45121fb83fef",
   "camelid_model_sha256": "3f8a1c04b7e2",
+  "camelid_host": "macos/aarch64 cores=8 simd=dotprod+i8mm+neon",
   "camelid_worker_threads": 8
 }
 ```
@@ -122,7 +123,7 @@ Every response is attributable to the lane that produced it, in three places so 
 | Location | Fields |
 |---|---|
 | **Response headers** (streams included) | `x-camelid-lane`, `x-camelid-config-sha256`, `x-camelid-admission-sha256`, `x-camelid-model-sha256`, `x-camelid-host`, `x-camelid-worker-threads` |
-| **Completion body** (non-streaming JSON) | `camelid_lane`, `camelid_config_sha256`, `camelid_admission_sha256`, `camelid_model_sha256`, `camelid_worker_threads` |
+| **Completion body** (non-streaming JSON) | `camelid_lane`, `camelid_config_sha256`, `camelid_admission_sha256`, `camelid_model_sha256`, `camelid_host`, `camelid_worker_threads` |
 | **Serving receipt** (opt-in, `--serving-receipts <path>`) | one JSONL line per request, digests at full length |
 
 ```json
@@ -175,11 +176,16 @@ which sizes the platform BLAS pool this replica reports nothing about, and
 which are a second, undocumented way to size the pool `--threads` owns. Naming
 one spelling of a lever and not the other would be a hint rather than a refusal.
 
-Admission is not a promise that a permitted variable cannot move the numerics:
-`CAMELID_ENTERPRISE_THREADS` plainly does. It is permitted because the width it
-produces is read back from the pool and published on every response. The rule
-both lists share is that **a lever this replica publishes is one a client can
-check; a lever it neither publishes nor refuses is the hole.**
+Admission is not a promise that a permitted variable cannot move the numerics.
+Two of the permitted names plainly do. `CAMELID_ENTERPRISE_MODEL` selects the
+weights, and different weights share nothing; `CAMELID_ENTERPRISE_THREADS` sizes
+the worker pool, and the guarantee below is scoped *per* width because
+bit-exactness across widths has not been established for the whole forward pass.
+Both are permitted because what they resolve to is published on every response —
+the model digest and the pool width are read back and stamped — not because they
+are inert. The rule both lists share is that **a lever this replica
+publishes is one a client can check; a lever it neither publishes nor refuses is
+the hole.**
 
 A refusal names every offending variable at once, says what each one does, and
 prints the allow list, so the answer to "what may I set, then?" comes from the

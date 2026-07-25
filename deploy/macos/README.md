@@ -190,11 +190,12 @@ upstream field reordering cannot break it. Both `generation_ready` and
 `engine_queue_depth` come from the same response, so one route serves readiness
 and the drain.
 
-> The Kubernetes manifests and the container `HEALTHCHECK` in this repository use
-> the weaker `curl -sf .../v1/models | grep -q '"id"'`. That is a deliberate
-> difference and not an oversight — those probes predate the health route being
-> on the served allow list — but the check above is the stricter one and is what
-> a new deployment should use.
+> The Kubernetes startup and readiness probes and the container `HEALTHCHECK`
+> now run the same check. They used to grep `/v1/models` for an id, which
+> reports healthy on a replica whose model is listed but whose runtime could not
+> be built — every generation request on such a pod fails. The Kubernetes
+> liveness probe stays on `/v1/models`, because it asks a different question:
+> whether the process still answers at all.
 
 ### Pinning the identity from the probe
 
@@ -231,6 +232,15 @@ admission digest is `45121fb83fef`, and it does *not* change at a pin bump —
 only when the allow list or the foreign-refusal list does.
 [ADR 0002](../../docs/adr/0002-replica-identity-surface.md) says what each does
 and does not claim.
+
+Both values are maintained by hand — here, in the repository `README.md` and in
+the ADR — including the two literals inside the probe above, which are
+executable: a stale copy there fails against a correctly-built replica. The
+workspace test suite asserts that all three documents carry the digests the
+binary computes, so a policy edit that updates the code and forgets this page
+fails the build rather than shipping. If a check here ever disagrees with a
+replica you trust, compare against `crates/server/src/lane.rs` before concluding
+the replica is at fault.
 
 If you want an in-box watchdog, a second LaunchDaemon with `StartInterval`
 running the readiness probe and calling
@@ -367,9 +377,13 @@ two weeks retained, bzip2'd.
 
 Size that threshold against your probe interval, not against your traffic. A
 receipt is written for **every** request the replica answers, and a readiness
-probe is a request: at roughly 350 bytes per line and one probe every five
-seconds, probe traffic alone is about 6 MB a day. On a quiet replica the receipt
-log is mostly health checks.
+probe is a request. A `GET /v1/health` line is **about 420 bytes** — three
+64-character digests, the host summary, lane, method, path, status, timestamp and
+worker width — so at one probe every five seconds probe traffic alone is roughly
+**7.3 MB a day**. That sits under the stanza's 10 MB size threshold, but not by
+much: any real traffic on top of it crosses the threshold before the nightly
+rotation gets there, and a probe every two seconds crosses it on probes alone. On
+a quiet replica the receipt log is mostly health checks.
 
 **launchd stdio does not rotate cleanly.** launchd opens `StandardOutPath` and
 `StandardErrorPath` once at job spawn and holds the descriptors, so a rotation
