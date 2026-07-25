@@ -24,7 +24,12 @@ Only the OpenAI-compatible `/v1` inference surface is public through the gateway
 replica `/api`, embedded WebUI, workspace, and model-lifecycle routes return 404.
 The gateway admits at most 256 concurrent request streams by default (including
 the full lifetime of streaming responses); set `CAMELID_GATEWAY_MAX_IN_FLIGHT`
-to tune that bound.
+to tune that bound. Every accepted client connection is also force-closed after
+`CAMELID_GATEWAY_MAX_CONNECTION_SECONDS` (default 300s) regardless of activity.
+This is a coarse wall-clock cap, not an idle timeout: it is what stops a client
+that drips a request body one byte at a time, or opens a response stream and
+never reads it, from pinning an admission permit indefinitely. Size it to
+comfortably exceed the slowest real generation this deployment serves.
 
 When a replica's queue is full it returns `503` + `Retry-After`; treat that as
 the autoscaling signal (scale on queue-full rate or p95 latency, not CPU — a
@@ -42,21 +47,30 @@ The gateway forwards only these replica routes:
 
 Everything else returns `404` at the gateway without contacting the replica.
 In particular, `/api/*`, legacy `/models/*`, workspace routes, and the embedded
-WebUI are replica-local and never public client paths.
+WebUI are replica-local and never public client paths. This list is a
+hand-maintained mirror of the pinned engine's public surface; nothing today
+verifies it stays in sync with the replica's actual contract if the engine
+pin moves (see `crates/replica-contract`, landing separately, for the
+authoritative tested inventory).
 `GET /healthz` is gateway-local and returns `204`; Kubernetes uses it for both
 readiness and liveness so replica saturation or temporary unavailability does
 not remove otherwise healthy gateway endpoints and amplify an outage.
 All gateway responses include permissive CORS visibility headers, matching the
 pinned replica API, so browser clients can inspect typed gateway `502`/`503`
-errors and route-level `404`/`405` failures. No credentials are enabled.
+errors and route-level `404`/`405` failures. Cross-origin preflight (`OPTIONS`
+with `Access-Control-Request-Method`) is answered locally by the CORS layer
+and never reaches the replica or consumes an admission permit. No credentials
+are enabled.
 
 Request and response bodies remain streaming and opaque. The gateway removes
 HTTP hop-by-hop headers and strips client-supplied `Forwarded`, `X-Forwarded-*`,
 and `X-Real-IP` values because this release does not yet establish trusted
 client identity. It does not retry requests. The upstream connection pool keeps
 at most 32 idle connections for 30 seconds, and the configurable concurrency
-limit is held until a streaming response completes or disconnects. Saturation
-returns a typed `503` with `Retry-After: 1`.
+limit is held until a streaming response completes, disconnects, or the
+connection's maximum duration elapses. Saturation returns a typed `503` with
+a `Retry-After` of 1-3 seconds (randomized, so clients rejected at the same
+instant do not retry in lockstep).
 
 ## Docker
 

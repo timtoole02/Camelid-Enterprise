@@ -6,7 +6,7 @@ use axum::routing::{any, post};
 use axum::Router;
 use bytes::Bytes;
 use camelid_enterprise_gateway::{
-    router as gateway_router, router_with_max_in_flight, UpstreamOrigin,
+    router as gateway_router, router_with_max_in_flight, UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT,
 };
 use futures_util::stream;
 use http_body_util::BodyExt;
@@ -47,8 +47,29 @@ async fn spawn_server(app: Router) -> TestServer {
 }
 
 async fn spawn_gateway(upstream: SocketAddr) -> TestServer {
+    spawn_gateway_with_limits(upstream, DEFAULT_MAX_IN_FLIGHT, Duration::from_secs(30)).await
+}
+
+async fn spawn_gateway_with_limits(
+    upstream: SocketAddr,
+    max_in_flight: NonZeroUsize,
+    max_connection_duration: Duration,
+) -> TestServer {
     let upstream = UpstreamOrigin::parse(&format!("http://{upstream}")).unwrap();
-    spawn_server(gateway_router(upstream)).await
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = router_with_max_in_flight(upstream, max_in_flight);
+    let task = tokio::spawn(async move {
+        camelid_enterprise_gateway::serve(
+            listener,
+            router,
+            max_connection_duration,
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    });
+    TestServer { addr, task }
 }
 
 fn client() -> Client<HttpConnector, Body> {
@@ -487,7 +508,7 @@ async fn rejects_wrong_methods_without_contacting_upstream() {
 }
 
 #[tokio::test]
-async fn forwards_head_and_cors_preflight_on_allowed_routes() {
+async fn head_requests_still_forward_to_the_replica() {
     let methods = Arc::new(Mutex::new(Vec::new()));
     let upstream = spawn_server(Router::new().fallback(any({
         let methods = Arc::clone(&methods);
@@ -502,25 +523,63 @@ async fn forwards_head_and_cors_preflight_on_allowed_routes() {
     .await;
     let app = gateway_router(UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap());
 
-    for (method, path) in [
-        (Method::HEAD, "/v1/models"),
-        (Method::OPTIONS, "/v1/chat/completions"),
-    ] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(path)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::HEAD)
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    assert_eq!(*methods.lock().unwrap(), [Method::HEAD, Method::OPTIONS]);
+    assert_eq!(*methods.lock().unwrap(), [Method::HEAD]);
+}
+
+#[tokio::test]
+async fn cors_preflight_is_answered_locally_without_contacting_the_replica() {
+    let upstream_calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(Router::new().fallback(any({
+        let upstream_calls = Arc::clone(&upstream_calls);
+        move || {
+            let upstream_calls = Arc::clone(&upstream_calls);
+            async move {
+                upstream_calls.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        }
+    })))
+    .await;
+    let app = gateway_router(UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap());
+
+    // A real browser preflight for a cross-origin, non-safelisted request
+    // (JSON body) carries these two headers. Only their presence makes a
+    // request a preflight in tower-http's CORS layer; the gateway does not
+    // register an `OPTIONS` handler on any route, so a preflight must be
+    // answered entirely by the CORS layer, before the router dispatches it.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/v1/chat/completions")
+                .header("origin", "https://example.test")
+                .header("access-control-request-method", "POST")
+                .header("access-control-request-headers", "content-type")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["access-control-allow-origin"], "*");
+    // `CorsLayer::permissive()` answers every preflight with the wildcard,
+    // not a mirror of the requested method/headers.
+    assert_eq!(response.headers()["access-control-allow-methods"], "*");
+    assert_eq!(response.headers()["access-control-allow-headers"], "*");
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -578,7 +637,15 @@ async fn concurrency_limit_is_held_for_the_full_response_stream() {
         .await
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(rejected.headers()["retry-after"], "1");
+    let retry_after: u64 = rejected.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("retry-after must be a decimal integer of seconds");
+    assert!(
+        (1..=3).contains(&retry_after),
+        "retry-after must be jittered within [1, 3], got {retry_after}"
+    );
     assert_eq!(rejected.headers()["access-control-allow-origin"], "*");
 
     drop(first);
@@ -679,12 +746,11 @@ async fn graceful_shutdown_waits_for_an_active_response_stream() {
     let app = gateway_router(UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap());
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .unwrap();
+        camelid_enterprise_gateway::serve(listener, app, Duration::from_secs(30), async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
     });
     let request = Request::post(format!("http://{gateway_addr}/v1/chat/completions"))
         .body(Body::empty())
@@ -707,4 +773,66 @@ async fn graceful_shutdown_waits_for_an_active_response_stream() {
     }
     drop(body);
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn stalled_connection_is_closed_after_the_maximum_duration_and_releases_its_permit() {
+    let release = Arc::new(Notify::new());
+    let upstream = spawn_server(
+        Router::new()
+            .route("/v1/chat/completions", any(delayed_sse))
+            .with_state(Arc::clone(&release)),
+    )
+    .await;
+    let gateway = spawn_gateway_with_limits(
+        upstream.addr,
+        NonZeroUsize::new(1).unwrap(),
+        Duration::from_millis(300),
+    )
+    .await;
+
+    // The first request never finishes: `delayed_sse` sends one chunk, then
+    // waits on a `Notify` that this test never signals, and the client below
+    // never reads past that first chunk either — exactly like a client that
+    // stops reading its response. Nothing here drops the body, so the only
+    // thing that can free the admission permit is the gateway's own
+    // maximum-connection-duration cap.
+    let first_request = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .body(Body::empty())
+        .unwrap();
+    let first_response = client().request(first_request).await.unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let mut first_body = first_response.into_body();
+    let first_chunk = first_body
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(first_chunk, "data: first\n\n");
+
+    let second_request = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .body(Body::empty())
+        .unwrap();
+    let second_response = client().request(second_request).await.unwrap();
+    assert_eq!(
+        second_response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the single admission permit must still be pinned by the stalled first request"
+    );
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let third_request = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .body(Body::empty())
+        .unwrap();
+    let third_response = client().request(third_request).await.unwrap();
+    assert_eq!(
+        third_response.status(),
+        StatusCode::OK,
+        "the gateway must have force-closed the stalled connection and released its permit"
+    );
+
+    drop(first_body);
 }

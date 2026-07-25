@@ -1,9 +1,11 @@
 use camelid_enterprise_gateway::{
-    router_with_max_in_flight, UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT,
+    router_with_max_in_flight, UpstreamOrigin, DEFAULT_MAX_CONNECTION_DURATION,
+    DEFAULT_MAX_IN_FLIGHT,
 };
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "camelid-enterprise-gateway", version, about)]
@@ -29,6 +31,17 @@ enum Command {
             env = "CAMELID_GATEWAY_MAX_IN_FLIGHT"
         )]
         max_in_flight: NonZeroUsize,
+        /// Maximum seconds a single client connection may stay open. This is
+        /// a hard cap, not an idle timeout: it bounds how long a stalled or
+        /// malicious client (a slow request-body drip, or a client that
+        /// never reads its response) can pin an admission permit. Legitimate
+        /// long-running generations must finish within this bound.
+        #[arg(
+            long,
+            default_value_t = DEFAULT_MAX_CONNECTION_DURATION.as_secs(),
+            env = "CAMELID_GATEWAY_MAX_CONNECTION_SECONDS"
+        )]
+        max_connection_seconds: u64,
     },
 }
 
@@ -43,7 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             upstream,
             addr,
             max_in_flight,
-        } => serve(&upstream, addr, max_in_flight).await,
+            max_connection_seconds,
+        } => serve(&upstream, addr, max_in_flight, max_connection_seconds).await,
     }
 }
 
@@ -51,13 +65,24 @@ async fn serve(
     upstream: &str,
     addr: SocketAddr,
     max_in_flight: NonZeroUsize,
+    max_connection_seconds: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream = UpstreamOrigin::parse(upstream)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, max_in_flight = max_in_flight.get(), "gateway listening");
-    axum::serve(listener, router_with_max_in_flight(upstream, max_in_flight))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let max_connection_duration = Duration::from_secs(max_connection_seconds);
+    tracing::info!(
+        %addr,
+        max_in_flight = max_in_flight.get(),
+        max_connection_seconds,
+        "gateway listening"
+    );
+    camelid_enterprise_gateway::serve(
+        listener,
+        router_with_max_in_flight(upstream, max_in_flight),
+        max_connection_duration,
+        shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }
 

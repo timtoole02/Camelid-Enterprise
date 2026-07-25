@@ -12,6 +12,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# The gateway crate uses `NonZeroUsize::new(..).unwrap()` in a `const` item,
+# which requires the const-stable `Option::unwrap` stabilized in Rust 1.83.
+rust-version = "1.83"
 license = "Apache-2.0"
 repository = "https://github.com/timtoole02/Camelid-Enterprise"
 

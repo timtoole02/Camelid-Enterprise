@@ -45,6 +45,8 @@ spec:
               value: "http://camelid-enterprise-deterministic"
             - name: CAMELID_GATEWAY_MAX_IN_FLIGHT
               value: "256"
+            - name: CAMELID_GATEWAY_MAX_CONNECTION_SECONDS
+              value: "300"
           ports:
             - containerPort: 8080
               name: http
@@ -65,3 +67,12 @@ spec:
               path: /healthz
               port: http
             periodSeconds: 15
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # `readOnlyRootFilesystem` leaves no writable path at all; this is
+        # unused today (the gateway writes nothing) but keeps a dependency
+        # that ever needs a scratch file from failing silently.
+        - name: tmp
+          emptyDir: {}

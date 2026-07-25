@@ -6,12 +6,9 @@
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::{
-    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, CONNECTION, CONTENT_TYPE, HOST,
-};
+use axum::http::header::{CONNECTION, CONTENT_TYPE, HOST};
 use axum::http::uri::{Authority, Scheme};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
-use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -27,11 +24,26 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tower_http::cors::CorsLayer;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IDLE_PER_HOST: usize = 32;
+/// Retry-After is jittered across this inclusive range (seconds) so that
+/// clients rejected at the same instant do not retry in lockstep and
+/// re-create the exact saturation spike that rejected them.
+const RETRY_AFTER_JITTER_SECONDS: (u8, u8) = (1, 3);
 pub const DEFAULT_MAX_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+/// Every accepted client connection is force-closed after this long,
+/// regardless of activity. Nothing else in this module bounds how long a
+/// single HTTP exchange may run: the admission permit in [`PermitBody`] is
+/// held for the full request+response lifetime, so a client that drips a
+/// request body one byte at a time, or opens a response stream and never
+/// reads it, would otherwise pin a permit (and a TCP socket) indefinitely.
+/// This is a coarse backstop, not an idle timeout: legitimate long-running
+/// generations must complete within this bound. Size it to the slowest real
+/// completion the deployment expects, with margin.
+pub const DEFAULT_MAX_CONNECTION_DURATION: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
 pub struct UpstreamOrigin {
@@ -96,6 +108,11 @@ pub fn router(upstream: UpstreamOrigin) -> Router {
     router_with_max_in_flight(upstream, DEFAULT_MAX_IN_FLIGHT)
 }
 
+// This route table is a hand-maintained mirror of the pinned engine's public
+// `/v1` surface (see `crates/replica-contract` for the authoritative,
+// tested inventory once it lands). If the pinned engine adds, removes, or
+// renames a public route, this list must be updated by hand: nothing today
+// verifies the gateway's allowlist and the replica's actual contract agree.
 pub fn router_with_max_in_flight(upstream: UpstreamOrigin, max_in_flight: NonZeroUsize) -> Router {
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
@@ -108,17 +125,23 @@ pub fn router_with_max_in_flight(upstream: UpstreamOrigin, max_in_flight: NonZer
     let client = client_builder.build(connector);
     Router::new()
         .route("/healthz", get(gateway_health))
-        .route("/v1/health", get(proxy).options(proxy))
-        .route("/v1/models", get(proxy).options(proxy))
-        .route("/v1/models/:model", get(proxy).options(proxy))
-        .route("/v1/completions", post(proxy).options(proxy))
-        .route("/v1/chat/completions", post(proxy).options(proxy))
-        .route("/v1/embeddings", post(proxy).options(proxy))
-        .route("/v1/responses", post(proxy).options(proxy))
-        .route("/v1/messages", post(proxy).options(proxy))
-        .route("/v1/rerank", post(proxy).options(proxy))
-        .route("/v1/reranking", post(proxy).options(proxy))
-        .layer(middleware::from_fn(add_cors_response_headers))
+        .route("/v1/health", get(proxy))
+        .route("/v1/models", get(proxy))
+        .route("/v1/models/:model", get(proxy))
+        .route("/v1/completions", post(proxy))
+        .route("/v1/chat/completions", post(proxy))
+        .route("/v1/embeddings", post(proxy))
+        .route("/v1/responses", post(proxy))
+        .route("/v1/messages", post(proxy))
+        .route("/v1/rerank", post(proxy))
+        .route("/v1/reranking", post(proxy))
+        // CORS preflight (`OPTIONS` with `Access-Control-Request-Method`) is
+        // answered locally by this layer, before the request ever reaches a
+        // route handler: it does not consume an admission permit or contact
+        // the replica. Real cross-origin, non-safelisted requests (for
+        // example `POST` with `Content-Type: application/json`) get a
+        // complete preflight response, not just `Access-Control-Allow-Origin`.
+        .layer(CorsLayer::permissive())
         .with_state(GatewayState {
             upstream,
             client,
@@ -130,17 +153,6 @@ async fn gateway_health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn add_cors_response_headers(request: Request, next: Next) -> Response {
-    let mut response = next.run(request).await;
-    response
-        .headers_mut()
-        .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-    response
-        .headers_mut()
-        .insert(ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("*"));
-    response
-}
-
 async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Response {
     let permit = match Arc::clone(&state.admission).try_acquire_owned() {
         Ok(permit) => permit,
@@ -149,9 +161,13 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
                 StatusCode::SERVICE_UNAVAILABLE,
                 "gateway concurrency limit reached",
             );
-            response
-                .headers_mut()
-                .insert("retry-after", HeaderValue::from_static("1"));
+            let (low, high) = RETRY_AFTER_JITTER_SECONDS;
+            let retry_after = fastrand::u8(low..=high);
+            response.headers_mut().insert(
+                "retry-after",
+                HeaderValue::from_str(&retry_after.to_string())
+                    .expect("a small decimal integer is a valid header value"),
+            );
             return response;
         }
     };
@@ -177,7 +193,6 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
             remove_hop_by_hop(&mut parts.headers);
-            let body = Body::new(body);
             Response::from_parts(parts, Body::new(PermitBody::new(body, permit)))
         }
         Err(error) => {
@@ -299,6 +314,59 @@ fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
         value = &value[..value.len() - 1];
     }
     value
+}
+
+/// Serves `router` on `listener` until `shutdown` resolves, then finishes
+/// in-flight connections gracefully before returning.
+///
+/// Every accepted connection is force-closed after `max_connection_duration`
+/// (see [`DEFAULT_MAX_CONNECTION_DURATION`]) regardless of activity, which is
+/// what bounds how long a stalled client can pin an admission permit. This is
+/// a per-connection wall-clock cap, not an idle timer: it fires even while a
+/// connection is making steady, legitimate progress, so it must be sized to
+/// comfortably exceed the slowest real generation this deployment serves.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    max_connection_duration: Duration,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _peer_addr) = match accepted {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to accept a gateway connection");
+                        continue;
+                    }
+                };
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let service = hyper_util::service::TowerToHyperService::new(router.clone());
+                let connection = hyper::server::conn::http1::Builder::new().serve_connection(io, service);
+                let watched = graceful.watch(connection);
+                tokio::spawn(async move {
+                    if tokio::time::timeout(max_connection_duration, watched)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            seconds = max_connection_duration.as_secs(),
+                            "gateway connection exceeded the maximum duration and was closed",
+                        );
+                    }
+                });
+            }
+            _ = &mut shutdown => {
+                break;
+            }
+        }
+    }
+    drop(listener);
+    graceful.shutdown().await;
+    Ok(())
 }
 
 #[cfg(test)]
