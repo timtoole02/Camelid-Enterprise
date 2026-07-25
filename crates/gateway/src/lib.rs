@@ -10,7 +10,7 @@ use axum::http::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, WWW_AUTH
 use axum::http::uri::{Authority, Scheme};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, MethodRouter};
 use axum::{Json, Router};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -18,6 +18,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use identity::{IdentityError, PrincipalId, SqliteIdentityStore, TokenStore};
 use pin_project_lite::pin_project;
+use replica_contract::HttpMethod;
 use std::fmt;
 use std::io::Write;
 use std::num::NonZeroUsize;
@@ -141,11 +142,13 @@ pub fn router_with_max_in_flight(upstream: UpstreamOrigin, max_in_flight: NonZer
     router_with_options(upstream, max_in_flight, GatewayAuth::Disabled, None)
 }
 
-// This route table is a hand-maintained mirror of the pinned engine's public
-// `/v1` surface (see `crates/replica-contract` for the authoritative,
-// tested inventory once it lands). If the pinned engine adds, removes, or
-// renames a public route, this list must be updated by hand: nothing today
-// verifies the gateway's allowlist and the replica's actual contract agree.
+// The forwarded route surface is derived from `replica_contract::PUBLIC_ROUTES`,
+// the single machine-readable source of truth for the replica's public HTTP
+// contract, so the gateway's allowlist cannot silently drift from it. Adding,
+// removing, or renaming a public route in the contract crate changes exactly
+// what this gateway forwards, with no hand-maintained mirror to keep in sync.
+// Private replica routes (model, runtime, workspace, legacy, diagnostics) are
+// absent from `PUBLIC_ROUTES` by construction, so they are never forwarded.
 pub fn router_with_options(
     upstream: UpstreamOrigin,
     max_in_flight: NonZeroUsize,
@@ -161,18 +164,13 @@ pub fn router_with_options(
     client_builder.pool_idle_timeout(POOL_IDLE_TIMEOUT);
     client_builder.pool_max_idle_per_host(MAX_IDLE_PER_HOST);
     let client = client_builder.build(connector);
-    Router::new()
-        .route("/healthz", get(gateway_health))
-        .route("/v1/health", get(proxy))
-        .route("/v1/models", get(proxy))
-        .route("/v1/models/:model", get(proxy))
-        .route("/v1/completions", post(proxy))
-        .route("/v1/chat/completions", post(proxy))
-        .route("/v1/embeddings", post(proxy))
-        .route("/v1/responses", post(proxy))
-        .route("/v1/messages", post(proxy))
-        .route("/v1/rerank", post(proxy))
-        .route("/v1/reranking", post(proxy))
+    // `/healthz` is the gateway's own liveness probe, not part of the replica
+    // contract, so it is registered explicitly and answered locally.
+    let mut router = Router::new().route("/healthz", get(gateway_health));
+    for spec in replica_contract::contractual_routes() {
+        router = router.route(spec.path, proxy_methods(spec.methods));
+    }
+    router
         // CORS preflight (`OPTIONS` with `Access-Control-Request-Method`) is
         // answered locally by this layer, before the request ever reaches a
         // route handler: it does not consume an admission permit, run
@@ -192,6 +190,24 @@ pub fn router_with_options(
 
 async fn gateway_health() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+/// Builds the [`MethodRouter`] for one contractual route: every HTTP method the
+/// contract declares for it is forwarded to [`proxy`], and any other method
+/// falls through to axum's automatic `405 Method Not Allowed`. Matching
+/// [`HttpMethod`] exhaustively means a new method variant added to the contract
+/// crate stops this crate from compiling until the gateway is taught to forward
+/// it, rather than silently dropping a newly-contractual method.
+fn proxy_methods(methods: &[HttpMethod]) -> MethodRouter<GatewayState> {
+    let mut method_router = MethodRouter::new();
+    for method in methods {
+        method_router = match method {
+            HttpMethod::Get => method_router.get(proxy),
+            HttpMethod::Post => method_router.post(proxy),
+            HttpMethod::Delete => method_router.delete(proxy),
+        };
+    }
+    method_router
 }
 
 async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Response {

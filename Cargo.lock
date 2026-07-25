@@ -318,6 +318,7 @@ dependencies = [
  "axum",
  "bytes",
  "camelid-enterprise-identity",
+ "camelid-enterprise-replica-contract",
  "clap",
  "fastrand",
  "futures-util",

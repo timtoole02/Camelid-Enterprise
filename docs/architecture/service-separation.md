@@ -60,7 +60,7 @@ deploy/
 | **Serving replica** | `crates/server` (`camelid-enterprise` bin) | CLI (`serve`), binds an HTTP listener, applies the deterministic lane, stamps attribution, loads one model at startup. |
 | **Lane / config freeze** | `crates/server/src/lane.rs` | Applies a canonical env-var configuration vector, fails closed on any override, publishes its SHA-256. Engine pinned by revision (`ENGINE_PIN`). |
 | **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-host` on every response, injects fields into completion bodies, writes optional JSONL serving receipts (each carrying the gateway-stamped `request_id` when present, or `null` for direct-to-replica traffic). |
-| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin forwarding for an explicit `/v1` inference allowlist, with opaque streaming bodies, hop-by-hop header filtering, no retries, bounded concurrency (admission-controlled), and no response rewriting. Replica control routes are not exposed. Optionally enforces bearer-token auth (see below), checked before the admission permit is taken; unauthenticated pass-through remains the default. Stamps a gateway-authoritative `x-camelid-request-id` on every forwarded request (overwriting any client value) and, with `serve --audit-log <path>`, writes one JSONL audit line per handled request — including auth/admission rejections — as `{ts, request_id, principal, method, path, status}`. |
+| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin forwarding for the `/v1` inference allowlist it derives from `replica_contract::PUBLIC_ROUTES` (so the allowlist cannot silently drift from the replica's public contract), with opaque streaming bodies, hop-by-hop header filtering, no retries, bounded concurrency (admission-controlled), and no response rewriting. Replica control routes are not exposed. Optionally enforces bearer-token auth (see below), checked before the admission permit is taken; unauthenticated pass-through remains the default. Stamps a gateway-authoritative `x-camelid-request-id` on every forwarded request (overwriting any client value) and, with `serve --audit-log <path>`, writes one JSONL audit line per handled request — including auth/admission rejections — as `{ts, request_id, principal, method, path, status}`. |
 | **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | The gateway exposes `/v1/health`, model discovery, completions/chat, and the pinned engine's compatibility endpoints. Replica-local `/api` model management remains private. Provided by the pinned engine crate, **not** by this repo. |
 | **Engine core** | `crates/engine-core` | GGUF container, model config, tensor/forward/tokenizer types. Host-agnostic. |
 | **Platform kernels** | `crates/engine-{macos,linux,windows}` | Runtime CPU feature detection (`probe()`), platform kernels. macOS port landing first; Linux/Windows currently capability-detection only. |
@@ -211,7 +211,11 @@ tokens for one model"; everything multi-user is layered on top.
   health, discovery, typed errors, and attribution. An explicit
   model-backed test covers load, readiness, deterministic greedy output, and
   SSE with a compatible local GGUF, plus queue saturation, typed backpressure,
-  and depth recovery.
+  and depth recovery. Both sides now consume the shared registry: the replica
+  verifies its pinned router against it, and the gateway derives its forwarded
+  allowlist from `PUBLIC_ROUTES` (with a test asserting it forwards exactly the
+  contractual routes and methods), so neither can drift from the contract
+  unnoticed.
 2. **Gateway (pass-through first) — built.** A transparent fixed-origin gateway
   fronts the existing replica pool with no inference behavior change. It ships
   as a Rust binary, separate container, and private Kubernetes Service.

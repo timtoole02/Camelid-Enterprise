@@ -41,6 +41,20 @@ pub enum Surface {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RouteSpec {
+    /// Route path in **axum path syntax**: path parameters are written `:name`
+    /// (e.g. `/v1/models/:model`).
+    ///
+    /// This is a deliberate, load-bearing coupling worth naming, because this
+    /// crate is otherwise framework-neutral. The path grammar stored here is the
+    /// one both current consumers use — the pinned engine's replica router and
+    /// the gateway — which are both on axum 0.7 and register `path` verbatim.
+    /// axum 0.8 changed parameter syntax to `{name}`; under it a `:model`
+    /// segment silently becomes a *literal* path segment: the router still
+    /// builds, but the parameterized route stops matching real requests (404)
+    /// with no compile error. A consumer on a framework with different path
+    /// syntax must translate `path` rather than register it verbatim; and
+    /// `probe_path` exists so conformance checks hit the real matcher and would
+    /// catch exactly this kind of silent break.
     pub path: &'static str,
     /// Concrete path used by executable conformance checks for parameterized
     /// routes. Equal to `path` for non-parameterized routes.
@@ -69,6 +83,9 @@ const fn route(
 }
 
 /// Complete client-facing route set for [`CONTRACT_ID`].
+///
+/// Paths use axum path syntax (`:param`); see [`RouteSpec::path`] for the
+/// framework-coupling caveat that entails.
 pub const PUBLIC_ROUTES: &[RouteSpec] = &[
     route("/v1/health", "/v1/health", GET, Surface::PublicInference),
     route("/v1/models", "/v1/models", GET, Surface::PublicInference),
