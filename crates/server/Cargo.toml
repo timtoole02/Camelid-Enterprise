@@ -16,6 +16,7 @@ path = "src/main.rs"
 camelid = { git = "https://github.com/timtoole02/Camelid", rev = "b4e3a9056567ed8145fc4fa29850d6f1f261ac2b" }
 
 engine-core.workspace = true
+replica-contract.workspace = true
 serde_json.workspace = true
 
 axum = "0.7"
@@ -33,6 +34,9 @@ engine-linux.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 engine-windows.workspace = true
+
+[build-dependencies]
+toml = "0.8"
 
 [dev-dependencies]
 # Drive the attribution middleware through a real router (`ServiceExt::oneshot`)

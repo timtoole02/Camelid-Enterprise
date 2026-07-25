@@ -6,15 +6,10 @@
 //! replica cannot serve fail closed (typed 503 from the bounded engine queue);
 //! there is no silent demotion to any other execution mode.
 
-mod attribution;
-mod lane;
-
-use attribution::Attribution;
-use axum::middleware;
+use camelid_enterprise::{apply_deterministic, attributed_router, ENGINE_PIN};
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "camelid-enterprise", version, about)]
@@ -72,7 +67,7 @@ async fn serve(
         )
         .into());
     }
-    let config = lane::apply_deterministic().map_err(std::io::Error::other)?;
+    let config = apply_deterministic().map_err(std::io::Error::other)?;
     #[cfg(target_os = "macos")]
     let host = engine_macos::probe();
     #[cfg(target_os = "linux")]
@@ -82,7 +77,7 @@ async fn serve(
     let host_summary = host.summary();
     eprintln!(
         "[lane] deterministic | engine pin {} | config vector sha256 {} | host {}",
-        lane::ENGINE_PIN,
+        ENGINE_PIN,
         config.short(),
         host_summary
     );
@@ -91,14 +86,7 @@ async fn serve(
     let state = camelid::api::AppState::with_configured_threads(threads)
         .with_default_enable_thinking(false)
         .with_models_dir(None);
-    let ctx = Attribution {
-        lane: "deterministic",
-        config_sha256: Arc::new(config.sha256),
-        host: Arc::new(host_summary),
-        receipts: serving_receipts.map(Arc::new),
-    };
-    let router = camelid::api::router_with_state(state)
-        .layer(middleware::from_fn_with_state(ctx.clone(), attribution::attribute));
+    let router = attributed_router(state, config.sha256, host_summary, serving_receipts);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("[lane] listening on http://{addr}");

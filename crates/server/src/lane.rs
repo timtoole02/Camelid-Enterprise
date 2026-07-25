@@ -8,7 +8,8 @@
 
 use sha2::{Digest, Sha256};
 
-pub const ENGINE_PIN: &str = "b4e3a9056567ed8145fc4fa29850d6f1f261ac2b";
+/// Exact engine dependency revision, derived from `Cargo.toml` by `build.rs`.
+pub const ENGINE_PIN: &str = env!("CAMELID_ENGINE_PIN");
 
 /// Keys the deterministic lane sets to canonical values before the engine
 /// reads any of them. The engine pins its forward pass to the order-stable

@@ -7,6 +7,7 @@ members = [
     "crates/engine-windows",
     "crates/gateway",
     "crates/identity",
+    "crates/replica-contract",
     "crates/server",
 ]
 
@@ -25,6 +26,7 @@ engine-macos = { path = "crates/engine-macos", package = "camelid-enterprise-eng
 engine-linux = { path = "crates/engine-linux", package = "camelid-enterprise-engine-linux" }
 engine-windows = { path = "crates/engine-windows", package = "camelid-enterprise-engine-windows" }
 identity = { path = "crates/identity", package = "camelid-enterprise-identity" }
+replica-contract = { path = "crates/replica-contract", package = "camelid-enterprise-replica-contract" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
