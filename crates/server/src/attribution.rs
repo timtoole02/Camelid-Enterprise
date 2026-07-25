@@ -133,11 +133,20 @@ pub async fn attribute(
         let log = Arc::clone(log);
         // Best-effort, off the request path's async context. Serialize the
         // whole-record append so simultaneous request tasks cannot interleave
-        // JSONL records within this process.
+        // JSONL records within this process. Not awaited: a receipt still
+        // in flight when the process exits (e.g. on SIGTERM) is lost, which
+        // is consistent with the "best-effort, no durability guarantee"
+        // contract, but is a real gap worth naming rather than papering over.
         tokio::task::spawn_blocking(move || {
-            let Ok(_guard) = receipt_write_lock().lock() else {
-                return;
-            };
+            // Recover a poisoned lock instead of dropping every subsequent
+            // receipt for the rest of the process's life. A panic while
+            // holding this lock cannot corrupt the file (each holder only
+            // appends one complete, newline-terminated record), so treating
+            // a poisoned guard as usable is safe and keeps the audit trail
+            // alive after an unrelated one-off failure.
+            let _guard = receipt_write_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&*log) {
                 let mut record = line.to_string();
                 record.push('\n');
@@ -151,7 +160,7 @@ pub async fn attribute(
 
 #[cfg(test)]
 mod tests {
-    use super::{attribute, Attribution, BODY_LIMIT};
+    use super::{attribute, receipt_write_lock, Attribution, BODY_LIMIT};
     use axum::body::{to_bytes, Body};
     use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
     use axum::middleware::from_fn_with_state;
@@ -388,5 +397,36 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("expected {expected} receipt line(s) were not written within the timeout");
+    }
+
+    /// A `std::sync::Mutex` never un-poisons itself once a panic occurs while
+    /// it is held. Giving up on a poisoned lock (as opposed to recovering it)
+    /// would silently drop every subsequent receipt for the rest of the
+    /// process's life. Prove recovery actually works: poison the shared lock
+    /// exactly like a panicking holder would, then confirm the next receipt
+    /// still gets written.
+    #[tokio::test]
+    async fn receipts_survive_a_poisoned_lock() {
+        let poison_thread = std::thread::spawn(|| {
+            let _guard = receipt_write_lock().lock().unwrap();
+            panic!("deliberately poisoning the receipt lock for this test");
+        });
+        assert!(
+            poison_thread.join().is_err(),
+            "the poisoning thread must have panicked"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let app = Router::new()
+            .fallback(get(|| async { Json(serde_json::json!({ "object": "list" })) }))
+            .layer(from_fn_with_state(ctx(Some(Arc::new(path.clone()))), attribute));
+
+        app.oneshot(Request::get("/after-poison").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let receipts = read_receipts(&path, 1).await;
+        assert_eq!(receipts[0]["path"], "/after-poison");
     }
 }

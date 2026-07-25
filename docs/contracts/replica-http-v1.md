@@ -12,11 +12,15 @@ forward for one deterministic inference replica. It is not a promise that every
 route present in the pinned desktop engine is a stable Enterprise API.
 
 The dependency-free public route registry in `crates/replica-contract` is the
-source of truth for contractual paths, methods, and classification, so replicas
-and gateways can share it without linking the inference engine. The private
-pinned-route inventory and executable conformance live in
-`crates/server/src/contract.rs`; they drive the exact pinned
-`camelid::api::router_with_state` and do not reimplement the engine API.
+source of truth for contractual paths, methods, and classification, structured
+so replicas and gateways *can* share it without linking the inference engine.
+The gateway does not import this crate yet: it currently declares its own
+allowlist independently, and nothing enforces that the two stay in agreement.
+Wiring the gateway to `replica_contract::PUBLIC_ROUTES` (or a cross-crate test
+asserting they match) is deferred to land alongside the gateway hardening work
+this contract rebases onto. The private pinned-route inventory and executable
+conformance live in `crates/server/src/contract.rs`; they drive the exact
+pinned `camelid::api::router_with_state` and do not reimplement the engine API.
 
 ## Evidence labels
 
@@ -215,7 +219,11 @@ Receipt writes are best-effort and asynchronous. A write/open failure does not
 fail the client response. There is no fsync, delivery acknowledgement, tenant
 identity, request body, response body, or durability guarantee in contract v1.
 Concurrent records are written as whole JSON-plus-newline buffers so lines do
-not interleave within one process.
+not interleave within one process. Because the write is scheduled on a
+background blocking task that is not awaited by the request path, a receipt
+still in flight when the process exits (for example on `SIGTERM`) can be lost;
+this is consistent with "best-effort, no durability guarantee" but is worth
+stating plainly rather than leaving implicit.
 
 **Evidence:** executable append/concurrency tests in the attribution module.
 
@@ -245,9 +253,16 @@ because they intentionally terminate the process.
 ## Replica-private pinned implementation inventory
 
 The complete private inventory is internal to the server contract module. Axum
-does not expose inverse route-tree introspection, so completeness is established
-by source review at the immutable engine revision and a pinned 61-route
-cardinality; executable checks prove every declared route and method exists.
+does not expose inverse route-tree introspection, so the executable test proves
+only that every *declared* route still exists with exactly its declared
+methods at the pinned engine revision — it catches a declared route being
+removed or having its methods change, but it cannot detect the engine adding a
+new route at a pin bump, since there is nothing to iterate that isn't already
+in the list. Completeness of the 61-route cardinality is therefore established
+by source review at each immutable engine revision, not by the test suite; a
+new route the reviewer misses is invisible to CI. This is a documentation-
+accuracy risk, not a security gap: the gateway is a default-deny allowlist over
+ten public routes, so an undiscovered private route is simply never exposed.
 Changing the engine revision requires another full source inventory review.
 These categories exist at the pinned engine revision but are **not** Enterprise
 public contracts:
