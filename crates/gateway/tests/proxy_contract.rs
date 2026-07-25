@@ -15,6 +15,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use identity::SqliteIdentityStore;
+use replica_contract::{HttpMethod, PUBLIC_ROUTES};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -1179,4 +1180,85 @@ async fn read_audit_records(path: &std::path::Path, expected: usize) -> Vec<serd
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("expected {expected} audit line(s) were not written within the timeout");
+}
+
+/// Upstream handler that records the method and path of every request it
+/// receives, so a test can assert exactly which requests the gateway forwarded.
+async fn record_method_and_path(
+    State(seen): State<ForwardedRequests>,
+    request: Request,
+) -> Response {
+    seen.lock()
+        .unwrap()
+        .push((request.method().clone(), request.uri().path().to_string()));
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Every `(method, path)` an upstream test handler saw the gateway forward.
+type ForwardedRequests = Arc<Mutex<Vec<(Method, String)>>>;
+
+/// The gateway must forward exactly the public contract's routes and methods:
+/// every `(method, path)` in `replica_contract::PUBLIC_ROUTES` reaches the
+/// upstream (proved via `probe_path` for the parameterized route), and the
+/// gateway forwards nothing beyond them. Because the router is derived from
+/// `PUBLIC_ROUTES`, this pins the gateway allowlist to the replica contract: a
+/// route added to or removed from the contract changes this test's outcome,
+/// with no separately maintained list to keep in sync.
+#[tokio::test]
+async fn forwards_exactly_the_public_contract_routes() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_server(
+        Router::new()
+            .fallback(any(record_method_and_path))
+            .with_state(Arc::clone(&seen)),
+    )
+    .await;
+    let gateway = spawn_gateway(upstream.addr).await;
+
+    let mut expected: Vec<(Method, String)> = Vec::new();
+    for spec in PUBLIC_ROUTES {
+        for contract_method in spec.methods {
+            let method = match contract_method {
+                HttpMethod::Get => Method::GET,
+                HttpMethod::Post => Method::POST,
+                HttpMethod::Delete => Method::DELETE,
+            };
+            let response = client()
+                .request(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(format!("http://{}{}", gateway.addr, spec.probe_path))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NO_CONTENT,
+                "gateway did not forward contractual route {} {}",
+                method,
+                spec.probe_path
+            );
+            expected.push((method, spec.probe_path.to_string()));
+        }
+    }
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        expected.len(),
+        "gateway forwarded a different number of requests than the contract declares"
+    );
+    for pair in &expected {
+        assert!(
+            seen.contains(pair),
+            "upstream never received forwarded {} {}",
+            pair.0,
+            pair.1
+        );
+    }
 }
