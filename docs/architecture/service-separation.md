@@ -60,8 +60,8 @@ deploy/
 | **Serving replica** | `crates/server` (`camelid-enterprise` bin) | CLI (`serve`), binds an HTTP listener, applies the deterministic lane, stamps attribution, loads one model at startup. |
 | **Lane / config freeze** | `crates/server/src/lane.rs` | Applies a canonical env-var configuration vector, fails closed on any override, publishes its SHA-256. Engine pinned by revision (`ENGINE_PIN`). |
 | **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-host` on every response, injects fields into completion bodies, writes optional JSONL serving receipts. |
-| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin HTTP forwarding with opaque streaming bodies, hop-by-hop header filtering, and no retries or response rewriting. Returns a typed `502` only when it cannot reach the upstream. Optionally enforces bearer-token auth (see below) before forwarding; unauthenticated pass-through remains the default. |
-| **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/api/models/load`. Provided by the pinned engine crate, **not** by this repo. |
+| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin forwarding for an explicit `/v1` inference allowlist, with opaque streaming bodies, hop-by-hop header filtering, no retries, bounded concurrency (admission-controlled), and no response rewriting. Replica control routes are not exposed. Optionally enforces bearer-token auth (see below), checked before the admission permit is taken; unauthenticated pass-through remains the default. |
+| **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | The gateway exposes `/v1/health`, model discovery, completions/chat, and the pinned engine's compatibility endpoints. Replica-local `/api` model management remains private. Provided by the pinned engine crate, **not** by this repo. |
 | **Engine core** | `crates/engine-core` | GGUF container, model config, tensor/forward/tokenizer types. Host-agnostic. |
 | **Platform kernels** | `crates/engine-{macos,linux,windows}` | Runtime CPU feature detection (`probe()`), platform kernels. macOS port landing first; Linux/Windows currently capability-detection only. |
 | **Identity primitive** | `crates/identity` | Resolves an opaque bearer token to an opaque `PrincipalId`, backed by a local SQLite store (hashed tokens only). Wired into the gateway (see below) as opt-in enforcement; still no orgs, RBAC, or SSO. |
@@ -81,7 +81,8 @@ deploy/
   access-control guidance; security is entirely "put it on a trusted network."
 - **Transparent gateway only.** A fixed-origin gateway fronts one replica or one
   K8s `Service`. There is no per-user or per-model routing, authentication,
-  quota, or rate limiting.
+  quota, or rate limiting. It rejects non-inference paths and bounds concurrent
+  request streams.
 
 ---
 

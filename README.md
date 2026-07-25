@@ -84,7 +84,7 @@ cargo run --release --bin camelid-enterprise-gateway -- serve \
   --upstream http://127.0.0.1:8181
 ```
 
-The replica exposes the engine's OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, …) on `127.0.0.1:8181` by default. With the gateway running, clients use `127.0.0.1:8080`; it preserves streaming bodies, status codes, and replica attribution without inspecting or retrying inference requests.
+The replica exposes the engine's OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, …) on `127.0.0.1:8181` by default. With the gateway running, clients use `127.0.0.1:8080`; it preserves streaming bodies, status codes, and replica attribution without inspecting or retrying inference requests. The gateway exposes only the supported `/v1` inference routes; replica control, model-lifecycle, workspace, and embedded WebUI routes are not forwarded.
 
 ```bash
 curl http://127.0.0.1:8181/v1/chat/completions \
