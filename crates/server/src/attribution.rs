@@ -26,9 +26,14 @@ use axum::{
 };
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+fn receipt_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Clone)]
 pub struct Attribution {
@@ -145,11 +150,22 @@ pub async fn attribute(
             "host": ctx.host.as_str(),
         });
         let log = Arc::clone(log);
-        // Best-effort, off the request path's async context. Write the whole
-        // record — JSON plus newline — in a single `write_all` so concurrent
-        // appends from simultaneous requests cannot interleave into a corrupt
-        // line.
+        // Best-effort, off the request path's async context. Serialize the
+        // whole-record append so simultaneous request tasks cannot interleave
+        // JSONL records within this process. Not awaited: a receipt still
+        // in flight when the process exits (e.g. on SIGTERM) is lost, which
+        // is consistent with the "best-effort, no durability guarantee"
+        // contract, but is a real gap worth naming rather than papering over.
         tokio::task::spawn_blocking(move || {
+            // Recover a poisoned lock instead of dropping every subsequent
+            // receipt for the rest of the process's life. A panic while
+            // holding this lock cannot corrupt the file (each holder only
+            // appends one complete, newline-terminated record), so treating
+            // a poisoned guard as usable is safe and keeps the audit trail
+            // alive after an unrelated one-off failure.
+            let _guard = receipt_write_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&*log) {
                 let mut record = line.to_string();
                 record.push('\n');
@@ -163,7 +179,7 @@ pub async fn attribute(
 
 #[cfg(test)]
 mod tests {
-    use super::{attribute, Attribution, BODY_LIMIT};
+    use super::{attribute, receipt_write_lock, Attribution, BODY_LIMIT};
     use axum::body::{to_bytes, Body};
     use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
     use axum::middleware::from_fn_with_state;
@@ -343,29 +359,35 @@ mod tests {
 
     /// With receipts enabled, each request appends exactly one JSONL line
     /// carrying method, path, status, lane, the full config digest, host, and a
-    /// numeric timestamp. Two requests must yield two lines — append, not
-    /// truncate — and concurrent appends must not corrupt a line.
+    /// numeric timestamp. Concurrent requests must yield complete, independently
+    /// parseable lines without truncation or interleaving.
     #[tokio::test]
     async fn receipts_append_one_line_per_request() {
+        const REQUESTS: usize = 64;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("receipts.jsonl");
         let app = Router::new()
-            .route("/v1/models", get(|| async { Json(serde_json::json!({ "object": "list" })) }))
-            .route(
-                "/v1/completions",
-                post(|| async { Json(serde_json::json!({ "id": "x" })) }),
-            )
+            .fallback(get(|| async { Json(serde_json::json!({ "object": "list" })) }))
             .layer(from_fn_with_state(ctx(Some(Arc::new(path.clone()))), attribute));
 
-        app.clone()
-            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        app.oneshot(Request::post("/v1/completions").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let mut requests = tokio::task::JoinSet::new();
+        for index in 0..REQUESTS {
+            let app = app.clone();
+            requests.spawn(async move {
+                app.oneshot(
+                    Request::get(format!("/contract-receipt/{index}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            });
+        }
+        while let Some(result) = requests.join_next().await {
+            result.unwrap();
+        }
 
-        let receipts = read_receipts(&path, 2).await;
+        let receipts = read_receipts(&path, REQUESTS).await;
         for r in &receipts {
             assert_eq!(r["lane"], "deterministic");
             assert_eq!(r["config_sha256"], TEST_SHA);
@@ -377,18 +399,14 @@ mod tests {
                 "a request without a gateway correlation id must record null: {r}"
             );
         }
-        // The two append writes may land in either order, so match on the set.
-        let seen: std::collections::HashSet<(String, String)> = receipts
+        let seen: std::collections::HashSet<String> = receipts
             .iter()
-            .map(|r| {
-                (
-                    r["method"].as_str().unwrap().to_string(),
-                    r["path"].as_str().unwrap().to_string(),
-                )
-            })
+            .map(|receipt| receipt["path"].as_str().unwrap().to_string())
             .collect();
-        assert!(seen.contains(&("GET".to_string(), "/v1/models".to_string())));
-        assert!(seen.contains(&("POST".to_string(), "/v1/completions".to_string())));
+        assert_eq!(seen.len(), REQUESTS);
+        for index in 0..REQUESTS {
+            assert!(seen.contains(&format!("/contract-receipt/{index}")));
+        }
     }
 
     /// A request carrying the gateway's `x-camelid-request-id` correlation
@@ -432,5 +450,36 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("expected {expected} receipt line(s) were not written within the timeout");
+    }
+
+    /// A `std::sync::Mutex` never un-poisons itself once a panic occurs while
+    /// it is held. Giving up on a poisoned lock (as opposed to recovering it)
+    /// would silently drop every subsequent receipt for the rest of the
+    /// process's life. Prove recovery actually works: poison the shared lock
+    /// exactly like a panicking holder would, then confirm the next receipt
+    /// still gets written.
+    #[tokio::test]
+    async fn receipts_survive_a_poisoned_lock() {
+        let poison_thread = std::thread::spawn(|| {
+            let _guard = receipt_write_lock().lock().unwrap();
+            panic!("deliberately poisoning the receipt lock for this test");
+        });
+        assert!(
+            poison_thread.join().is_err(),
+            "the poisoning thread must have panicked"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let app = Router::new()
+            .fallback(get(|| async { Json(serde_json::json!({ "object": "list" })) }))
+            .layer(from_fn_with_state(ctx(Some(Arc::new(path.clone()))), attribute));
+
+        app.oneshot(Request::get("/after-poison").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let receipts = read_receipts(&path, 1).await;
+        assert_eq!(receipts[0]["path"], "/after-poison");
     }
 }
