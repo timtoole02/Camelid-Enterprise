@@ -1200,13 +1200,17 @@ async fn record_method_and_path(
 /// Every `(method, path)` an upstream test handler saw the gateway forward.
 type ForwardedRequests = Arc<Mutex<Vec<(Method, String)>>>;
 
-/// The gateway must forward exactly the public contract's routes and methods:
-/// every `(method, path)` in `replica_contract::PUBLIC_ROUTES` reaches the
-/// upstream (proved via `probe_path` for the parameterized route), and the
-/// gateway forwards nothing beyond them. Because the router is derived from
-/// `PUBLIC_ROUTES`, this pins the gateway allowlist to the replica contract: a
-/// route added to or removed from the contract changes this test's outcome,
-/// with no separately maintained list to keep in sync.
+/// Every `(method, path)` in `replica_contract::PUBLIC_ROUTES` must be forwarded
+/// to the upstream (proved via `probe_path` for the parameterized route). This
+/// test drives only contract requests, so what it establishes is that the
+/// gateway forwards *all* of the contract, and — since the expected pairs are
+/// distinct — exactly one upstream request per contract entry, with no
+/// duplicates. It does not, on its own, prove that non-contract routes are
+/// rejected: that comes from deriving the router from `PUBLIC_ROUTES` plus
+/// `rejects_non_inference_routes_without_contacting_upstream`. Together they pin
+/// the gateway allowlist to the contract — adding or removing a contract route
+/// changes this test's outcome, with no separately maintained list to keep in
+/// sync.
 #[tokio::test]
 async fn forwards_exactly_the_public_contract_routes() {
     let seen = Arc::new(Mutex::new(Vec::new()));
