@@ -26,6 +26,26 @@ spec:
         app: camelid-enterprise
         lane: deterministic
     spec:
+      # REQUIRED, not a preference — the replica does not start without it after
+      # the first rollout.
+      #
+      # Kubernetes derives legacy Docker-link variables from Service names and
+      # injects them into every pod scheduled *after* the Service exists. This
+      # repository ships two Services whose names begin with the prefix the
+      # replica's startup admission scan claims, so a pod gets sixteen
+      # CAMELID_-prefixed variables it never asked for, and the scan refuses to
+      # start under variables it cannot classify.
+      #
+      # The timing is what makes this expensive to discover: the first rollout's
+      # pods precede the Services, so it comes up clean, and every rollout after
+      # it fails. The replica's refusal message recognizes the shape and names
+      # this setting, so the same failure on a Service you add yourself is
+      # self-diagnosing — but it should never have to fire here.
+      #
+      # The gateway Deployment deliberately does not set this: the gateway runs
+      # no admission scan, and adding it there for symmetry would imply the
+      # setting is cosmetic.
+      enableServiceLinks: false
       # nodeSelector:
       #   node.kubernetes.io/instance-type: <one instance type per pool>
       containers:
