@@ -11,7 +11,9 @@
 //!   injected into non-streaming completion JSON bodies;
 //! - an optional append-only serving-receipt log (JSONL), one line per request,
 //!   carrying the same facts as `lane`, `config_sha256`, `admission_sha256`,
-//!   `model_sha256`, `host` and `worker_threads`.
+//!   `model_sha256`, `host` and `worker_threads`, and — when present — the
+//!   gateway-stamped `request_id` that joins the receipt to the gateway's audit
+//!   record for the same request.
 //!
 //! These are separate fields because they are separate claims, and none stands
 //! in for another.
@@ -63,6 +65,15 @@
 //! per-hardware table the field exists to eliminate. Two questions, two fields,
 //! neither impersonating the other.
 //!
+//! **The gateway's correlation id** is the one field here this replica did not
+//! derive from itself, and the only one that appears on a single surface rather
+//! than all three. It is deliberately not a response header and not a body
+//! field, because it is not a claim about what produced the tokens: it is a join
+//! key, recorded so a serving receipt can be lined up against the gateway's
+//! audit record for the same request. The replica records it verbatim and cannot
+//! verify it, so the join is only as trustworthy as the deployment's network
+//! isolation of the replica.
+//!
 //! The honest consequence of that split, stated in the open rather than left to
 //! be discovered: two replicas may publish the same `config_sha256` and still
 //! emit different tokens. A client that cares compares all of these fields, not
@@ -79,7 +90,7 @@ use axum::{
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
 
@@ -95,6 +106,18 @@ const DIGEST_CHUNK: usize = 1024 * 1024;
 /// these two replicas the same?" — which a prefix answers. Anything that needs
 /// the real thing reads the receipt, which carries all 64.
 const SHORT_HEX: usize = 12;
+
+/// Serializes the whole-record receipt append.
+///
+/// Process-global rather than per-`Attribution` because the receipt path is
+/// process-global: every request task appends to the one file the operator
+/// pointed at, and a `write_all` per record is atomic only against writers that
+/// take a turn. Holding this across the append is what keeps two simultaneous
+/// requests from interleaving half-lines into the audit trail.
+fn receipt_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// What a file was, well enough to notice it being swapped underneath us.
 ///
@@ -362,9 +385,22 @@ impl Attribution {
     /// fully identify the replica that produced it is not a receipt — it is a
     /// line that has to be joined against a log nobody kept. The digests are
     /// full length here, because this is the copy an audit reads.
-    fn receipt(&self, method: &str, path: &str, status: u16, ts: f64) -> serde_json::Value {
+    ///
+    /// `request_id` is the one field that is per-request rather than per-replica
+    /// and the one this process did not mint: it is the gateway's correlation
+    /// id, recorded so a receipt can be joined to the gateway's audit record for
+    /// the same request, and `null` when the request did not arrive with one.
+    fn receipt(
+        &self,
+        method: &str,
+        path: &str,
+        status: u16,
+        ts: f64,
+        request_id: Option<String>,
+    ) -> serde_json::Value {
         serde_json::json!({
             "ts": ts,
+            "request_id": request_id,
             "method": method,
             "path": path,
             "status": status,
@@ -389,6 +425,22 @@ pub async fn attribute(
 ) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().to_string();
+    // Correlation id the gateway stamped on the forwarded request, if any. It
+    // is opaque and carries no identity, so recording it keeps the replica
+    // identity-blind while letting a serving receipt be joined to the gateway's
+    // audit record. Absent when a client reaches the replica directly, in which
+    // case the receipt records `null`.
+    //
+    // The replica records this value verbatim and cannot verify it: a client
+    // able to reach the replica directly can forge or collide a `req_<id>`.
+    // serde_json escaping keeps a forged value from corrupting the JSONL, so
+    // this is not an injection vector, but join integrity therefore rests on
+    // the deployment's replica network isolation, not on anything cryptographic.
+    let request_id = req
+        .headers()
+        .get("x-camelid-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
     let mut resp = next.run(req).await;
 
     ctx.stamp(&mut resp);
@@ -438,14 +490,28 @@ pub async fn attribute(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let line = ctx.receipt(&method, &path, resp.status().as_u16(), ts);
+        let line = ctx.receipt(&method, &path, resp.status().as_u16(), ts, request_id);
         let log = Arc::clone(log);
-        // Best-effort, off the request path's async context. Write the whole
-        // record — JSON plus newline — in a single `write_all` so concurrent
-        // appends from simultaneous requests cannot interleave into a corrupt
-        // line. Detached: a receipt may land after the client has its bytes, and
-        // on a stop the drain does not wait for it.
+        // Best-effort, off the request path's async context. The whole record —
+        // JSON plus newline — goes out in a single `write_all` under the
+        // process-global receipt lock, so simultaneous request tasks cannot
+        // interleave half-lines into the audit trail.
+        //
+        // Detached, and not awaited: a receipt may land after the client already
+        // has its bytes, and one still in flight when the process exits (on
+        // SIGTERM, say) is lost. That is consistent with the "best-effort, no
+        // durability guarantee" contract, but it is a real gap worth naming
+        // rather than papering over.
         tokio::task::spawn_blocking(move || {
+            // Recover a poisoned lock instead of dropping every subsequent
+            // receipt for the rest of the process's life. A panic while
+            // holding this lock cannot corrupt the file (each holder only
+            // appends one complete, newline-terminated record), so treating
+            // a poisoned guard as usable is safe and keeps the audit trail
+            // alive after an unrelated one-off failure.
+            let _guard = receipt_write_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&*log) {
                 let mut record = line.to_string();
                 record.push('\n');
@@ -459,6 +525,9 @@ pub async fn attribute(
 
 #[cfg(test)]
 mod tests {
+    // Glob, because these tests reach for the private internals — the
+    // fingerprint, the digest chunk size, the receipt lock — as well as the
+    // middleware itself.
     use super::*;
     use axum::body::to_bytes;
     use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
@@ -967,11 +1036,105 @@ mod tests {
 
     /// With receipts enabled, each request appends exactly one JSONL line
     /// carrying method, path, status, lane, the full config digest, the full
-    /// model digest, host, worker width and a numeric timestamp. Two requests
-    /// must yield two lines — append, not truncate — and concurrent appends must
-    /// not corrupt a line.
+    /// admission digest, the full model digest, host, worker width, a numeric
+    /// timestamp, and the gateway correlation id — `null` here, because these
+    /// requests did not come through the gateway.
+    ///
+    /// Driven concurrently: every line must be complete and independently
+    /// parseable, with no truncation and no interleaving between simultaneous
+    /// appends.
     #[tokio::test]
     async fn receipts_append_one_line_per_request() {
+        const REQUESTS: usize = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let app = Router::new()
+            .fallback(get(|| async { Json(serde_json::json!({ "object": "list" })) }))
+            .layer(from_fn_with_state(ctx(Some(Arc::new(path.clone()))), attribute));
+
+        let mut requests = tokio::task::JoinSet::new();
+        for index in 0..REQUESTS {
+            let app = app.clone();
+            requests.spawn(async move {
+                app.oneshot(
+                    Request::get(format!("/contract-receipt/{index}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            });
+        }
+        while let Some(result) = requests.join_next().await {
+            result.unwrap();
+        }
+
+        let receipts = read_receipts(&path, REQUESTS).await;
+        for r in &receipts {
+            assert_eq!(r["lane"], "deterministic");
+            assert_eq!(r["config_sha256"], TEST_SHA);
+            assert_eq!(r["admission_sha256"], TEST_ADMISSION_SHA);
+            // Full 64 on the receipt, not the 12 the wire carries: this is the
+            // copy an audit compares against a file.
+            assert_eq!(r["model_sha256"], TEST_MODEL_SHA);
+            assert_eq!(r["host"], TEST_HOST);
+            assert_eq!(r["worker_threads"], serde_json::json!(TEST_THREADS));
+            assert_eq!(r["status"], 200);
+            assert!(r["ts"].is_number(), "ts must be numeric: {r}");
+            assert!(
+                r["request_id"].is_null(),
+                "a request without a gateway correlation id must record null: {r}"
+            );
+        }
+        let seen: std::collections::HashSet<String> = receipts
+            .iter()
+            .map(|receipt| receipt["path"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(seen.len(), REQUESTS);
+        for index in 0..REQUESTS {
+            assert!(seen.contains(&format!("/contract-receipt/{index}")));
+        }
+    }
+
+    /// A request carrying the gateway's `x-camelid-request-id` correlation
+    /// header records that exact id in its receipt, so the receipt can be
+    /// joined to the gateway's audit record for the same request.
+    #[tokio::test]
+    async fn receipt_records_the_gateway_request_id_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { Json(serde_json::json!({ "object": "list" })) }),
+            )
+            .layer(from_fn_with_state(ctx(Some(Arc::new(path.clone()))), attribute));
+
+        app.oneshot(
+            Request::get("/v1/models")
+                .header("x-camelid-request-id", "req_0123456789abcdef0123456789abcdef")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let receipts = read_receipts(&path, 1).await;
+        assert_eq!(
+            receipts[0]["request_id"],
+            "req_0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    /// Each receipt records the method and path of the request that produced it,
+    /// across more than one verb — the concurrency test above drives one verb
+    /// against one route shape, so without this the `method` field could be
+    /// wired to a constant and no test would notice.
+    ///
+    /// Two sequential requests, so this also asserts the log is appended to
+    /// rather than truncated per request.
+    #[tokio::test]
+    async fn receipts_record_the_method_and_path_of_each_request() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("receipts.jsonl");
         let app = Router::new()
@@ -991,18 +1154,6 @@ mod tests {
             .unwrap();
 
         let receipts = read_receipts(&path, 2).await;
-        for r in &receipts {
-            assert_eq!(r["lane"], "deterministic");
-            assert_eq!(r["config_sha256"], TEST_SHA);
-            assert_eq!(r["admission_sha256"], TEST_ADMISSION_SHA);
-            // Full 64 on the receipt, not the 12 the wire carries: this is the
-            // copy an audit compares against a file.
-            assert_eq!(r["model_sha256"], TEST_MODEL_SHA);
-            assert_eq!(r["host"], TEST_HOST);
-            assert_eq!(r["worker_threads"], serde_json::json!(TEST_THREADS));
-            assert_eq!(r["status"], 200);
-            assert!(r["ts"].is_number(), "ts must be numeric: {r}");
-        }
         // The two append writes may land in either order, so match on the set.
         let seen: std::collections::HashSet<(String, String)> = receipts
             .iter()
@@ -1174,5 +1325,36 @@ mod tests {
             assert_eq!(workers.count(), count);
             assert_eq!(workers.header.to_str().unwrap(), count.to_string());
         }
+    }
+
+    /// A `std::sync::Mutex` never un-poisons itself once a panic occurs while
+    /// it is held. Giving up on a poisoned lock (as opposed to recovering it)
+    /// would silently drop every subsequent receipt for the rest of the
+    /// process's life. Prove recovery actually works: poison the shared lock
+    /// exactly like a panicking holder would, then confirm the next receipt
+    /// still gets written.
+    #[tokio::test]
+    async fn receipts_survive_a_poisoned_lock() {
+        let poison_thread = std::thread::spawn(|| {
+            let _guard = receipt_write_lock().lock().unwrap();
+            panic!("deliberately poisoning the receipt lock for this test");
+        });
+        assert!(
+            poison_thread.join().is_err(),
+            "the poisoning thread must have panicked"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let app = Router::new()
+            .fallback(get(|| async { Json(serde_json::json!({ "object": "list" })) }))
+            .layer(from_fn_with_state(ctx(Some(Arc::new(path.clone()))), attribute));
+
+        app.oneshot(Request::get("/after-poison").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let receipts = read_receipts(&path, 1).await;
+        assert_eq!(receipts[0]["path"], "/after-poison");
     }
 }

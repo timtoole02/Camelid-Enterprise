@@ -6,7 +6,7 @@
 
 **Date:** 2026-07-24
 **Applies to:** the `deterministic` lane, engine pin `b4e3a9056567ed8145fc4fa29850d6f1f261ac2b`
-**Code:** `crates/server/src/lane.rs`, `crates/server/src/attribution.rs`, `crates/server/src/surface.rs`, `crates/server/src/main.rs`
+**Code:** `crates/replica-contract/src/lib.rs`, `crates/server/src/lane.rs`, `crates/server/src/attribution.rs`, `crates/server/src/surface.rs`, `crates/server/src/lib.rs`, `crates/server/src/main.rs`
 
 ---
 
@@ -241,24 +241,54 @@ part that is not platform-specific; and
 `a_same_length_rewrite_in_place_is_not_detected` asserts the limit above, so it
 cannot quietly become a claim.
 
-### 3. The replica serves an allow list of routes, and an allow list of model names
+### 3. The replica serves the published route contract, and an allow list of model names
 
-`crates/server/src/surface.rs` filters the engine's router down to six request
-shapes:
+`crates/server/src/surface.rs` filters the engine's router down to the routes
+[`docs/contracts/replica-http-v1.md`](../contracts/replica-http-v1.md) publishes
+— ten, at this contract version:
 
-| Method | Path |
-|---|---|
-| `GET`, `HEAD`, `OPTIONS` | `/health` |
-| `GET`, `HEAD`, `OPTIONS` | `/v1/health` |
-| `GET`, `HEAD`, `OPTIONS` | `/v1/models` |
-| `GET`, `HEAD`, `OPTIONS` | `/v1/models/<one segment>` |
-| `POST`, `OPTIONS` | `/v1/completions` |
-| `POST`, `OPTIONS` | `/v1/chat/completions` |
+| Method | Path | What is promised |
+|---|---|---|
+| `GET`, `HEAD`, `OPTIONS` | `/v1/health` | readiness, including `generation_ready` |
+| `GET`, `HEAD`, `OPTIONS` | `/v1/models` | model discovery |
+| `GET`, `HEAD`, `OPTIONS` | `/v1/models/<one segment>` | model lookup |
+| `POST`, `OPTIONS` | `/v1/completions` | generation |
+| `POST`, `OPTIONS` | `/v1/chat/completions` | generation |
+| `POST`, `OPTIONS` | `/v1/embeddings` | the engine's typed `501 not_implemented` |
+| `POST`, `OPTIONS` | `/v1/responses` | the engine's typed `501 not_implemented` |
+| `POST`, `OPTIONS` | `/v1/messages` | the engine's typed `501 not_implemented` |
+| `POST`, `OPTIONS` | `/v1/rerank` | the engine's typed `501 not_implemented` |
+| `POST`, `OPTIONS` | `/v1/reranking` | the engine's typed `501 not_implemented` |
 
 Everything else is `403` with an OpenAI-shaped error body carrying
 `"code":"route_not_served"`. `403` and not `404`: the route exists and is
 withheld, and a `404` sends an operator hunting a version mismatch that is not
 there.
+
+**The list is not written in this file, and it is not written in `surface.rs`
+either.** It is `replica_contract::PUBLIC_ROUTES`, the dependency-free registry
+the contract document publishes, and the filter reads it. This section originally
+recorded a list of six paths kept in `surface.rs`, which made the replica's
+served surface a second inventory of the same public API — two lists that can
+disagree silently, at a distance, and in the direction that costs an outage
+rather than a breach: a route the published contract promises and the replica
+that exists to serve it refuses. Adding a route to the contract is what adds it
+here; nothing else does, and the gateway reads the same registry.
+
+The five compatibility routes are the visible consequence of that change, and
+they reverse what this section used to say. They are contractual **as explicit
+refusals**: the promise on them is the engine's own typed `501 not_implemented`,
+and a promise of an explicit refusal can only be kept by letting the request
+reach the code that refuses it. Answering them `403` here — which is what this
+replica did — made a client SDK's capability probe read as "this replica is
+locked down" rather than as "this engine does not implement embeddings".
+
+The engine's bare `/health` moved the other way, and for the same reason. The
+contract classifies it as replica-private diagnostics; `/v1/health` is what every
+probe in this tree polls — the container HEALTHCHECK, all three Kubernetes
+probes, the drain loop, the macOS installer. Serving `/health` would be an
+eleventh route living outside the registry, which is the second inventory this
+design removes, reintroduced for a probe nobody issues. It answers `403`.
 
 An allow list rather than a block list, for the same structural reason admission
 is one: the engine's router registers **61 routes resolving to 69 method/path
@@ -266,7 +296,9 @@ handler pairs** at this pin (28 `get`, 38 `post`, 3 `delete`), and a later pin
 adds more. A list of paths to block goes stale in silence; a list of paths to
 serve stays correct across a pin bump by refusing what it has never heard of. A
 route a later revision invents arrives refused rather than arriving served and
-waiting to be noticed.
+waiting to be noticed — and deriving the list from the registry keeps that
+property exactly, because the registry moves when the contract is revised, not
+when the engine grows a route.
 
 Method and path are **one rule**, because the engine overloads paths by method:
 `/api/runtime/gpu` is `get(gpu_runtime).post(set_gpu_runtime)` on a single line of
@@ -277,13 +309,18 @@ Three details are load-bearing rather than incidental.
 
 **`HEAD` is admitted wherever `GET` is**, because the engine's `get(...)` routes
 answer it and a probe or gateway that issues one is making a request the replica
-can serve.
+can serve. It follows `GET` and nothing else: `HEAD` on a generation route is not
+a cheap completion, it is a request the engine has no handler for.
 
-**`OPTIONS` is admitted on the six allowed paths.** The engine applies a
+**`OPTIONS` is admitted on every contractual path.** The engine applies a
 permissive CORS layer *inside* this filter, so the filter sees a browser's
 preflight first; refusing it fails the preflight and the real request is never
 issued. Admitting it concedes nothing — preflight for a withheld path is still
 refused, and the write it precedes is refused on its own rule regardless.
+
+Neither is an eleventh and twelfth route the registry forgot; the contract
+document says so in prose, because they are behavior axum and the pinned router
+provide for routes already listed.
 
 **The one prefix rule admits exactly one further segment.** The engine's route is
 `/v1/models/:model`, and its router falls back to an embedded web application. A
@@ -373,11 +410,22 @@ implied; keeping the port private remains the deployment's job.
 
 Falsifiable: `surface::tests::the_control_plane_is_not_served` and
 `no_unattributed_generation_route_is_served` name the withheld routes;
-`the_prefix_rule_admits_exactly_one_segment` pins the segment rule;
+`a_path_parameter_matches_exactly_one_segment` pins the segment rule;
+`every_contractual_route_is_served` and
+`preflight_is_served_on_contractual_paths_and_nowhere_else` read the served set
+out of the registry rather than restating it, so a route the contract promises
+and this filter withholds fails without anyone remembering to add a case;
+`the_compatibility_routes_answer_with_the_engines_own_not_implemented` drives all
+five through the real layer to the real engine and asserts the `501`, which is
+the promise, rather than that the filter merely admitted them; and
+`the_engines_private_liveness_route_is_not_served` pins bare `/health` on the
+other side of the line.
 `main::tests::every_allow_listed_route_reaches_the_engine_and_is_attributed`
-drives the allow list against the engine's **real** router composed exactly as
-`serve` composes it, which is what catches a rule naming a route the engine does
-not have; `the_embedded_web_application_is_not_reachable_through_the_filter`
+drives the contract against the engine's **real** router in the stack `serve`
+serves — it is composed by `camelid_enterprise::served_router`, the one place
+that layering is written down, so a filter deleted from production is a filter
+deleted from under this test — which is what catches a rule naming a route the
+engine does not have; `the_embedded_web_application_is_not_reachable_through_the_filter`
 asserts the fallback is unreachable, `/v1/models/a/b` included; and
 `the_startup_load_reaches_the_engine_handler_without_a_socket` asserts the
 in-process dispatch reaches the engine's private loader rather than a router
@@ -394,9 +442,12 @@ emits, because "not refused here" is also true of a response that never had a
 body. In `surface.rs`,
 `an_admitted_alias_is_rewritten_to_the_engines_key` reads the request the engine
 would have received, `a_request_naming_the_engines_key_is_forwarded_unchanged`
-pins that an exact match is not re-serialized, and
-`bodies_this_filter_cannot_check_are_forwarded_for_the_engine_to_reject` fixes
-what the filter does *not* claim.
+pins that an exact match is not re-serialized,
+`a_body_this_filter_cannot_fully_parse_is_refused_rather_than_forwarded` pins the
+fail-closed direction over the whole family of trailing bytes, and
+`nothing_reaching_the_engine_names_weights_this_replica_did_not_hash` states the
+guarantee once over the corpus rather than arm by arm, so a future arm that
+forwards something it should not fails there without a case being added for it.
 
 ### 4. Machine state is reported, next to the digests and never inside them
 
@@ -873,12 +924,18 @@ after the gate deserves the same treatment rather than a footnote here.
   `admission sha256`, and the ready line names the key the engine filed the
   weights under, because that key is what a request's `model` field may use. Log
   scrapers matching those lines exactly will need updating.
-- **The engine's typed "unsupported" replies became refusals.** `/v1/embeddings`,
-  `/v1/responses`, `/v1/messages` and the rerank spellings answer `403
-  route_not_served` rather than the engine's own answer. A client SDK probing them
-  for capability detection reads the refusal instead. That is the consistent
-  outcome — this replica does not serve them — but it is a decision, not a side
-  effect of the list being short.
+- **The engine's typed "unsupported" replies are served, not refused.**
+  `/v1/embeddings`, `/v1/responses`, `/v1/messages` and the two rerank spellings
+  answer the engine's own `501 not_implemented` with its `unsupported_*` code.
+  This decision was originally recorded here the other way round — they answered
+  `403 route_not_served`, argued for as consistency rather than as an accident of
+  a short list — and it is reversed. The published contract declares the typed
+  `501` *itself* the promise, and a promise of an explicit refusal can only be
+  kept by letting the request reach the code that gives it; a `403` told a client
+  SDK's capability probe that the replica was locked down rather than that the
+  engine has no embeddings. `bare /health` moved in the opposite direction and is
+  now refused, because the contract classifies it as replica-private diagnostics
+  and every probe in this tree already polls `/v1/health`.
 - **Some genuinely useful diagnostics went with the control plane.**
   `/api/capabilities`, `/api/execution-plan` and the telemetry stream are refused
   along with the routes that had to go. A read-only carve-out was rejected for
@@ -926,10 +983,14 @@ own output:
    gives a feature a live gate must move it to `routes_by_default`, which the
    `required_is_exactly_the_default_reachable_class` invariant then promotes to
    `required`.
-5. **The served route allow list in `crates/server/src/surface.rs`** — a bump that
-   moves a documented client route renames something a probe depends on, and a
-   bump that adds a control-plane route adds it *refused*, which is the intended
-   default but worth confirming rather than assuming.
+5. **The served route set** — which is `crates/replica-contract`, not
+   `crates/server/src/surface.rs`; the filter reads the registry and declares
+   nothing. A bump that moves a documented client route renames something a probe
+   depends on, and a bump that adds a control-plane route adds it *refused*,
+   which is the intended default but worth confirming rather than assuming.
+   Changing the registry is a contract revision: it changes what the replica
+   serves, what the gateway forwards, and what
+   `docs/contracts/replica-http-v1.md` publishes, all three from the one edit.
 6. **`config_sha256`** — it *will* change, because the pin is inside the preimage.
    Update the constant in `config_sha256_is_pinned` and the short form asserted by
    `crates/server/tests/lane_environment.rs`, then every copy published in prose:
@@ -992,11 +1053,14 @@ mechanism.**
 
 **Whether the served surface should carry read-only diagnostics.**
 `/api/capabilities` and `/api/execution-plan` mutate nothing and would help an
-operator debugging a replica. They are refused today because the allow list is
+operator debugging a replica. They are refused today because the contract is
 easier to defend when every row is on a documented client or probe path.
 Reconsider one route at a time, with the method pinned, and never as "read-only
 `/api/*`" — that is a category whose membership the engine controls, not this
-distribution.
+distribution. Note where such a change now has to be made: adding a route to
+`replica_contract::PUBLIC_ROUTES` is what serves it, and that also makes the
+gateway forward it and puts it in the published contract. There is no longer a
+way to admit a route on the replica alone, which is the point.
 
 **Whether reproducibility across thread counts holds beyond the prefill matmul.**
 `README.md` scopes the guarantee away from differing thread counts; the engine

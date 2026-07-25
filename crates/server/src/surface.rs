@@ -1,36 +1,70 @@
-//! The surface a replica actually serves.
+//! The surface a replica actually serves, and the one request it inspects.
 //!
-//! The engine this distribution wraps is a complete local inference
-//! application, and its router is that application's router: a control plane
-//! sits alongside the OpenAI-compatible API, all of it unauthenticated,
-//! including routes that load and unload weights and flip process-global
-//! execution flags. Bound as-is, a replica's published identity describes what
-//! it *started* with rather than what it is serving — the configuration digest,
-//! the model digest and the host summary all stay byte-identical across a model
-//! swap performed over the very port they are published on.
+//! Two filters live here, and they now answer to different owners.
 //!
-//! So the served router is filtered to the requests a client of the
-//! deterministic lane has business making, and everything else is refused. The
-//! filter is an **allow list** for the same reason admission is: the engine's
-//! router registers 61 routes at this pin and a later pin adds more, so a list
-//! of paths to block is a list that goes stale silently, while a list of paths
-//! to serve stays correct across a pin bump by refusing what it has never heard
-//! of. A route a later revision invents arrives refused rather than arriving
-//! served and waiting to be noticed.
+//! # Which requests are served: the contract decides, not this module
 //!
-//! Withholding routes is necessary and is not sufficient, because one of the
-//! routes that must stay is itself a weights-loading control. A generation
-//! request carries a `model` field, and the engine resolves it against the
-//! filesystem before it resolves it against anything else: a string that names
-//! an existing file is loaded on demand and becomes the process's active model,
-//! for that request and for every later request that names no model at all. A
-//! path-and-method filter cannot see that, because the request it arrives in is
-//! one the replica has to serve. So there is a second filter here, over the body
-//! of the two admitted generation routes — [`pin_generation_to_the_served_model`]
-//! — and the two together are what turn the model digest on every response from a
-//! startup observation into a claim about the process lifetime: the file this
-//! replica hashed before it bound its port is the file it answers from until it
-//! stops.
+//! The served set is [`replica_contract::PUBLIC_ROUTES`] — the dependency-free
+//! registry that `docs/contracts/replica-http-v1.md` publishes and that a gateway
+//! can link without linking the engine. This module used to carry its own list of
+//! admitted paths. That made two inventories of one public surface, and two
+//! inventories are two things that can disagree: silently, at a distance, and in
+//! the direction that costs an outage rather than a breach — a route the
+//! published contract promises, refused by the replica that exists to serve it.
+//! There is one list now, and this file reads it. Adding a route to the contract
+//! is what adds it here; nothing else does.
+//!
+//! A filter is still needed, because the engine this distribution wraps is a
+//! complete local inference application and its router is that application's
+//! router: a control plane sits alongside the OpenAI-compatible API, all of it
+//! unauthenticated, including routes that load and unload weights and flip
+//! process-global execution flags. The contract names ten routes; the engine
+//! registers sixty-one at this pin. Bound unfiltered, a replica's published
+//! identity would describe what it *started* with rather than what it is serving:
+//! the configuration digest, the model digest and the host summary all stay
+//! byte-identical across a model swap performed over the very port they are
+//! published on.
+//!
+//! Deriving the served set from the registry keeps the property that made an
+//! allow list the right shape in the first place. A route a later engine revision
+//! invents is not in the registry, so it arrives refused rather than arriving
+//! served and waiting to be noticed — the pin bump is a contract review, not a
+//! silent surface expansion.
+//!
+//! One consequence is worth stating because it reverses this module's earlier
+//! behavior: `/v1/embeddings`, `/v1/responses`, `/v1/messages` and the two rerank
+//! spellings are contractual. The promise on them is the engine's own typed
+//! `501 not_implemented` answer, and a promise of an explicit refusal can only be
+//! kept by letting the request reach the code that refuses it. They were answered
+//! `403` here; they are served now.
+//!
+//! # This is not the trust boundary
+//!
+//! The boundary is the deployment's: traffic enters at the gateway, and
+//! `deploy/k8s/replica-network-policy.yaml` is what keeps other workloads off the
+//! replica's port. Everything in this module is defence in depth behind that. The
+//! engine applies a permissive CORS policy *inside* this filter, so every route
+//! admitted here is readable and postable from any web origin by anyone who can
+//! reach the port at all. These filters bound *what* a caller may ask for, never
+//! *who* may ask.
+//!
+//! # What this module still decides on its own: the generation body
+//!
+//! Withholding routes is necessary and is not sufficient, and the contract does
+//! not close the gap. `/v1/chat/completions` is contractual and the gateway
+//! forwards it, so a route registry and a network policy both leave it open — as
+//! they should. But that request carries a `model` field, and the engine resolves
+//! it against the filesystem before it resolves it against anything else: a
+//! string that names an existing file is loaded on demand and becomes the
+//! process's active model, for that request and for every later request that
+//! names no model at all. Nothing a path-and-method filter can see, because the
+//! request it arrives in is one the replica has to serve.
+//!
+//! So there is a second filter here, over the body of the two generation routes —
+//! [`pin_generation_to_the_served_model`] — and it is what turns the model digest
+//! on every response from a startup observation into a claim about the process
+//! lifetime: the file this replica hashed before it bound its port is the file it
+//! answers from until it stops.
 //!
 //! That second filter fails closed, and the reason is the one defect this design
 //! is most likely to grow back. It has to *read* the body to check the field, so
@@ -41,12 +75,6 @@
 //! follows it, so a single trailing byte is a parse error here and an ordinary
 //! request there. A generation body this filter cannot fully parse is therefore
 //! refused rather than handed on.
-//!
-//! It is not an access-control layer and must not be read as one. The engine
-//! applies a permissive CORS policy inside this filter, so every route admitted
-//! here is still readable and postable from any web origin by anyone who can
-//! reach the port. The filter bounds *what* a caller may ask for, never *who*
-//! may ask; keeping the port private remains the deployment's job.
 
 use axum::{
     body::{to_bytes, Body},
@@ -58,6 +86,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use replica_contract::{HttpMethod, RouteSpec};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -82,129 +111,145 @@ use std::sync::Arc;
 /// this honest if the engine's extractor default ever moves.
 pub const REQUEST_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
-/// How an admitted rule recognizes a path.
-enum Route {
-    /// The whole path, exactly.
-    Exact(&'static str),
-    /// The prefix plus exactly one more non-empty path segment.
-    ///
-    /// Used only where the engine's own route takes a single path parameter.
-    /// "One segment" is the whole point and not pedantry: the engine's route is
-    /// `/v1/models/:model`, which matches one segment, and its router falls back
-    /// to the embedded web UI. A looser prefix admits `/v1/models/a/b`, which
-    /// misses the axum route, reaches the fallback, and is answered by the app
-    /// shell with HTTP 200 — a served response from a surface this filter exists
-    /// to withhold.
-    OneSegmentUnder(&'static str),
+/// The contract's method vocabulary, as this stack spells methods.
+///
+/// Exhaustive on purpose. A method the registry grows later stops the build
+/// here, which is the only place in this module where a contract change should
+/// be able to require a decision — the alternative, a catch-all arm returning
+/// something plausible, would decide it silently and in whichever direction the
+/// arm happened to pick.
+fn declared_as_http(method: HttpMethod) -> Method {
+    match method {
+        HttpMethod::Get => Method::GET,
+        HttpMethod::Post => Method::POST,
+        HttpMethod::Delete => Method::DELETE,
+    }
 }
 
-/// One admitted request shape: the methods, then the path rule.
-struct Served {
-    methods: &'static [Method],
-    route: Route,
+/// Whether a contractual route admits `method`.
+///
+/// Two methods are admitted beyond the ones the registry declares, and neither
+/// is a route the registry forgot — the contract says so in as many words:
+/// "Axum also answers `HEAD` for registered `GET` routes. The pinned router
+/// provides permissive CORS preflight […]. Neither behavior adds another
+/// application route."
+///
+/// `HEAD` follows `GET`, because the engine's `get(...)` routes answer it, so a
+/// probe or a gateway that issues one is making a request the replica can serve
+/// and a filter that refused it would break a caller for no gain. It follows
+/// `GET` and nothing else: `HEAD` on a generation route is not a cheap
+/// completion, it is a request the engine has no handler for.
+///
+/// `OPTIONS` is admitted on every contractual path, for a sharper reason. The
+/// engine applies its permissive CORS layer *inside* this filter, so the filter
+/// sees a browser's preflight first. A client posting `Content-Type:
+/// application/json` to a completion route cross-origin sends one, and refusing
+/// it fails the preflight so the real request is never issued at all. Admitting
+/// it concedes nothing: preflight for a path outside the contract is still
+/// refused, and the write it precedes is refused on its own rule regardless.
+fn method_is_admitted(route: &RouteSpec, method: &Method) -> bool {
+    method == Method::OPTIONS
+        || route.methods.iter().any(|declared| {
+            let declared = declared_as_http(*declared);
+            method == declared || (declared == Method::GET && method == Method::HEAD)
+        })
 }
 
-/// Read methods, and the preflight that has to precede a cross-origin write.
+/// Whether a request path matches a contractual path pattern.
 ///
-/// `HEAD` is here because the engine's `get(...)` routes answer it, so a probe
-/// or a gateway that issues one is making a request the replica can serve; a
-/// filter that refused it would break a caller for no gain.
+/// Segment by segment, with `:name` matching exactly one non-empty segment —
+/// the axum semantics the registry's patterns are written in, applied to the
+/// same raw percent-encoded path axum's own router matches on, so the filter and
+/// the router cannot disagree about where a segment ends.
 ///
-/// `OPTIONS` is here for a sharper reason. The engine applies a permissive CORS
-/// layer *inside* this filter, so the filter sees a browser's preflight first. A
-/// client posting `Content-Type: application/json` to a completion route
-/// cross-origin sends one, and refusing it fails the preflight so the real
-/// request is never issued at all. Admitting it concedes nothing: preflight for
-/// a withheld path is still refused, and the write it precedes is refused on its
-/// own rule regardless.
-const READ: &[Method] = &[Method::GET, Method::HEAD, Method::OPTIONS];
+/// "Exactly one segment" is the whole point and not pedantry. The engine's route
+/// is `/v1/models/:model` and its router falls back to the embedded web UI, so a
+/// looser prefix rule admits `/v1/models/a/b`, which misses the axum route,
+/// reaches the fallback, and is answered by the application shell with HTTP 200 —
+/// a served response from a surface this filter exists to withhold.
+///
+/// A pattern this matcher does not understand — an axum catch-all, say — matches
+/// nothing and is therefore refused rather than over-admitted. Fail-closed is the
+/// correct direction for a rule nobody has reviewed yet, and it is loud: the
+/// contractual route would 403 and the conformance test in this module fails.
+fn path_matches(pattern: &str, path: &str) -> bool {
+    let mut pattern_segments = pattern.split('/');
+    let mut path_segments = path.split('/');
+    loop {
+        match (pattern_segments.next(), path_segments.next()) {
+            (None, None) => return true,
+            (Some(expected), Some(actual)) => {
+                let matched = match expected.strip_prefix(':') {
+                    Some(_) => !actual.is_empty(),
+                    None => expected == actual,
+                };
+                if !matched {
+                    return false;
+                }
+            }
+            // Different segment counts: `/v1/models/a/b` against
+            // `/v1/models/:model`, and `/v1/models` against `/v1/models/:model`.
+            _ => return false,
+        }
+    }
+}
 
-/// Generation, and its preflight.
-const WRITE: &[Method] = &[Method::POST, Method::OPTIONS];
-
-/// Every request this replica serves.
+/// Whether `method path` is on the served surface.
 ///
-/// Method and path together, because the engine overloads paths by method:
-/// `/api/runtime/gpu` is `get(gpu_runtime).post(set_gpu_runtime)` on one line of
-/// its router, so a path-only rule cannot tell reading the accelerator state
-/// from mutating it.
+/// The single dispatch point: the layer, and every test, decide through this and
+/// not through a copy of its rules — and this is the only place the served set
+/// is read, so there is nowhere else for a second inventory to accumulate.
 ///
-/// The list is what the deployment artifacts and the documented client surface
-/// need, and nothing else. Notable absences, each deliberate and each of which
-/// answers unauthenticated on the engine's router at this pin:
+/// Everything outside the contract is refused, including routes the engine
+/// answers unauthenticated at this pin and that a reader might expect to find
+/// admitted here:
 ///
 ///   * `/api/models/load`, `/api/models/unload`, `/api/models/inspect`, the
 ///     catalog and local-delete routes — the replica serves the model named on
 ///     its command line, and withholding these is what makes that true of the
 ///     whole process lifetime rather than of its first second;
 ///   * `/api/runtime/gpu` — flips a process-global accelerator flag under a lane
-///     whose guarantee is stated over the CPU forward pass;
+///     whose guarantee is stated over the CPU forward pass. It is also why method
+///     and path are one rule rather than two: the engine registers that path as
+///     `get(gpu_runtime).post(set_gpu_runtime)`, so a path-only filter cannot
+///     tell reading the accelerator state from mutating it;
 ///   * the engine's legacy completion-server-compatible routes, which include a
 ///     second generation route the attribution middleware does not inject bodies
 ///     for: a way to get tokens out of this replica without the fields that say
 ///     what produced them;
 ///   * the agent-workspace family, telemetry streams, execution-plan,
 ///     capabilities, tokenizer and generation-session routes, and the embedded
-///     web UI fallback — a serving replica is not an interactive application.
-///
-/// Also refused, and worth stating because it is a behavior change rather than
-/// an omission: the engine's typed "unsupported" replies on `/v1/embeddings`,
-/// `/v1/responses`, `/v1/messages` and the rerank spellings become refusals
-/// here. A client SDK probing those for capability detection now reads 403
-/// rather than the engine's own 501-shaped answer. That is the consistent
-/// outcome — this replica does not serve them — but it is a decision, not a side
-/// effect of the list being short.
-const SERVED: &[Served] = &[
-    // Readiness and the drain probe. Both spellings, because the engine answers
-    // both and the deployment documentation reaches for `/v1/health`. Neither is
-    // used by an artifact in this tree today; they are admitted anyway because
-    // this is the only endpoint that reports whether the replica can actually
-    // generate, the drain sequence polls its queue depth, and adding a route to
-    // this list later means re-touching the filter under time pressure.
-    Served { methods: READ, route: Route::Exact("/health") },
-    Served { methods: READ, route: Route::Exact("/v1/health") },
-    // The model listing the container HEALTHCHECK, the three Kubernetes probes
-    // and the gateway's readiness probe all read.
-    Served { methods: READ, route: Route::Exact("/v1/models") },
-    Served { methods: READ, route: Route::OneSegmentUnder("/v1/models/") },
-    // Generation.
-    Served { methods: WRITE, route: Route::Exact("/v1/completions") },
-    Served { methods: WRITE, route: Route::Exact("/v1/chat/completions") },
-];
-
-/// Whether `method path` is on the served surface.
-///
-/// The single dispatch point: the layer, and every test, decide through this and
-/// not through a copy of its rules.
+///     web UI fallback — a serving replica is not an interactive application;
+///   * bare `/health`. The contract classifies it as replica-private
+///     diagnostics and `/v1/health` is the readiness route every deployment
+///     artifact in this tree already polls, so serving it would be an eleventh
+///     route outside the contract — exactly the second inventory this rewrite
+///     removes, reintroduced for a probe nobody issues.
 fn is_served(method: &Method, path: &str) -> bool {
-    SERVED.iter().any(|served| {
-        served.methods.contains(method)
-            && match served.route {
-                Route::Exact(route) => path == route,
-                Route::OneSegmentUnder(route) => path
-                    .strip_prefix(route)
-                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('/')),
-            }
-    })
+    replica_contract::PUBLIC_ROUTES
+        .iter()
+        .any(|route| path_matches(route.path, path) && method_is_admitted(route, method))
 }
 
 /// The refusal, as a typed JSON error rather than a bare status.
 ///
 /// A client that asked for a route this replica does not serve gets an
 /// OpenAI-shaped error object, because that is what its error handling already
-/// parses. 403 and not 404: the route exists and is withheld, and a 404 sends an
-/// operator hunting a version mismatch that is not there. The message says which
-/// request was refused and why the surface is restricted, so the answer to "is
-/// this a bug or the design?" is in the response body rather than in a document
-/// the reader has to go and find.
+/// parses. 403 and not 404: the route exists on the engine's router and is
+/// withheld, and a 404 sends an operator hunting a version mismatch that is not
+/// there. The message names the contract, so the answer to "is this a bug or the
+/// design?" is a document the reader can go and check rather than a judgement
+/// they have to make.
 fn refused(method: &Method, path: &str) -> Response {
     let body = serde_json::json!({
         "error": {
             "message": format!(
-                "{method} {path} is not served by this replica. The deterministic lane serves \
-                 generation, model listing and health; the engine's model-management and \
-                 runtime-control routes are withheld, because a replica that can be \
-                 reconfigured over its serving port cannot vouch for what produced its output."
+                "{method} {path} is not part of {}. This replica serves the published public \
+                 route contract — health, model discovery and generation — and withholds the \
+                 engine's model-management, runtime-control, workspace and legacy routes, \
+                 because a replica that can be reconfigured over its serving port cannot vouch \
+                 for what produced its output.",
+                replica_contract::CONTRACT_ID
             ),
             "type": "invalid_request_error",
             "code": "route_not_served",
@@ -214,7 +259,7 @@ fn refused(method: &Method, path: &str) -> Response {
     json_response(StatusCode::FORBIDDEN, body)
 }
 
-/// Refuse anything outside the served surface.
+/// Refuse anything outside the published route contract.
 ///
 /// Layered *inside* the attribution middleware, so a refusal still carries the
 /// replica's full identity: a client that gets a 403 from a pool of
@@ -411,6 +456,22 @@ pub async fn pin_generation_to_the_served_model(
 }
 
 /// The two routes that carry a `model` field into the engine's resolver.
+///
+/// Deliberately *not* derived from the route contract, and the distinction is
+/// the reason this module still exists. The contract classifies routes by what
+/// this product promises a client; this asks what the pinned engine's handler
+/// does with the request, which is a different question with a different answer
+/// and a different reason to change. Both generation routes converge on one
+/// engine function that resolves the request's `model` against the filesystem;
+/// the other eight contractual routes do not reach it. `/v1/health`,
+/// `/v1/models` and `/v1/models/:model` only read already-loaded state, and the
+/// five compatibility routes are handled by functions that take no state and no
+/// body at all — they answer their typed `501` and touch nothing.
+///
+/// A contract revision must therefore not silently extend this set, and a pin
+/// bump must not silently leave it short. Both directions are re-reviewed by
+/// hand against the engine's source, which is what
+/// `only_the_generation_routes_are_inspected` pins from this side.
 fn is_generation_path(path: &str) -> bool {
     matches!(path, "/v1/completions" | "/v1/chat/completions")
 }
@@ -533,29 +594,122 @@ mod tests {
     use axum::Router;
     use tower::ServiceExt;
 
-    /// Every route a deployment artifact or the documented client surface
-    /// actually uses. This is the test that costs a production outage if it is
-    /// wrong in the other direction: a route missing from `SERVED` is not a
-    /// tightened surface, it is a probe that fails in production and nowhere
-    /// else, and a rollout that never goes ready.
+    /// Every route the published contract promises is served, read from the
+    /// registry rather than written out again.
     ///
-    /// Sources, all in this tree: the container HEALTHCHECK and the Kubernetes
-    /// startup, readiness and liveness probes read `/v1/models`; the gateway's
-    /// readiness probe forwards to the same; the README documents
-    /// `/v1/chat/completions`, `/v1/completions` and `/v1/models`; the drain
-    /// sequence polls health.
+    /// A copy of the list here would be a third inventory of the public surface,
+    /// and it would hide precisely the failure that matters: a route the contract
+    /// promises and this filter quietly withholds still passes a test that only
+    /// ever asks about the routes its author already knew about.
+    ///
+    /// This is also the direction that costs a production outage rather than a
+    /// breach. A contractual route missing from the served set is not a tightened
+    /// surface, it is a probe that fails in production and nowhere else, and a
+    /// rollout that never goes ready. The concrete callers, all in this tree: the
+    /// container HEALTHCHECK and the Kubernetes startup, readiness and liveness
+    /// probes read `/v1/health`; the gateway's readiness probe forwards to the
+    /// replica; the drain sequence polls health; the README documents
+    /// `/v1/chat/completions`, `/v1/completions` and `/v1/models`.
     #[test]
-    fn every_route_the_deployment_artifacts_and_clients_use_is_served() {
-        for (method, path) in [
-            (Method::GET, "/health"),
-            (Method::GET, "/v1/health"),
-            (Method::GET, "/v1/models"),
-            (Method::GET, "/v1/models/Llama%203.2%201B%20Instruct"),
-            (Method::POST, "/v1/completions"),
-            (Method::POST, "/v1/chat/completions"),
-        ] {
-            assert!(is_served(&method, path), "{method} {path} must be served");
+    fn every_contractual_route_is_served() {
+        for route in replica_contract::PUBLIC_ROUTES {
+            for declared in route.methods {
+                let method = declared_as_http(*declared);
+                assert!(
+                    is_served(&method, route.probe_path),
+                    "{method} {} is contractual and must be served",
+                    route.path
+                );
+            }
         }
+    }
+
+    /// A path parameter is matched as a value, not as a prefix: a percent-encoded
+    /// model id with spaces in it is one segment and is served.
+    #[test]
+    fn a_percent_encoded_model_id_is_one_segment() {
+        assert!(is_served(&Method::GET, "/v1/models/Llama%203.2%201B%20Instruct"));
+    }
+
+    /// The five explicit-unsupported compatibility routes are contractual, so
+    /// they are served.
+    ///
+    /// This assertion is the inverse of the one it replaces. These paths were
+    /// refused here with `403`, which made a client SDK's capability probe read
+    /// as "this replica is locked down" rather than as the engine's own typed
+    /// "not implemented". The contract declares the `501` *itself* the promise —
+    /// see the errors table in `docs/contracts/replica-http-v1.md` — and a
+    /// promise of an explicit refusal can only be kept by letting the request
+    /// reach the code that refuses it.
+    #[test]
+    fn the_compatibility_routes_are_served_rather_than_refused_here() {
+        for path in [
+            "/v1/embeddings",
+            "/v1/responses",
+            "/v1/messages",
+            "/v1/rerank",
+            "/v1/reranking",
+        ] {
+            assert!(
+                is_served(&Method::POST, path),
+                "POST {path} is contractual as an explicit unsupported answer, so the request \
+                 has to reach the engine that gives it"
+            );
+        }
+    }
+
+    /// …and that the answer they reach really is the engine's own typed `501`,
+    /// driven through the real layer against the real engine router.
+    ///
+    /// `is_served` returning true is not the property a client depends on. The
+    /// property is that the request arrives at a handler and comes back with the
+    /// documented code, which is a fact about this filter *and* the engine
+    /// together and can only be asserted by running both.
+    #[tokio::test]
+    async fn the_compatibility_routes_answer_with_the_engines_own_not_implemented() {
+        let served = camelid::api::router_with_state(camelid::api::AppState::default())
+            .layer(axum::middleware::from_fn(serve_only_the_lane));
+        for (path, code) in [
+            ("/v1/embeddings", "unsupported_embeddings"),
+            ("/v1/responses", "unsupported_responses"),
+            ("/v1/messages", "unsupported_messages"),
+            ("/v1/rerank", "unsupported_reranking"),
+            ("/v1/reranking", "unsupported_reranking"),
+        ] {
+            let resp = served
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+            let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["error"]["type"], "not_implemented", "{path}");
+            assert_eq!(json["error"]["code"], code, "{path}");
+        }
+    }
+
+    /// Bare `/health` is not served, and it is named here because it used to be.
+    ///
+    /// The contract classifies it as replica-private diagnostics, nothing in this
+    /// tree polls it — the container HEALTHCHECK, all three Kubernetes probes,
+    /// the drain loop and the macOS installer all ask `/v1/health` — and keeping
+    /// it would mean an eleventh served route living outside the registry, which
+    /// is the second inventory this module was rewritten to remove. If a probe
+    /// ever needs it, the fix is to add it to the contract, not to this file.
+    #[test]
+    fn the_engines_private_liveness_route_is_not_served() {
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert!(!is_served(&method, "/health"), "{method} /health must not be served");
+        }
+        assert!(is_served(&Method::GET, "/v1/health"), "the contractual spelling is served");
     }
 
     /// A probe or a gateway may issue `HEAD` where a client issues `GET`, and
@@ -563,37 +717,33 @@ mod tests {
     /// caller the replica can serve.
     #[test]
     fn head_is_served_wherever_get_is() {
-        for path in ["/health", "/v1/health", "/v1/models", "/v1/models/x"] {
+        for path in ["/v1/health", "/v1/models", "/v1/models/x"] {
             assert!(is_served(&Method::HEAD, path), "HEAD {path} must be served");
         }
         // …but only where GET is. HEAD on a generation route is not a cheap
         // completion, it is a request the engine has no handler for.
         assert!(!is_served(&Method::HEAD, "/v1/chat/completions"));
+        assert!(!is_served(&Method::HEAD, "/v1/embeddings"));
     }
 
     /// The engine's CORS layer sits behind this filter, so a preflight that is
     /// refused here fails before the layer that would have answered it — and the
-    /// real request is then never sent. Every admitted path takes `OPTIONS`;
+    /// real request is then never sent. Every contractual path takes `OPTIONS`;
     /// nothing else does.
     #[test]
-    fn preflight_is_served_on_admitted_paths_and_nowhere_else() {
-        for path in [
-            "/health",
-            "/v1/health",
-            "/v1/models",
-            "/v1/models/x",
-            "/v1/completions",
-            "/v1/chat/completions",
-        ] {
+    fn preflight_is_served_on_contractual_paths_and_nowhere_else() {
+        for route in replica_contract::PUBLIC_ROUTES {
             assert!(
-                is_served(&Method::OPTIONS, path),
-                "OPTIONS {path} must be served or a browser client cannot reach it"
+                is_served(&Method::OPTIONS, route.probe_path),
+                "OPTIONS {} must be served or a browser client cannot reach it",
+                route.path
             );
         }
         assert!(
             !is_served(&Method::OPTIONS, "/api/models/load"),
             "preflighting a withheld route must not be a way to learn it is there"
         );
+        assert!(!is_served(&Method::OPTIONS, "/health"));
     }
 
     /// The routes that make a replica's published identity untrue. Each answers
@@ -650,8 +800,8 @@ mod tests {
         assert!(!is_served(&Method::GET, "/v1/chat/completions"));
     }
 
-    /// The one prefix rule claims exactly the namespace of the engine's
-    /// single-path-parameter route and cannot reach past it.
+    /// A `:param` in a contractual path claims exactly one segment and cannot
+    /// reach past it.
     ///
     /// The multi-segment case is the one that matters and the one a looser rule
     /// gets wrong: `/v1/models/a/b` matches no engine route, so it falls through
@@ -659,7 +809,7 @@ mod tests {
     /// with the application shell and HTTP 200. Admitting it would serve a page
     /// from a surface this filter exists to withhold.
     #[test]
-    fn the_prefix_rule_admits_exactly_one_segment() {
+    fn a_path_parameter_matches_exactly_one_segment() {
         assert!(is_served(&Method::GET, "/v1/models/anything"));
         assert!(
             !is_served(&Method::GET, "/v1/models/a/b"),
@@ -674,20 +824,31 @@ mod tests {
         assert!(!is_served(&Method::GET, "/v1/models-secret"));
     }
 
-    /// The property that survives a pin bump: a route nobody wrote a rule for is
-    /// refused, so new engine routes arrive refused rather than arriving served.
+    /// The property that survives a pin bump: a route the contract does not name
+    /// is refused, so a route a later engine revision invents arrives refused
+    /// rather than arriving served.
+    ///
+    /// This is the property that made an allow list the right shape before the
+    /// registry existed, and it is unchanged by deriving the list from the
+    /// registry — the registry moves when the contract is revised, not when the
+    /// engine grows a route.
     #[test]
     fn an_unknown_route_is_refused_by_default() {
         assert!(!is_served(&Method::POST, "/api/some/route/a/later/pin/adds"));
         assert!(!is_served(&Method::GET, "/"));
         assert!(!is_served(&Method::GET, "/index.html"), "the web UI is not served");
-        assert!(!is_served(&Method::POST, "/v1/embeddings"));
+        assert!(!is_served(&Method::POST, "/v2/chat/completions"));
+        // A near-miss on a contractual path, which is where an over-eager
+        // matcher would leak: same prefix, different route.
+        assert!(!is_served(&Method::POST, "/v1/chat/completions/stream"));
     }
 
     /// The refusal has to be legible to a client's existing error handling, and
-    /// has to say the route is withheld rather than absent.
+    /// has to say the route is withheld rather than absent — and now, which
+    /// document decides that, so an operator can check the claim instead of
+    /// taking the replica's word for it.
     #[tokio::test]
-    async fn the_refusal_is_a_typed_json_error_naming_the_request() {
+    async fn the_refusal_is_a_typed_json_error_naming_the_request_and_the_contract() {
         let resp = refused(&Method::POST, "/api/models/load");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(resp.headers()[CONTENT_TYPE], "application/json");
@@ -697,6 +858,10 @@ mod tests {
         assert_eq!(body["error"]["type"], "invalid_request_error");
         let message = body["error"]["message"].as_str().unwrap();
         assert!(message.contains("POST /api/models/load"), "unexpected message: {message}");
+        assert!(
+            message.contains(replica_contract::CONTRACT_ID),
+            "the refusal must name the contract it is refusing against: {message}"
+        );
     }
 
     /// End to end through the real layer: the refusal happens before the handler
@@ -1091,14 +1256,32 @@ mod tests {
         );
     }
 
-    /// The filter claims the two generation routes and nothing else. A `model`
-    /// field on any other admitted route is not a model selector, and rewriting
-    /// it would be this filter inventing semantics the engine does not have.
+    /// The body filter claims the two generation routes and nothing else. A
+    /// `model` field on any other contractual route is not a model selector, and
+    /// rewriting it would be this filter inventing semantics the engine does not
+    /// have.
+    ///
+    /// The compatibility routes are the interesting entries, because they are the
+    /// ones the contract added to the served set and they do accept a `model`
+    /// field in the OpenAI shapes they imitate. They are still not inspected, and
+    /// the reason is a fact about the pinned engine rather than a judgement call:
+    /// their handlers take no state and no body, so there is no resolver behind
+    /// them to keep a path away from. Inspecting them would buffer every such
+    /// request to check a field that reaches nothing.
     #[tokio::test]
     async fn only_the_generation_routes_are_inspected() {
         assert!(is_generation_path("/v1/completions"));
         assert!(is_generation_path("/v1/chat/completions"));
-        for path in ["/v1/models", "/v1/health", "/health", "/v1/models/x"] {
+        for path in [
+            "/v1/models",
+            "/v1/health",
+            "/v1/models/x",
+            "/v1/embeddings",
+            "/v1/responses",
+            "/v1/messages",
+            "/v1/rerank",
+            "/v1/reranking",
+        ] {
             assert!(!is_generation_path(path), "{path} is not a generation route");
         }
 

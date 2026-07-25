@@ -1,0 +1,11 @@
+[package]
+name = "camelid-enterprise-replica-contract"
+description = "Dependency-free public HTTP contract shared by Camelid Enterprise replicas and gateways."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "replica_contract"
+path = "src/lib.rs"

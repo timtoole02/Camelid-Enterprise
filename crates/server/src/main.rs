@@ -6,15 +6,21 @@
 //! replica cannot serve fail closed (typed 503 from the bounded engine queue);
 //! there is no silent demotion to any other execution mode.
 
-mod attribution;
-mod lane;
-mod surface;
-
-use attribution::{Attribution, ModelIdentity, WorkerThreads};
-use axum::middleware;
+// What a replica *is* — the engine pin, the lane's configuration vector, the
+// attribution stamped on every response, the startup load and the served route
+// surface — lives in this crate's library target, so the contract tests and the
+// conformance harness are written against the same code a served replica is
+// built from rather than a restatement of it. This binary is the process around
+// that: the CLI, the host probe, the worker pool, the listener and shutdown. It
+// composes no part of the served stack itself; `replica_router` is the one place
+// that happens, which is what keeps the surface a client meets and the surface
+// the tests drive from being two different things.
+use camelid_enterprise::{
+    apply_deterministic, replica_router, Attribution, ModelIdentity, WorkerThreads, ENGINE_PIN,
+};
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -94,7 +100,7 @@ async fn serve(
         )
         .into());
     }
-    let config = lane::apply_deterministic().map_err(std::io::Error::other)?;
+    let config = apply_deterministic().map_err(std::io::Error::other)?;
     #[cfg(target_os = "macos")]
     let host = engine_macos::probe();
     #[cfg(target_os = "linux")]
@@ -130,7 +136,7 @@ async fn serve(
     eprintln!(
         "[lane] deterministic | engine pin {} | config vector sha256 {} | admission sha256 {} | \
          model sha256 {} | host {} | worker threads {}",
-        lane::ENGINE_PIN,
+        ENGINE_PIN,
         config.short(),
         config.admission_short(),
         model_identity.short(),
@@ -142,11 +148,18 @@ async fn serve(
     let state = camelid::api::AppState::with_configured_threads(threads)
         .with_default_enable_thinking(false)
         .with_models_dir(None);
+
+    // Everything this replica publishes about itself, settled before anything
+    // can answer a request. It is handed to `replica_router` rather than applied
+    // here: the served view needs two further layers, one of which cannot be
+    // written until the model is loaded, and both have to sit *inside*
+    // attribution so that a request this replica refuses is still a response
+    // that says which replica refused it.
     let ctx = Attribution {
         lane: "deterministic",
         config_sha256: Arc::new(config.sha256),
         admission_sha256: Arc::new(config.admission_sha256),
-        model: model_identity.clone(),
+        model: model_identity,
         host: Arc::new(host_summary),
         workers,
         receipts: serving_receipts.map(Arc::new),
@@ -167,133 +180,16 @@ async fn serve(
     eprintln!("[lane] listening on http://{addr}");
     eprintln!("[lane] loading model; nothing is served until the load completes");
 
-    let model_id = load_startup_model(engine.clone(), &model).await?;
-    model_identity.verify_unchanged(&model).map_err(std::io::Error::other)?;
+    // Load, re-verify the digest, and compose — all of it in the library, so the
+    // stack this process serves is the stack the tests drive. Nothing about the
+    // served surface is decided in this file.
+    let (served, model_id) = replica_router(engine, &model, &requested_model, ctx).await?;
     eprintln!("[lane] model loaded as '{model_id}'; replica ready");
-
-    // Composed only now, and only from the id the engine itself reported. The
-    // body filter refuses a generation request naming anything but this model,
-    // and it cannot be written before the load because the engine derives that
-    // key from the GGUF's own metadata — a value this distribution reads back
-    // rather than predicts.
-    let served_model = Arc::new(surface::ServedModel::new(model_id, &model, &requested_model));
-    let served = engine
-        .layer(middleware::from_fn_with_state(
-            served_model,
-            surface::pin_generation_to_the_served_model,
-        ))
-        .layer(middleware::from_fn(surface::serve_only_the_lane))
-        .layer(middleware::from_fn_with_state(ctx, attribution::attribute));
 
     axum::serve(listener, served)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
-}
-
-/// Load the model this replica was started with, without a route to load it,
-/// and report the key the engine filed it under.
-///
-/// That key is a return value rather than something this binary derives, and the
-/// distinction is load-bearing. The engine keys its loaded models by the GGUF's
-/// `general.name` when the metadata carries one and by the file stem when it
-/// does not, and that choice belongs to the engine at whatever revision is
-/// pinned. The served-surface filter matches request bodies against it, so a key
-/// guessed here and wrong there would refuse every request naming the model the
-/// replica is serving — a rule about the engine's state, read back from the
-/// engine, rather than a copy of its logic that goes stale at a pin bump.
-///
-/// The engine exposes model loading over HTTP and nowhere else — its loader is
-/// module-private and its state exposes no in-process entry point — so this is
-/// an HTTP request. It is not a request over a socket. The unfiltered router is
-/// a `tower` service, so the load is dispatched into it in-process: same
-/// handler, same middleware stack, same shared state, and no listener anywhere
-/// that could accept a connection from anything else.
-///
-/// That is the point. `POST /api/models/load` is unauthenticated and changes
-/// what a replica serves without changing anything it publishes about itself. A
-/// private loopback port carrying the unfiltered router would shrink the window
-/// in which that is reachable; dispatching in-process removes the window. It
-/// also removes a bind that can fail, an ephemeral port, a retry loop for the
-/// scheduling gap before the listener is polled, and a hand-rolled HTTP parse.
-///
-/// Source-restricting the route to loopback instead was considered and is
-/// strictly weaker exactly where it matters: in a pod every sidecar shares the
-/// network namespace and is "loopback", and on a host bound to `0.0.0.0` so is
-/// every local process. It weakens "nothing can swap the weights" to "no remote
-/// client can", and it leaves the control plane permanently mounted rather than
-/// never mounted.
-///
-/// Blocking rather than spawning is the operator-visible consequence, and the
-/// one to know about: the process prints that it is listening, then goes quiet
-/// for the length of the load. Nothing is lost — the engine reports itself not
-/// generation-ready until the load completes anyway, and every deployment
-/// artifact here already treats listening as distinct from ready — and what is
-/// gained is that no request can reach a served router whose model is not yet
-/// the one this replica hashed. It also fixes a second problem: posting the load
-/// to the replica's *own serving listener*, as this did before, made the load an
-/// in-flight request there, so a stop signal three seconds into startup blocked
-/// for the whole read while the documented drain probe reported an empty queue
-/// the entire time.
-///
-/// No timeout. A timeout firing mid-load would abandon the engine's model
-/// transition in a state this process cannot reason about; the bound is the
-/// supervisor's own startup probe, which restarts the container when it gives
-/// up. On failure this returns an error rather than exiting from a detached
-/// task, so the caller decides — which also removes a race in which the loader
-/// could kill the process while the listener was already accepting.
-async fn load_startup_model(
-    engine: axum::Router,
-    model: &Path,
-) -> Result<String, Box<dyn std::error::Error>> {
-    use axum::body::{to_bytes, Body};
-    use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
-    use tower::ServiceExt;
-
-    let body = serde_json::json!({ "path": model.to_string_lossy() }).to_string();
-    let request = Request::builder()
-        .method("POST")
-        .uri("/api/models/load")
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(body))?;
-
-    // `Error = Infallible`, so the only outcomes here are a status and a body.
-    let response = engine.oneshot(request).await?;
-    let status = response.status();
-    // Bounded, and generously: the success reply is the engine's whole
-    // loaded-model record, GGUF metadata and per-tensor descriptors included, so
-    // it is megabytes for an ordinary model and a tight limit here reads as "the
-    // engine reported no id". A bound is still worth having — this is a reply to
-    // a request this process made, and an unbounded read would turn a strange
-    // one into an allocation — but it has to sit above the record, not above a
-    // guess at it.
-    let bytes = to_bytes(response.into_body(), 256 * 1024 * 1024).await.unwrap_or_default();
-    if status == StatusCode::OK {
-        return serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|value| value.get("id")?.as_str().map(ToOwned::to_owned))
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                // The load succeeded and the replica still cannot start, because
-                // the served-surface filter is written against this key. Serving
-                // without it would mean serving a generation route whose model
-                // field nothing checks.
-                format!(
-                    "the engine loaded {} but did not report the id it filed it under, so this \
-                     replica cannot pin generation requests to the model it hashed",
-                    model.display()
-                )
-                .into()
-            });
-    }
-    let detail = String::from_utf8_lossy(&bytes).trim().to_string();
-    Err(format!(
-        "could not load the model at {}: the engine answered HTTP {}{}",
-        model.display(),
-        status.as_u16(),
-        if detail.is_empty() { String::new() } else { format!(": {detail}") }
-    )
-    .into())
 }
 
 /// Size the data-parallel worker pool, and report the width it came up with.
@@ -364,6 +260,8 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camelid_enterprise::{load_startup_model, served_router, surface, ServedModel};
+    use std::path::Path;
 
     /// The engine's router, exactly as the startup loader receives it.
     fn engine_router() -> axum::Router {
@@ -378,10 +276,18 @@ mod tests {
     /// spelling of a path, so an assertion cannot pass by accident.
     const TEST_MODEL_ID: &str = "Test Model 1B";
 
-    /// The stack a client actually meets: the engine's router, the body filter,
-    /// the served-route filter, and attribution — composed exactly as `serve`
-    /// composes them.
-    fn served_router() -> axum::Router {
+    /// The stack a client actually meets.
+    ///
+    /// It is composed by [`served_router`] — the same call `serve` makes through
+    /// `replica_router`, and the only place in the workspace that layering is
+    /// written down. Restating the layers here instead would have made these
+    /// tests pass over a stack of this file's own construction while the shipped
+    /// one drifted; that is exactly the gap that let both filters be deleted from
+    /// production with the suite still green.
+    ///
+    /// The only thing supplied by hand is what a real start reads off the disk:
+    /// an identity and the key the engine reported for the loaded weights.
+    fn served_stack() -> axum::Router {
         let ctx = Attribution {
             lane: "deterministic",
             config_sha256: Arc::new("0".repeat(64)),
@@ -392,18 +298,12 @@ mod tests {
             workers: WorkerThreads::resolved(1),
             receipts: None,
         };
-        let served_model = Arc::new(surface::ServedModel::new(
+        let served_model = Arc::new(ServedModel::new(
             TEST_MODEL_ID.to_string(),
             Path::new("/models/pinned.gguf"),
             Path::new("/models/pinned.gguf"),
         ));
-        engine_router()
-            .layer(middleware::from_fn_with_state(
-                served_model,
-                surface::pin_generation_to_the_served_model,
-            ))
-            .layer(middleware::from_fn(surface::serve_only_the_lane))
-            .layer(middleware::from_fn_with_state(ctx, attribution::attribute))
+        served_router(engine_router(), served_model, ctx)
     }
 
     async fn through_the_served_stack(method: &str, path: &str) -> axum::response::Response {
@@ -415,12 +315,12 @@ mod tests {
         path: &str,
         body: &str,
     ) -> axum::response::Response {
-        through(&served_router(), method, path, body).await
+        through(&served_stack(), method, path, body).await
     }
 
     /// The same, against a stack the caller holds on to.
     ///
-    /// `served_router()` builds fresh engine state every call, so two requests
+    /// `served_stack()` builds fresh engine state every call, so two requests
     /// through it are two replicas. A test about what one replica's state is
     /// after a request has to send both through the same one.
     async fn through(
@@ -451,26 +351,43 @@ mod tests {
     /// replica emits is attributed — asserted against the engine's real router
     /// rather than a stand-in.
     ///
-    /// This is the direction of failure that costs an outage. A route named in
-    /// the filter but absent from the engine is a 403 that nothing in this
+    /// This is the direction of failure that costs an outage. A route the
+    /// contract promises but the filter refuses is a 403 that nothing in this
     /// workspace would otherwise catch, because the filter's own unit tests
     /// answer only "does the rule match", never "is there anything behind it".
     /// Passing here means the container HEALTHCHECK, the three Kubernetes probes
     /// and the gateway's readiness probe all reach a handler.
+    ///
+    /// The contractual half of the list is read from the shared route registry
+    /// rather than written out again. A copy here would be a second inventory of
+    /// the public surface, and the failure it would hide is the one that matters:
+    /// a route the published contract promises and this replica quietly withholds
+    /// would still pass a test that only ever asks about the routes it already
+    /// knew about. That includes the compatibility routes, which are contractual
+    /// as *explicit* refusals — the engine's own typed "not implemented" answer
+    /// is the promise, and it can only be kept if the request reaches it.
     #[tokio::test]
     async fn every_allow_listed_route_reaches_the_engine_and_is_attributed() {
         use axum::http::StatusCode;
 
-        for (method, path) in [
-            ("GET", "/health"),
-            ("GET", "/v1/health"),
-            ("GET", "/v1/models"),
-            ("GET", "/v1/models/some-model"),
-            ("HEAD", "/v1/models"),
-            ("OPTIONS", "/v1/chat/completions"),
-            ("POST", "/v1/completions"),
-            ("POST", "/v1/chat/completions"),
-        ] {
+        let contractual = replica_contract::PUBLIC_ROUTES.iter().flat_map(|route| {
+            route
+                .methods
+                .iter()
+                .map(move |method| (method.as_str(), route.probe_path))
+        });
+        // Served, and not enumerated by the registry because they are not
+        // separate promises: the `HEAD` and CORS-preflight forms of contractual
+        // routes, which the contract document calls out in prose as behavior axum
+        // and the pinned router provide for routes already listed.
+        //
+        // The engine's bare `/health` is deliberately absent. It is
+        // replica-private diagnostics under the contract, `/v1/health` is what
+        // every probe in this tree polls, and serving it would be an eleventh
+        // route living outside the registry.
+        let operational = [("HEAD", "/v1/models"), ("OPTIONS", "/v1/chat/completions")];
+
+        for (method, path) in contractual.chain(operational) {
             let response = through_the_served_stack(method, path).await;
             assert_ne!(
                 response.status(),
@@ -498,17 +415,28 @@ mod tests {
         }
     }
 
-    /// The three readiness routes answer 200 with no model loaded, which is what
-    /// makes them usable as probes: a probe that only passes once the replica is
+    /// The readiness routes answer 200 with no model loaded, which is what makes
+    /// them usable as probes: a probe that only passes once the replica is
     /// serving cannot report that the replica is starting.
+    ///
+    /// Both are contractual, which is the point — the container HEALTHCHECK, the
+    /// three Kubernetes probes, the drain loop and the macOS installer all poll
+    /// `/v1/health` or `/v1/models`, so the routes the deployment depends on are
+    /// the routes the published contract promises. The engine's bare `/health` is
+    /// replica-private and is not served; nothing in this tree asks for it.
     #[tokio::test]
     async fn the_probe_routes_answer_before_a_model_is_loaded() {
         use axum::http::StatusCode;
 
-        for path in ["/health", "/v1/health", "/v1/models"] {
+        for path in ["/v1/health", "/v1/models"] {
             let response = through_the_served_stack("GET", path).await;
             assert_eq!(response.status(), StatusCode::OK, "GET {path} must answer a probe");
         }
+        assert_eq!(
+            through_the_served_stack("GET", "/health").await.status(),
+            StatusCode::FORBIDDEN,
+            "the engine's private liveness route is outside the contract and is withheld"
+        );
     }
 
     /// A refusal is a response this replica emitted, so it is attributed like
@@ -659,7 +587,7 @@ mod tests {
         std::fs::write(&model, b"not really a model").unwrap();
 
         let filtered =
-            engine_router().layer(middleware::from_fn(surface::serve_only_the_lane));
+            engine_router().layer(axum::middleware::from_fn(surface::serve_only_the_lane));
         let err = load_startup_model(filtered, &model)
             .await
             .expect_err("the served surface must not carry the loader")
@@ -738,7 +666,7 @@ mod tests {
         use axum::body::to_bytes;
         use axum::http::StatusCode;
 
-        let stack = served_router();
+        let stack = served_stack();
         let elsewhere = std::fs::canonicalize("Cargo.toml").unwrap();
         // One well-formed request per route — the engine refuses a body carrying
         // both spellings before it looks at anything else, and a refusal for the

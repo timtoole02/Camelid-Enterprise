@@ -6,12 +6,17 @@ members = [
     "crates/engine-linux",
     "crates/engine-windows",
     "crates/gateway",
+    "crates/identity",
+    "crates/replica-contract",
     "crates/server",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# The gateway crate uses `NonZeroUsize::new(..).unwrap()` in a `const` item,
+# which requires the const-stable `Option::unwrap` stabilized in Rust 1.83.
+rust-version = "1.83"
 license = "Apache-2.0"
 repository = "https://github.com/timtoole02/Camelid-Enterprise"
 
@@ -20,6 +25,8 @@ engine-core = { path = "crates/engine-core", package = "camelid-enterprise-engin
 engine-macos = { path = "crates/engine-macos", package = "camelid-enterprise-engine-macos" }
 engine-linux = { path = "crates/engine-linux", package = "camelid-enterprise-engine-linux" }
 engine-windows = { path = "crates/engine-windows", package = "camelid-enterprise-engine-windows" }
+identity = { path = "crates/identity", package = "camelid-enterprise-identity" }
+replica-contract = { path = "crates/replica-contract", package = "camelid-enterprise-replica-contract" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

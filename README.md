@@ -57,7 +57,7 @@ LLM serving stacks quietly trade reproducibility for performance. Batching, spec
 - **Execution posture is declared, not accidental.** A replica declares its lane at startup; the response carries which one produced it, under which configuration, from which weights, on which machine, at which pool width.
 - **Fails closed.** A configuration that would move a replica off its declared posture is a startup error, not a silent degradation. Admission is deny-by-default: an environment variable nobody wrote a rule for is refused, rather than waved through because nobody listed it as dangerous — and the admission policy itself is published as a digest, so a client can tell two builds apart by what they would refuse.
 - **Attribution everywhere.** Every response is tagged in headers, in the completion body, and in an optional audit receipt.
-- **A serving surface, not an application.** The replica serves generation, model listing and health, and refuses the rest of the engine's router. It also refuses a generation request that names weights other than its own, because the engine resolves that field against the filesystem — withholding the model-management routes is necessary and, on its own, is not enough.
+- **A serving surface, not an application.** The replica serves the routes of a versioned HTTP contract — generation, model listing, health, and the engine's own typed compatibility replies — and refuses the rest of its router, model management and runtime control included. It also refuses a generation request that names weights other than its own, because the engine resolves that field against the filesystem — withholding the model-management routes is necessary and, on its own, is not enough.
 - **Scales like a stateless service.** One replica serves one model; capacity is replica count. Docker and Kubernetes manifests are in the box.
 
 ## Lanes
@@ -75,7 +75,7 @@ A replica declares its lane at startup, and every response is attributable to it
 - **Frozen configuration.** At startup the lane applies a canonical configuration vector — the order-stable CPU forward pass, speculation off, performance tunables at their defaults — then hashes it (SHA-256). The hash travels with every response, so a replica's exact posture is legible from the outside.
 - **Identified weights.** The GGUF is hashed whole before the port is bound, and its digest rides on every response. Two replicas serving different files are told apart from the outside, which the engine's own model *name* cannot do.
 - **One generation at a time.** Requests execute whole-generation serialized, so output never depends on what else is in flight.
-- **A fixed surface.** The served routes are an allow list; the engine's model-management and runtime-control routes are refused. So is a generation request whose `model` field names anything but this replica's own weights — the engine would otherwise load that file on demand and answer from it. The two together are what make the published model digest a claim about the whole process lifetime rather than about its first second.
+- **A declared surface.** The served routes are an allow list, and it is the contract's own registry rather than a second list this crate keeps privately — so a route the contract does not name, including the engine's model-management and runtime-control routes, is refused rather than served by default. Refused too is a generation request whose `model` field names anything but this replica's own weights: the engine would otherwise load that file on demand and answer from it, over a route the contract requires. The two together are what make the published model digest a claim about the whole process lifetime rather than about its first second.
 - **Fail closed.** An unrecognized `CAMELID_*` variable refuses startup; a full queue returns a typed `503` with `Retry-After`. There is no silent fallback to a faster, weaker execution mode.
 
 ## Quick start
@@ -94,11 +94,13 @@ cargo run --release --bin camelid-enterprise-gateway -- serve \
   --upstream http://127.0.0.1:8181
 ```
 
-The replica exposes an OpenAI-compatible API on `127.0.0.1:8181` by default. The served surface is an allow list, and this is all of it — `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`, `GET /v1/models/<id>`, `GET /health` and `GET /v1/health`, plus `HEAD` and CORS preflight where they apply. Everything else on the engine's router answers `403` with `"code":"route_not_served"`.
+The replica exposes an OpenAI-compatible API on `127.0.0.1:8181` by default, and its served surface is the versioned [Replica HTTP Contract v1](docs/contracts/replica-http-v1.md). Nothing in this repository keeps a second inventory of that surface: the replica's route filter and the gateway's forwarding table both read the dependency-free registry in `crates/replica-contract`, which is the contract's own machine-readable form, so one edit changes what the replica serves, what the gateway forwards and what the contract publishes. The list is `GET /v1/health`, `GET /v1/models`, `GET /v1/models/<id>`, `POST /v1/completions` and `POST /v1/chat/completions`, plus the five compatibility paths the pinned engine answers with a typed `501` — `/v1/embeddings`, `/v1/responses`, `/v1/messages`, `/v1/rerank` and `/v1/reranking` — and `HEAD` and CORS preflight where they apply. Everything else on the engine's router — model load and unload, runtime control, the workspace family, the legacy completion-server routes, and the embedded web UI — answers `403` with `"code":"route_not_served"`.
 
-On the two generation routes the `model` field is checked as well as the path. It may name this replica's own weights — the id the engine filed them under, the path the replica was started with, or that file's name or stem — or it may be omitted. Anything else answers `404` with `"code":"model_not_served"`, whether or not a file of that name exists on disk.
+On the two generation routes the `model` field is checked as well as the path, which is a separate control because no route list can stand in for it: the engine resolves that field against the filesystem and loads whatever it names, over a route the contract requires the replica to serve. The field may name this replica's own weights — the id the engine filed them under, the path the replica was started with, or that file's name or stem — or it may be omitted. Anything else answers `404` with `"code":"model_not_served"`, whether or not a file of that name exists on disk.
 
-With the gateway running, clients use `127.0.0.1:8080`; it preserves streaming bodies, status codes, and replica attribution without inspecting or retrying inference requests.
+The contract document also fixes attribution, health and readiness, typed errors, streaming, receipts, startup and shutdown behaviour, the evidence behind each claim, and what it deliberately leaves unspecified. Its executable conformance tests live in `crates/server`.
+
+With the gateway running, clients use `127.0.0.1:8080`. It forwards the contractual routes and nothing else, preserves streaming bodies, status codes and replica attribution without inspecting or retrying inference requests, and stamps a gateway-authoritative `x-camelid-request-id` on every forwarded request — the correlation id the replica records in its serving receipt.
 
 > **Listening is not readiness.** The model is read whole and hashed *before* the port is bound — a replica must never answer a request without being able to say what produced it — and then, with the port bound but nothing served from it, the same file is loaded. On a large GGUF from cold cache that is tens of seconds of quiet between `listening` and `replica ready`. Probe `GET /v1/health` for `"generation_ready":true`; a bare TCP-connect check would report ready far too early.
 
@@ -114,7 +116,7 @@ curl http://127.0.0.1:8181/v1/chat/completions \
 ```
 
 > [!WARNING]
-> `serve --addr 0.0.0.0:8181` makes the API reachable by every device that can reach the host. The served-route allow list bounds *what* a caller may ask for, never *who* may ask — there is no authentication here, and the gateway does not add any in this release. Only bind `0.0.0.0` on a trusted network, behind your own access controls.
+> **A replica is an internal service.** It has no authentication and no tenant identity, and `serve --addr 0.0.0.0:8181` makes its API reachable by every device that can reach the host. Client traffic belongs at the gateway, with cluster policy keeping ordinary workloads off the replica port — [`deploy/k8s/replica-network-policy.yaml`](deploy/k8s/replica-network-policy.yaml) is that policy for Kubernetes, and on one box the replica stays on loopback. The route contract and the model check bound *what* an admitted caller may ask for, never *who* may ask; they are defence in depth behind that isolation, not a replacement for it. The gateway can require a bearer token (`serve --identity-db <path>`), but enforcement is opt-in and the gateway terminates no TLS.
 
 ## Attribution
 
@@ -124,11 +126,17 @@ Every response is attributable to the lane that produced it, in three places so 
 |---|---|
 | **Response headers** (streams included) | `x-camelid-lane`, `x-camelid-config-sha256`, `x-camelid-admission-sha256`, `x-camelid-model-sha256`, `x-camelid-host`, `x-camelid-worker-threads` |
 | **Completion body** (non-streaming JSON) | `camelid_lane`, `camelid_config_sha256`, `camelid_admission_sha256`, `camelid_model_sha256`, `camelid_host`, `camelid_worker_threads` |
-| **Serving receipt** (opt-in, `--serving-receipts <path>`) | one JSONL line per request, digests at full length |
+| **Serving receipt** (opt-in, `--serving-receipts <path>`) | one JSONL line per request, digests at full length, plus the gateway's `request_id` |
 
 ```json
-{"admission_sha256":"45121fb83fef631f8464c32dada6100b23f0a0af80347031f812803ee9ec2a09","config_sha256":"30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7","host":"macos/aarch64 cores=8 simd=dotprod+i8mm+neon","lane":"deterministic","method":"POST","model_sha256":"3f8a1c04b7e2d95608f31a7c4be0d2593a6e18cf7b402d95e6c1380af472bb19","path":"/v1/chat/completions","status":200,"ts":1784845685.882345,"worker_threads":8}
+{"admission_sha256":"45121fb83fef631f8464c32dada6100b23f0a0af80347031f812803ee9ec2a09","config_sha256":"30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7","host":"macos/aarch64 cores=8 simd=dotprod+i8mm+neon","lane":"deterministic","method":"POST","model_sha256":"3f8a1c04b7e2d95608f31a7c4be0d2593a6e18cf7b402d95e6c1380af472bb19","path":"/v1/chat/completions","request_id":"req_9f2c1ad4e7b30516","status":200,"ts":1784845685.882345,"worker_threads":8}
 ```
+
+`request_id` is the one receipt field the replica does not mint. It is the
+correlation id the gateway stamps on every request it forwards, echoed here so a
+receipt joins to the gateway's own audit line for the same request — which is
+where identity lives, and where it stays. It is `null` when a request reaches the
+replica without one.
 
 The digests are published at twelve hex characters on the wire — an audit and
 comparison handle, not a cryptographic binding — and at all sixty-four on
@@ -201,14 +209,16 @@ docker build -f deploy/docker/Dockerfile -t camelid-enterprise:0.1.0 .
 docker run -p 127.0.0.1:8181:8181 -v /path/to/models:/models:ro \
     camelid-enterprise:0.1.0 --model /models/model.gguf
 
-# Kubernetes
+# Kubernetes — the network policy is not optional; it is what keeps the
+# replica port off the rest of the namespace
 kubectl apply -f deploy/k8s/deployment.yaml -f deploy/k8s/service.yaml \
-    -f deploy/k8s/gateway-deployment.yaml -f deploy/k8s/gateway-service.yaml
+    -f deploy/k8s/gateway-deployment.yaml -f deploy/k8s/gateway-service.yaml \
+    -f deploy/k8s/replica-network-policy.yaml
 ```
 
 Bare-metal Apple Silicon hosts run the binaries directly; [deploy/macos/](deploy/macos/README.md) has the launchd units and the readiness and drain procedures.
 
-See [deploy/README.md](deploy/README.md) for the full scaling model, probe configuration, the drain sequence, and sizing guidance. Two things there are easy to miss and expensive to rediscover: a replica's drain time is the **sum** of every generation it has already accepted, not the longest one; and the Kubernetes replica pod spec must keep `enableServiceLinks: false`, or every rollout after the first refuses to start.
+See [deploy/README.md](deploy/README.md) for the trust boundary, the full scaling model, probe configuration, the drain sequence, and sizing guidance. Three things there are easy to miss and expensive to rediscover: the replica network policy only filters anything if the cluster CNI enforces NetworkPolicy at all; a replica's drain time is the **sum** of every generation it has already accepted, not the longest one; and the Kubernetes replica pod spec must keep `enableServiceLinks: false`, or every rollout after the first refuses to start.
 
 ## Scope
 
@@ -230,9 +240,12 @@ crates/
 ├── engine-linux/     Linux backend — x86 AVX/VNNI and CUDA (in progress).
 ├── engine-windows/   Windows backend (in progress).
 ├── gateway/          Transparent streaming entry point in front of replicas.
-└── server/           The lane-attributed serving binary.
+├── identity/         Bearer token → opaque principal id, for the gateway.
+├── replica-contract/ Dependency-free public route registry, shared by both.
+└── server/           The lane-attributed serving binary, and the contract it owns.
 deploy/               Docker images, Kubernetes manifests, macOS launchd units.
 docs/adr/             Architecture decision records.
+docs/contracts/       The versioned replica HTTP contract.
 ```
 
 `engine-core` never inspects the host; anything keyed on detected hardware lives in exactly one platform crate, and the server links only the crate for its target OS. Accelerated kernels are proven bit-identical to the portable reference on real hardware — acceleration delivers speed without changing a single output bit.

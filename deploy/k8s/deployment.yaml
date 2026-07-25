@@ -7,6 +7,14 @@
 # behavior is scoped to a hardware class, so replicas should not float across
 # heterogeneous nodes or get throttled unpredictably. Pin node selection to
 # one instance type per pool.
+#
+# A replica is an internal service. It has no authentication and no tenant
+# identity, so client traffic must enter through the gateway and the replica
+# port must not be reachable from ordinary workloads. The `app`/`lane` labels
+# below are what `replica-network-policy.yaml` selects on; apply that policy
+# with this Deployment, on a CNI that enforces NetworkPolicy. The replica's own
+# route contract and generation-body model check are defence in depth on top of
+# that isolation, not a substitute for it.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -46,10 +54,25 @@ spec:
       # no admission scan, and adding it there for symmetry would imply the
       # setting is cosmetic.
       enableServiceLinks: false
+      # The server drains active generations on SIGTERM. Keep this at least as
+      # long as the gateway drain window so a coordinated rollout cannot kill
+      # the upstream half of an otherwise draining client stream.
+      terminationGracePeriodSeconds: 300
       # nodeSelector:
       #   node.kubernetes.io/instance-type: <one instance type per pool>
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: server
+          # The release tag is used here for readability. Production automation
+          # must replace it with the published image digest
+          # (`camelid-enterprise@sha256:...`) so a rollout cannot change bytes
+          # under one tag.
           image: camelid-enterprise:0.1.0
           # --threads is passed explicitly and must stay in step with the cpu
           # request/limit below. Left unset, the replica takes rayon's default,
@@ -66,6 +89,11 @@ spec:
             - "8"
             - "--serving-receipts"
             - "/receipts/serving.jsonl"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           env:
             - name: CAMELID_ENTERPRISE_ADDR
               value: "0.0.0.0:8181"
@@ -107,10 +135,17 @@ spec:
               readOnly: true
             - name: receipts
               mountPath: /receipts
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: models
           persistentVolumeClaim:
             claimName: camelid-models
             readOnly: true
         - name: receipts
+          emptyDir: {}
+        # `readOnlyRootFilesystem` leaves no writable path at all; nothing
+        # writes here today, but it keeps any future scratch-file dependency
+        # from failing silently.
+        - name: tmp
           emptyDir: {}

@@ -414,13 +414,28 @@ correct and the machine simply never comes back.
 
 ## Exposure
 
-The replica serves an allow list of requests and refuses everything else with
-`403` and `"code":"route_not_served"`:
+The replica serves the routes of
+[Replica HTTP Contract v1](../../docs/contracts/replica-http-v1.md) and refuses
+everything else with `403` and `"code":"route_not_served"`. It keeps no private
+second copy of that list — the route filter reads the dependency-free registry in
+`crates/replica-contract`, which is the contract's machine-readable form.
+Admitted, with `HEAD` and CORS preflight where they apply:
 
-| Method | Path |
-|---|---|
-| `GET`, `HEAD`, `OPTIONS` | `/health`, `/v1/health`, `/v1/models`, `/v1/models/<id>` |
-| `POST`, `OPTIONS` | `/v1/completions`, `/v1/chat/completions` |
+| Method | Path | Answered by |
+|---|---|---|
+| `GET` | `/v1/health`, `/v1/models`, `/v1/models/<id>` | the engine |
+| `POST` | `/v1/completions`, `/v1/chat/completions` | the engine |
+| `POST` | `/v1/embeddings`, `/v1/responses`, `/v1/messages`, `/v1/rerank`, `/v1/reranking` | the engine's typed `501` "unsupported" replies |
+
+The last row is a contractual surface rather than a capability: the pinned engine
+answers those paths with a typed `501` and an `unsupported_*` code, and the
+contract carries that through so a client SDK's capability probe gets the
+engine's own answer instead of a refusal it has to special-case.
+
+**Point your health check at `/v1/health`, not `/health`.** The engine's bare
+`/health` is replica-private diagnostics under the contract and answers `403`
+here; `/v1/health` is the route the installer, the drain loop and every probe in
+this repository poll, and it is the one that reports `generation_ready`.
 
 Not served, and this is the point: the engine's `/api/models/load`,
 `/api/models/unload` and `/api/runtime/gpu` are **unauthenticated** on its own
@@ -432,13 +447,14 @@ one. The engine's legacy completion-server-compatible routes are refused with th
 rest; one of them is a second generation route that attribution does not inject
 body fields for.
 
-The two admitted generation routes carry a `model` field, and the engine resolves
-that field against the filesystem before anything else, so it is checked too: it
-may name this replica's own weights — the id above, the path in `--model`, or
-that file's name or stem — or be omitted. Anything else answers `404` with
+The two generation routes carry a `model` field, and the engine resolves that
+field against the filesystem before anything else, so it is checked too: it may
+name this replica's own weights — the id above, the path in `--model`, or that
+file's name or stem — or be omitted. Anything else answers `404` with
 `"code":"model_not_served"`, identically whether or not a file of that name is on
 this disk. Withholding the routes without checking the field would have left the
-model swappable by an ordinary completion request.
+model swappable by an ordinary completion request, over a route the contract
+requires the replica to serve.
 
 `x-camelid-model-sha256` is the external check that the weights have not moved.
 It is the SHA-256 of the GGUF this process hashed before it bound its port, and
@@ -446,12 +462,22 @@ it is on every response. Compare it against `shasum -a 256` of the file you
 intended to serve.
 
 The unit still binds `127.0.0.1`, and that is still the right default:
-**the allow list bounds what a caller can ask for, not who may ask.** Anyone who
-can reach the port can spend the replica's single generation slot, and the
+**the route contract bounds what a caller can ask for, not who may ask.** Anyone
+who can reach the port can spend the replica's single generation slot, and the
 engine applies a permissive CORS policy to the routes that are served, so they
 are reachable from any web origin. Widen `--addr` only behind something that
-authenticates, or on an isolated network with a packet filter doing the same. The
-gateway in this release does not authenticate either.
+authenticates, or on an isolated network with a packet filter doing the same.
+
+The replica itself authenticates nothing and is not going to. The gateway can:
+`camelid-enterprise-gateway serve --identity-db <path>` rejects any request
+without a valid `Authorization: Bearer <token>` with a typed `401`, before the
+request takes an admission permit or reaches a replica. Enforcement is **opt-in**
+— without `--identity-db` the gateway forwards exactly as before — and the
+gateway terminates no TLS. The gateway unit in this directory binds
+`0.0.0.0:8080` by design, since it is meant to be the box's one entry point, so a
+bearer token would cross that hop in cleartext: put TLS in front of the gateway
+before `--identity-db` buys anything on a network you do not control. That unit
+ships without `--identity-db`.
 
 ## When it will not start
 

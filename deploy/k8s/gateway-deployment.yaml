@@ -20,14 +20,33 @@ spec:
       labels:
         app: camelid-enterprise-gateway
     spec:
+      # Axum drains active streaming responses on SIGTERM. Give long model
+      # generations time to finish before kubelet sends SIGKILL.
+      terminationGracePeriodSeconds: 300
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: gateway
           image: camelid-enterprise-gateway:0.1.0
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           env:
             - name: CAMELID_GATEWAY_ADDR
               value: "0.0.0.0:8080"
             - name: CAMELID_GATEWAY_UPSTREAM
               value: "http://camelid-enterprise-deterministic"
+            - name: CAMELID_GATEWAY_MAX_IN_FLIGHT
+              value: "256"
+            - name: CAMELID_GATEWAY_MAX_CONNECTION_SECONDS
+              value: "300"
           ports:
             - containerPort: 8080
               name: http
@@ -40,11 +59,20 @@ spec:
               memory: 256Mi
           readinessProbe:
             httpGet:
-              path: /v1/models
+              path: /healthz
               port: http
             periodSeconds: 5
-          # Replica availability affects readiness, not gateway process health.
           livenessProbe:
-            tcpSocket:
+            httpGet:
+              path: /healthz
               port: http
             periodSeconds: 15
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # `readOnlyRootFilesystem` leaves no writable path at all; this is
+        # unused today (the gateway writes nothing) but keeps a dependency
+        # that ever needs a scratch file from failing silently.
+        - name: tmp
+          emptyDir: {}
