@@ -23,7 +23,10 @@ env:
 jobs:
   replica-contract-model:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The queue-saturation test serializes decoding behind a shared engine
+    # lock; on shared CI hardware the last queued request can wait well past
+    # its own decode time. This is the real hang ceiling for the whole job.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

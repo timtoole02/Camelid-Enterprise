@@ -7,7 +7,13 @@ use std::time::Duration;
 use tower::ServiceExt;
 
 const MODEL_ENV: &str = "CAMELID_ENTERPRISE_TEST_MODEL";
-const STEP_TIMEOUT: Duration = Duration::from_secs(300);
+// The deterministic lane serializes generation, so the queue-saturation test
+// spawns concurrent requests that decode one at a time behind a shared lock.
+// Each task's timeout is measured from spawn, so a task queued behind many
+// slow decodes on constrained CI hardware can wait well past its own decode
+// time. This bound is a hang detector, not a performance target; the CI job's
+// own timeout-minutes remains the real ceiling on total wall-clock time.
+const STEP_TIMEOUT: Duration = Duration::from_secs(900);
 
 async fn body_json(response: axum::response::Response) -> Value {
     let bytes = tokio::time::timeout(
@@ -15,7 +21,7 @@ async fn body_json(response: axum::response::Response) -> Value {
         to_bytes(response.into_body(), 16 * 1024 * 1024),
     )
     .await
-    .expect("replica response body exceeded 300 seconds")
+    .expect("replica response body exceeded 900 seconds")
     .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
@@ -39,7 +45,7 @@ fn assert_attribution(response: &axum::response::Response, expected_sha: &str) {
 async fn send(app: axum::Router, request: Request<Body>) -> axum::response::Response {
     tokio::time::timeout(STEP_TIMEOUT, app.oneshot(request))
         .await
-        .expect("replica contract HTTP step exceeded 300 seconds")
+        .expect("replica contract HTTP step exceeded 900 seconds")
         .unwrap()
 }
 
