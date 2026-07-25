@@ -26,12 +26,28 @@ spec:
         app: camelid-enterprise
         lane: deterministic
     spec:
+      # The server drains active generations on SIGTERM. Keep this at least as
+      # long as the gateway drain window so a coordinated rollout cannot kill
+      # the upstream half of an otherwise draining client stream.
+      terminationGracePeriodSeconds: 300
       # nodeSelector:
       #   node.kubernetes.io/instance-type: <one instance type per pool>
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: server
           image: camelid-enterprise:0.1.0
           args: ["--model", "/models/model.gguf", "--serving-receipts", "/receipts/serving.jsonl"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           env:
             - name: CAMELID_ENTERPRISE_ADDR
               value: "0.0.0.0:8181"
@@ -67,10 +83,17 @@ spec:
               readOnly: true
             - name: receipts
               mountPath: /receipts
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: models
           persistentVolumeClaim:
             claimName: camelid-models
             readOnly: true
         - name: receipts
+          emptyDir: {}
+        # `readOnlyRootFilesystem` leaves no writable path at all; nothing
+        # writes here today, but it keeps any future scratch-file dependency
+        # from failing silently.
+        - name: tmp
           emptyDir: {}
