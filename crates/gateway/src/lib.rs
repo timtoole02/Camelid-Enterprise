@@ -6,7 +6,7 @@
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::{CONNECTION, CONTENT_TYPE, HOST};
+use axum::http::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, WWW_AUTHENTICATE};
 use axum::http::uri::{Authority, Scheme};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -14,7 +14,9 @@ use axum::{Json, Router};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use identity::{IdentityError, PrincipalId, SqliteIdentityStore, TokenStore};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -75,21 +77,45 @@ impl UpstreamOrigin {
 struct GatewayState {
     upstream: UpstreamOrigin,
     client: Client<HttpConnector, Body>,
+    auth: GatewayAuth,
 }
 
-pub fn router(upstream: UpstreamOrigin) -> Router {
+/// Whether the gateway requires every request to carry a bearer token that
+/// resolves to a known principal before it is forwarded upstream.
+///
+/// [`GatewayAuth::Disabled`] preserves the gateway's original transparent
+/// behavior unchanged: nothing about existing deployments breaks until an
+/// operator opts in by supplying an identity database.
+#[derive(Clone)]
+pub enum GatewayAuth {
+    Disabled,
+    RequireToken(Arc<SqliteIdentityStore>),
+}
+
+pub fn router(upstream: UpstreamOrigin, auth: GatewayAuth) -> Router {
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
     connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
     let mut client_builder = Client::builder(TokioExecutor::new());
     client_builder.retry_canceled_requests(false);
     let client = client_builder.build(connector);
-    Router::new()
-        .fallback(proxy)
-        .with_state(GatewayState { upstream, client })
+    Router::new().fallback(proxy).with_state(GatewayState {
+        upstream,
+        client,
+        auth,
+    })
 }
 
 async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Response {
+    if let GatewayAuth::RequireToken(store) = &state.auth {
+        match authenticate(store, request.headers()).await {
+            Ok(principal) => {
+                request.extensions_mut().insert(principal);
+            }
+            Err(response) => return response,
+        }
+    }
+
     let upstream_uri = match state.upstream.request_uri(request.uri()) {
         Ok(uri) => uri,
         Err(error) => {
@@ -134,6 +160,61 @@ fn gateway_error(status: StatusCode, message: &'static str) -> Response {
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+}
+
+/// Resolves the request's bearer token to a principal, or returns the exact
+/// response the gateway should send back without forwarding anything upstream.
+async fn authenticate(
+    store: &Arc<SqliteIdentityStore>,
+    headers: &HeaderMap,
+) -> Result<PrincipalId, Response> {
+    let Some(token) = bearer_token(headers) else {
+        return Err(unauthorized("missing bearer token"));
+    };
+    let store = Arc::clone(store);
+    let token = token.to_string();
+    let resolved = tokio::task::spawn_blocking(move || store.resolve(&token))
+        .await
+        .expect("identity resolution task panicked");
+
+    resolved.map_err(|error| match error {
+        IdentityError::InvalidToken => unauthorized("invalid bearer token"),
+        IdentityError::Storage(message) => {
+            tracing::error!(%message, "identity store error while authenticating request");
+            gateway_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "gateway could not verify the bearer token",
+            )
+        }
+    })
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+fn unauthorized(message: &'static str) -> Response {
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "unauthorized"
+            }
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+        .headers_mut()
+        .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
     response
 }
 

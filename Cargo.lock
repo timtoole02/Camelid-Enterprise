@@ -315,6 +315,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "camelid-enterprise-identity",
  "clap",
  "futures-util",
  "http-body-util",
@@ -324,6 +325,15 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "camelid-enterprise-identity"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "rusqlite",
+ "sha2 0.10.9",
 ]
 
 [[package]]

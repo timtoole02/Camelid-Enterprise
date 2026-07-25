@@ -36,7 +36,7 @@ terminal, Kanban agents) are **not in this repository**.
 ### 2.1 Repository layout (present)
 
 ```
-Cargo.toml                     workspace: 5 member crates
+Cargo.toml                     workspace: 6 member crates
 crates/
   engine-core/                 platform-neutral engine (gguf, model, tensor,
                                forward, tokenizer, host, error)
@@ -44,6 +44,7 @@ crates/
   engine-linux/                per-platform kernels + host probe()
   engine-windows/              per-platform kernels + host probe()
   gateway/                     transparent fixed-origin HTTP gateway
+  identity/                    token -> opaque principal id primitive (SQLite)
   server/                      the `camelid-enterprise` serving binary
 deploy/
   docker/                      separate replica and gateway images
@@ -59,10 +60,11 @@ deploy/
 | **Serving replica** | `crates/server` (`camelid-enterprise` bin) | CLI (`serve`), binds an HTTP listener, applies the deterministic lane, stamps attribution, loads one model at startup. |
 | **Lane / config freeze** | `crates/server/src/lane.rs` | Applies a canonical env-var configuration vector, fails closed on any override, publishes its SHA-256. Engine pinned by revision (`ENGINE_PIN`). |
 | **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-host` on every response, injects fields into completion bodies, writes optional JSONL serving receipts. |
-| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin HTTP forwarding with opaque streaming bodies, hop-by-hop header filtering, and no retries or response rewriting. Returns a typed `502` only when it cannot reach the upstream. |
+| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin HTTP forwarding with opaque streaming bodies, hop-by-hop header filtering, and no retries or response rewriting. Returns a typed `502` only when it cannot reach the upstream. Optionally enforces bearer-token auth (see below) before forwarding; unauthenticated pass-through remains the default. |
 | **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/api/models/load`. Provided by the pinned engine crate, **not** by this repo. |
 | **Engine core** | `crates/engine-core` | GGUF container, model config, tensor/forward/tokenizer types. Host-agnostic. |
 | **Platform kernels** | `crates/engine-{macos,linux,windows}` | Runtime CPU feature detection (`probe()`), platform kernels. macOS port landing first; Linux/Windows currently capability-detection only. |
+| **Identity primitive** | `crates/identity` | Resolves an opaque bearer token to an opaque `PrincipalId`, backed by a local SQLite store (hashed tokens only). Wired into the gateway (see below) as opt-in enforcement; still no orgs, RBAC, or SSO. |
 | **Deployment assets** | `deploy/` | Dockerfile (model mounted at runtime, not baked); K8s Deployment (Guaranteed QoS, one model per pool, startup/readiness probes on `/v1/models`) + Service. |
 
 ### 2.3 Properties that exist Today
@@ -88,9 +90,12 @@ deploy/
 So the plan never drifts into assuming work is done, this is the explicit list of
 what the vision requires that is absent today:
 
-- **No authentication / identity.** No login, sessions, tokens, or user store.
-- **No multi-user / multi-tenant model.** No concept of a user, team, org, or
-  data isolation between them.
+- **No identity layer by default.** `crates/identity` plus gateway bearer-token
+  enforcement exist, but enforcement is opt-in (`--identity-db`) and off by
+  default; without it there is still no authentication, no users beyond a flat
+  local table, and no tenants. No orgs, RBAC, sessions, or SSO/OIDC.
+- **No multi-user / multi-tenant model.** No concept of a team, org, or data
+  isolation between principals beyond the token → principal mapping itself.
 - **No authorization.** No roles, permissions, or per-user quotas.
 - **No control-plane behavior.** The transparent gateway exists, but there is no
   request routing by user or model, admission control, rate limiting, or usage
@@ -171,8 +176,8 @@ tokens for one model"; everything multi-user is layered on top.
 | Service | Owns | Must never | Exists today? |
 |---|---|---|---|
 | **Inference Replica Pool** | Producing attributed tokens for exactly one model, one generation at a time; lane guarantee; attribution stamping. | Know about users, auth, or other models. Hold cross-request state. | **Yes** — `crates/server`. Reuse as-is. |
-| **Gateway / Control Plane** | Terminating client connections, authenticating requests, routing to the right model pool, quotas, rate limiting, usage metering. | Run inference. Store user credentials (delegates to Identity). | **Partial** — transparent fixed-origin forwarding exists; control-plane behavior does not. |
-| **Identity & Auth Service** | Users, orgs/teams, credentials, sessions, API tokens, roles/permissions. | Route inference or store conversation content. | No. |
+| **Gateway / Control Plane** | Terminating client connections, authenticating requests, routing to the right model pool, quotas, rate limiting, usage metering. | Run inference. Store user credentials (delegates to Identity). | **Partial** — transparent forwarding plus opt-in bearer-token enforcement exist; routing, quotas, and metering do not. |
+| **Identity & Auth Service** | Users, orgs/teams, credentials, sessions, API tokens, roles/permissions. | Route inference or store conversation content. | **Partial** — `crates/identity` resolves tokens to principals and gates the gateway; no orgs, roles, sessions, or federation. |
 | **Model / Catalog Service** | Registry of available models, their files, and lifecycle (register, load target, retire); mapping model name → replica pool. | Serve inference itself. Own user data. | Partial — only `/api/models/load` on the replica exists. |
 | **Application Tier** | End-user experiences: WebUI, desktop app, agentic terminal, Kanban agents. | Bypass the gateway to reach replicas directly. | **External** — not in this repo. |
 | **Platform Data + Observability** | Durable state (users, conversations, audit trail), receipts aggregation, metrics, logs. | Be reached directly by replicas or by clients. | Partial — only per-replica JSONL receipts + stderr tracing. |
@@ -201,9 +206,15 @@ tokens for one model"; everything multi-user is layered on top.
 2. **Gateway (pass-through first) — built.** A transparent fixed-origin gateway
   fronts the existing replica pool with no inference behavior change. It ships
   as a Rust binary, separate container, and private Kubernetes Service.
-3. **Identity & auth — not started.** Add the Identity service and make the
-  gateway require authentication. Replicas remain unchanged and unauthenticated
-  *behind* the gateway on a private network.
+3. **Identity & auth — in progress.** `crates/identity` provides the
+  token -> opaque `PrincipalId` primitive (SQLite-backed, hashed tokens, no
+  orgs/RBAC/SSO yet). The gateway now enforces it: `serve --identity-db <path>`
+  rejects any request without a valid `Authorization: Bearer <token>` with a
+  typed `401` before it reaches a replica; omitting the flag keeps the
+  gateway's original unauthenticated pass-through unchanged. `create-user`,
+  `issue-token`, and `revoke-token` subcommands manage the local database.
+  Still missing: no way to require auth by default, no per-request identity
+  reaching receipts, no routing or quotas.
 4. **Multi-user routing & quotas — not started.** Gateway routes by model and
   enforces per-user/per-org limits; usage metering begins. Still no state in
   replicas.

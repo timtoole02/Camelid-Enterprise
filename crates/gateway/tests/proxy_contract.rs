@@ -4,12 +4,13 @@ use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use axum::{routing::any, Router};
 use bytes::Bytes;
-use camelid_enterprise_gateway::{router as gateway_router, UpstreamOrigin};
+use camelid_enterprise_gateway::{router as gateway_router, GatewayAuth, UpstreamOrigin};
 use futures_util::stream;
 use http_body_util::BodyExt;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use identity::SqliteIdentityStore;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -39,8 +40,12 @@ async fn spawn_server(app: Router) -> TestServer {
 }
 
 async fn spawn_gateway(upstream: SocketAddr) -> TestServer {
+    spawn_gateway_with_auth(upstream, GatewayAuth::Disabled).await
+}
+
+async fn spawn_gateway_with_auth(upstream: SocketAddr, auth: GatewayAuth) -> TestServer {
     let upstream = UpstreamOrigin::parse(&format!("http://{upstream}")).unwrap();
-    spawn_server(gateway_router(upstream)).await
+    spawn_server(gateway_router(upstream, auth)).await
 }
 
 fn client() -> Client<HttpConnector, Body> {
@@ -299,7 +304,10 @@ async fn returns_typed_bad_gateway_only_for_gateway_failure() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let unavailable = listener.local_addr().unwrap();
     drop(listener);
-    let app = gateway_router(UpstreamOrigin::parse(&format!("http://{unavailable}")).unwrap());
+    let app = gateway_router(
+        UpstreamOrigin::parse(&format!("http://{unavailable}")).unwrap(),
+        GatewayAuth::Disabled,
+    );
     let request = Request::get("/v1/models").body(Body::empty()).unwrap();
 
     let response = app.oneshot(request).await.unwrap();
@@ -311,4 +319,83 @@ async fn returns_typed_bad_gateway_only_for_gateway_failure() {
         to_bytes(response.into_body(), 1024).await.unwrap(),
         r#"{"error":{"message":"upstream replica is unavailable","type":"gateway_error"}}"#
     );
+}
+
+#[tokio::test]
+async fn rejects_requests_with_no_bearer_token_when_auth_is_required() {
+    let store = Arc::new(SqliteIdentityStore::open_in_memory().unwrap());
+    let unreachable_upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+
+    let gateway =
+        spawn_gateway_with_auth(unreachable_upstream, GatewayAuth::RequireToken(store)).await;
+    let request = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = client().request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()["www-authenticate"], "Bearer");
+    assert_eq!(
+        to_bytes(Body::new(response.into_body()), 1024)
+            .await
+            .unwrap(),
+        r#"{"error":{"message":"missing bearer token","type":"unauthorized"}}"#
+    );
+}
+
+#[tokio::test]
+async fn rejects_requests_with_an_invalid_bearer_token() {
+    let store = Arc::new(SqliteIdentityStore::open_in_memory().unwrap());
+    let unreachable_upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+
+    let gateway =
+        spawn_gateway_with_auth(unreachable_upstream, GatewayAuth::RequireToken(store)).await;
+    let request = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .header("authorization", "Bearer not-a-real-token")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = client().request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn forwards_requests_carrying_a_valid_bearer_token() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_server(
+        Router::new()
+            .fallback(any(capture_request))
+            .with_state(Arc::clone(&captured)),
+    )
+    .await;
+    let gateway = spawn_gateway_with_auth(
+        upstream.addr,
+        GatewayAuth::RequireToken(Arc::new(store)),
+    )
+    .await;
+    let request = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .header("host", "public-gateway.example")
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-client-test", "authorized")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = client().request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(captured.lock().unwrap().is_some());
 }
