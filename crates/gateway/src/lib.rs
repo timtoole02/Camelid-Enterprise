@@ -6,7 +6,7 @@
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::{CONNECTION, CONTENT_TYPE, HOST};
+use axum::http::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, WWW_AUTHENTICATE};
 use axum::http::uri::{Authority, Scheme};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -16,6 +16,7 @@ use http_body::{Body as HttpBody, Frame, SizeHint};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
+use identity::{IdentityError, PrincipalId, SqliteIdentityStore, TokenStore};
 use pin_project_lite::pin_project;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -102,10 +103,27 @@ struct GatewayState {
     upstream: UpstreamOrigin,
     client: Client<HttpConnector, Body>,
     admission: Arc<Semaphore>,
+    auth: GatewayAuth,
+}
+
+/// Whether the gateway requires every request to carry a bearer token that
+/// resolves to a known principal before it is forwarded upstream.
+///
+/// [`GatewayAuth::Disabled`] preserves the gateway's original transparent
+/// behavior unchanged: nothing about existing deployments breaks until an
+/// operator opts in by supplying an identity database.
+#[derive(Clone)]
+pub enum GatewayAuth {
+    Disabled,
+    RequireToken(Arc<SqliteIdentityStore>),
 }
 
 pub fn router(upstream: UpstreamOrigin) -> Router {
     router_with_max_in_flight(upstream, DEFAULT_MAX_IN_FLIGHT)
+}
+
+pub fn router_with_max_in_flight(upstream: UpstreamOrigin, max_in_flight: NonZeroUsize) -> Router {
+    router_with_options(upstream, max_in_flight, GatewayAuth::Disabled)
 }
 
 // This route table is a hand-maintained mirror of the pinned engine's public
@@ -113,7 +131,11 @@ pub fn router(upstream: UpstreamOrigin) -> Router {
 // tested inventory once it lands). If the pinned engine adds, removes, or
 // renames a public route, this list must be updated by hand: nothing today
 // verifies the gateway's allowlist and the replica's actual contract agree.
-pub fn router_with_max_in_flight(upstream: UpstreamOrigin, max_in_flight: NonZeroUsize) -> Router {
+pub fn router_with_options(
+    upstream: UpstreamOrigin,
+    max_in_flight: NonZeroUsize,
+    auth: GatewayAuth,
+) -> Router {
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
     connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
@@ -137,15 +159,17 @@ pub fn router_with_max_in_flight(upstream: UpstreamOrigin, max_in_flight: NonZer
         .route("/v1/reranking", post(proxy))
         // CORS preflight (`OPTIONS` with `Access-Control-Request-Method`) is
         // answered locally by this layer, before the request ever reaches a
-        // route handler: it does not consume an admission permit or contact
-        // the replica. Real cross-origin, non-safelisted requests (for
-        // example `POST` with `Content-Type: application/json`) get a
-        // complete preflight response, not just `Access-Control-Allow-Origin`.
+        // route handler: it does not consume an admission permit, run
+        // authentication, or contact the replica. Real cross-origin,
+        // non-safelisted requests (for example `POST` with
+        // `Content-Type: application/json`) get a complete preflight
+        // response, not just `Access-Control-Allow-Origin`.
         .layer(CorsLayer::permissive())
         .with_state(GatewayState {
             upstream,
             client,
             admission: Arc::new(Semaphore::new(max_in_flight.get())),
+            auth,
         })
 }
 
@@ -154,6 +178,20 @@ async fn gateway_health() -> StatusCode {
 }
 
 async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Response {
+    // Authentication runs before admission is checked. Otherwise an
+    // unauthenticated flood would consume in-flight permits (and the SQLite
+    // lookup time behind each one) meant for legitimate authenticated
+    // traffic before ever being rejected; a request that fails auth must
+    // never take a permit at all.
+    if let GatewayAuth::RequireToken(store) = &state.auth {
+        match authenticate(store, request.headers()).await {
+            Ok(principal) => {
+                request.extensions_mut().insert(principal);
+            }
+            Err(response) => return response,
+        }
+    }
+
     let permit = match Arc::clone(&state.admission).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
@@ -264,6 +302,66 @@ fn gateway_error(status: StatusCode, message: &'static str) -> Response {
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+}
+
+/// Resolves the request's bearer token to a principal, or returns the exact
+/// response the gateway should send back without forwarding anything upstream.
+async fn authenticate(
+    store: &Arc<SqliteIdentityStore>,
+    headers: &HeaderMap,
+) -> Result<PrincipalId, Response> {
+    let Some(token) = bearer_token(headers) else {
+        return Err(unauthorized("missing bearer token"));
+    };
+    let store = Arc::clone(store);
+    let token = token.to_string();
+    let resolved = tokio::task::spawn_blocking(move || store.resolve(&token))
+        .await
+        .expect("identity resolution task panicked");
+
+    resolved.map_err(|error| match error {
+        IdentityError::InvalidToken => unauthorized("invalid bearer token"),
+        IdentityError::Storage(message) => {
+            tracing::error!(%message, "identity store error while authenticating request");
+            gateway_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "gateway could not verify the bearer token",
+            )
+        }
+    })
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    // RFC 7235 defines the auth-scheme token ("Bearer") as case-insensitive;
+    // some clients and SDKs send `bearer` or `BEARER`. Match accordingly and
+    // tolerate any amount of whitespace between the scheme and the token.
+    let (scheme, rest) = value.split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim();
+    (!token.is_empty()).then_some(token)
+}
+
+fn unauthorized(message: &'static str) -> Response {
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "unauthorized"
+            }
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+        .headers_mut()
+        .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
     response
 }
 
@@ -426,5 +524,49 @@ mod tests {
         remove_hop_by_hop(&mut headers);
 
         assert!(!headers.contains_key("x-private"));
+    }
+
+    #[test]
+    fn bearer_token_matches_the_scheme_case_insensitively() {
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("{scheme} secret-token")).unwrap(),
+            );
+            assert_eq!(
+                bearer_token(&headers),
+                Some("secret-token"),
+                "scheme {scheme}"
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_token_tolerates_extra_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer    secret-token   "),
+        );
+        assert_eq!(bearer_token(&headers), Some("secret-token"));
+    }
+
+    #[test]
+    fn bearer_token_rejects_other_schemes_and_missing_headers() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(bearer_token(&headers), None);
+
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(bearer_token(&headers), None);
+
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer"));
+        assert_eq!(bearer_token(&headers), None);
+
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer   "));
+        assert_eq!(bearer_token(&headers), None);
     }
 }

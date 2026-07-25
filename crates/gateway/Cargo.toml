@@ -17,6 +17,7 @@ fastrand = "2"
 http-body = "1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "server-graceful", "service", "tokio"] }
+identity.workspace = true
 pin-project-lite = "0.2"
 serde_json.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }

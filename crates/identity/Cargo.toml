@@ -1,0 +1,19 @@
+[package]
+name = "camelid-enterprise-identity"
+description = "Local identity primitive for Camelid Enterprise: resolves opaque API tokens to opaque principal ids, backed by SQLite."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "identity"
+path = "src/lib.rs"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+getrandom = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true
