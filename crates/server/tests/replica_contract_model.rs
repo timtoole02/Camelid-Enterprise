@@ -162,7 +162,7 @@ async fn real_model_conforms_to_replica_http_v1() {
         .starts_with("text/event-stream"));
     let bytes = tokio::time::timeout(STEP_TIMEOUT, to_bytes(stream.into_body(), 16 * 1024 * 1024))
         .await
-        .expect("replica SSE body exceeded 300 seconds")
+        .expect("replica SSE body exceeded 900 seconds")
         .unwrap();
     let stream = String::from_utf8(bytes.to_vec()).unwrap();
     let events: Vec<&str> = stream
@@ -175,7 +175,14 @@ async fn real_model_conforms_to_replica_http_v1() {
         serde_json::from_str::<Value>(event).expect("every data event before [DONE] is JSON");
     }
 
-    const CONCURRENT_REQUESTS: usize = 16;
+    // 12, not 16: this must comfortably exceed the engine's admission
+    // capacity (observed at 9 elsewhere in this suite) so both the accepted
+    // and rejected branches below are exercised, while keeping the total
+    // serialized decode queue as short as the assertions allow. Constrained
+    // CI hardware pays for every admitted request's decode sequentially
+    // (the deterministic lane serializes generation), so queue depth is the
+    // single biggest lever on this test's wall-clock cost.
+    const CONCURRENT_REQUESTS: usize = 12;
     let mut requests = tokio::task::JoinSet::new();
     for index in 0..CONCURRENT_REQUESTS {
         let app = app.clone();
@@ -192,7 +199,11 @@ async fn real_model_conforms_to_replica_http_v1() {
                             "content": format!("Count briefly: {index}")
                         }],
                         "temperature": 0,
-                        "max_tokens": 8,
+                        // Minimal: this section only needs to prove
+                        // admission/rejection/attribution/recovery, not
+                        // generation quality. Every extra token here is paid
+                        // for once per admitted request, serialized.
+                        "max_tokens": 2,
                         "stream": false
                     }),
                 ),
