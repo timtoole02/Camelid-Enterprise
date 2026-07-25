@@ -92,6 +92,17 @@ pub enum GatewayAuth {
     RequireToken(Arc<SqliteIdentityStore>),
 }
 
+// Merge-order constraint for the pending admission-control rebase:
+//
+// This branch is cut from `main` before admission control (a bounded
+// in-flight semaphore, tracked in the separate gateway-hardening PR) lands.
+// When this branch rebases onto that work, authentication here must run
+// *before* the admission permit is acquired: otherwise an unauthenticated
+// flood consumes permits (and the SQLite lookup time behind each one) before
+// ever being rejected, starving legitimate authenticated traffic. Any local
+// health-check route that work introduces (e.g. `/healthz`) must also stay
+// exempt from this auth check, the way it stays exempt from admission.
+
 pub fn router(upstream: UpstreamOrigin, auth: GatewayAuth) -> Router {
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
@@ -191,11 +202,16 @@ async fn authenticate(
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    // RFC 7235 defines the auth-scheme token ("Bearer") as case-insensitive;
+    // some clients and SDKs send `bearer` or `BEARER`. Match accordingly and
+    // tolerate any amount of whitespace between the scheme and the token.
+    let (scheme, rest) = value.split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim();
+    (!token.is_empty()).then_some(token)
 }
 
 fn unauthorized(message: &'static str) -> Response {
@@ -311,5 +327,49 @@ mod tests {
         remove_hop_by_hop(&mut headers);
 
         assert!(!headers.contains_key("x-private"));
+    }
+
+    #[test]
+    fn bearer_token_matches_the_scheme_case_insensitively() {
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("{scheme} secret-token")).unwrap(),
+            );
+            assert_eq!(
+                bearer_token(&headers),
+                Some("secret-token"),
+                "scheme {scheme}"
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_token_tolerates_extra_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer    secret-token   "),
+        );
+        assert_eq!(bearer_token(&headers), Some("secret-token"));
+    }
+
+    #[test]
+    fn bearer_token_rejects_other_schemes_and_missing_headers() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(bearer_token(&headers), None);
+
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(bearer_token(&headers), None);
+
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer"));
+        assert_eq!(bearer_token(&headers), None);
+
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer   "));
+        assert_eq!(bearer_token(&headers), None);
     }
 }

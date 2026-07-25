@@ -19,7 +19,7 @@ use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// Opaque identifier for a principal (today: exactly one user per token).
 ///
@@ -102,7 +102,26 @@ impl SqliteIdentityStore {
     /// Opens (creating if absent) the identity database at `path` and ensures
     /// its schema exists.
     pub fn open(path: &Path) -> Result<Self, IdentityError> {
-        Self::from_connection(Connection::open(path)?)
+        let conn = Connection::open(path)?;
+        // WAL lets `serve`'s long-lived auth-lookup connection and a
+        // short-lived CLI process (create-user/issue-token/revoke-token)
+        // touch the same database file concurrently without one blocking on
+        // the other's rollback-journal lock. rusqlite already sets a
+        // 5-second `sqlite3_busy_timeout` on every connection it opens, so a
+        // transient conflict under either journal mode retries before
+        // failing, not on it. SQLite silently keeps the prior mode instead of
+        // erroring if WAL cannot be enabled (e.g. certain network
+        // filesystems), so check the mode it actually reports back rather
+        // than assuming the pragma took effect.
+        let mode: String =
+            conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(IdentityError::Storage(format!(
+                "identity database at {} could not be switched to WAL journal mode (reported: {mode})",
+                path.display()
+            )));
+        }
+        Self::from_connection(conn)
     }
 
     /// In-memory store. For tests and single-process smoke checks only:
@@ -113,7 +132,8 @@ impl SqliteIdentityStore {
 
     fn from_connection(conn: Connection) -> Result<Self, IdentityError> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS users (
+            "PRAGMA foreign_keys = ON;
+            CREATE TABLE IF NOT EXISTS users (
                 principal_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 created_at_unix INTEGER NOT NULL
@@ -130,11 +150,29 @@ impl SqliteIdentityStore {
         })
     }
 
+    /// Locks the store's connection, recovering from poisoning instead of
+    /// propagating it.
+    ///
+    /// A `std::sync::Mutex` never un-poisons itself once a panic occurs while
+    /// it is held. Propagating that poisoning here would mean one unrelated
+    /// panic during any identity operation permanently breaks every later
+    /// one for the life of the process — in the gateway, that means every
+    /// request fails once this lock is poisoned, until restart. Every
+    /// operation in this file executes one self-contained statement (or a
+    /// `SELECT` immediately followed by one `INSERT`/`DELETE`) and holds no
+    /// transaction state across calls, so reusing a guard recovered from a
+    /// poisoned lock is safe.
+    fn locked_connection(&self) -> MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Creates a user and returns its opaque [`PrincipalId`]. `name` is a
     /// display label only; it is never used as a lookup key.
     pub fn create_user(&self, name: &str) -> Result<PrincipalId, IdentityError> {
         let principal = PrincipalId(random_id("usr"));
-        let conn = self.conn.lock().expect("identity connection poisoned");
+        let conn = self.locked_connection();
         conn.execute(
             "INSERT INTO users (principal_id, name, created_at_unix) VALUES (?1, ?2, ?3)",
             rusqlite::params![principal.0, name, unix_now()],
@@ -147,7 +185,7 @@ impl SqliteIdentityStore {
     /// its SHA-256 hash is persisted, so a stolen database backup cannot be
     /// used to authenticate.
     pub fn issue_token(&self, principal: &PrincipalId) -> Result<String, IdentityError> {
-        let conn = self.conn.lock().expect("identity connection poisoned");
+        let conn = self.locked_connection();
         let exists: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM users WHERE principal_id = ?1",
@@ -172,7 +210,7 @@ impl SqliteIdentityStore {
 
     /// Revokes a token. A no-op if the token was already invalid.
     pub fn revoke_token(&self, token: &str) -> Result<(), IdentityError> {
-        let conn = self.conn.lock().expect("identity connection poisoned");
+        let conn = self.locked_connection();
         conn.execute(
             "DELETE FROM tokens WHERE token_hash = ?1",
             rusqlite::params![hash_token(token)],
@@ -183,7 +221,7 @@ impl SqliteIdentityStore {
 
 impl TokenStore for SqliteIdentityStore {
     fn resolve(&self, token: &str) -> Result<PrincipalId, IdentityError> {
-        let conn = self.conn.lock().expect("identity connection poisoned");
+        let conn = self.locked_connection();
         let principal_id: Option<String> = conn
             .query_row(
                 "SELECT principal_id FROM tokens WHERE token_hash = ?1",
@@ -262,6 +300,27 @@ mod tests {
         store.revoke_token("cme_never-issued").unwrap();
     }
 
+    /// `open` asks SQLite for WAL mode explicitly (rather than assuming the
+    /// pragma took effect) so a concurrent CLI process and a running `serve`
+    /// can touch the same file without contending for the default
+    /// rollback-journal lock. Prove it actually switches on a real file, not
+    /// just that the call returns `Ok`.
+    #[test]
+    fn opening_a_file_backed_store_enables_wal_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.sqlite");
+
+        let store = SqliteIdentityStore::open(&path).unwrap();
+
+        let mode: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+    }
+
     #[test]
     fn issuing_a_token_for_an_unknown_principal_fails() {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
@@ -299,6 +358,30 @@ mod tests {
             .unwrap();
         assert_ne!(stored_hash, token);
         assert_eq!(stored_hash, hash_token(&token));
+    }
+
+    /// A `std::sync::Mutex` never un-poisons itself once a panic occurs while
+    /// it is held. Giving up on a poisoned lock would permanently break every
+    /// identity operation for the life of the process. Prove recovery works:
+    /// poison the store's connection lock exactly like a panicking holder
+    /// would, then confirm the store keeps working afterward.
+    #[test]
+    fn store_survives_a_poisoned_lock() {
+        let store = std::sync::Arc::new(SqliteIdentityStore::open_in_memory().unwrap());
+        let principal = store.create_user("ada").unwrap();
+
+        let poison_store = std::sync::Arc::clone(&store);
+        let poison_thread = std::thread::spawn(move || {
+            let _guard = poison_store.conn.lock().unwrap();
+            panic!("deliberately poisoning the identity connection lock for this test");
+        });
+        assert!(
+            poison_thread.join().is_err(),
+            "the poisoning thread must have panicked"
+        );
+
+        let token = store.issue_token(&principal).unwrap();
+        assert_eq!(store.resolve(&token).unwrap(), principal);
     }
 
     #[test]

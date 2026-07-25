@@ -382,11 +382,8 @@ async fn forwards_requests_carrying_a_valid_bearer_token() {
             .with_state(Arc::clone(&captured)),
     )
     .await;
-    let gateway = spawn_gateway_with_auth(
-        upstream.addr,
-        GatewayAuth::RequireToken(Arc::new(store)),
-    )
-    .await;
+    let gateway =
+        spawn_gateway_with_auth(upstream.addr, GatewayAuth::RequireToken(Arc::new(store))).await;
     let request = Request::get(format!("http://{}/v1/models", gateway.addr))
         .header("host", "public-gateway.example")
         .header("authorization", format!("Bearer {token}"))

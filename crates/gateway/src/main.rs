@@ -2,7 +2,7 @@ use camelid_enterprise_gateway::{router, GatewayAuth, UpstreamOrigin};
 use clap::{Parser, Subcommand};
 use identity::{PrincipalId, SqliteIdentityStore};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -51,6 +51,10 @@ enum Command {
     RevokeToken {
         #[arg(long, env = "CAMELID_GATEWAY_IDENTITY_DB")]
         identity_db: PathBuf,
+        /// The token to revoke, or `-` to read it from stdin instead.
+        /// Passing the plaintext token directly on the command line leaves
+        /// it in shell history and briefly visible to other processes via
+        /// `ps`; prefer `-` and pipe it in.
         token: String,
     },
 }
@@ -85,6 +89,12 @@ async fn serve(
     let auth = match identity_db {
         Some(path) => {
             tracing::info!(path = %path.display(), "gateway auth enforcement enabled");
+            tracing::warn!(
+                "bearer tokens are sent as plain HTTP headers; this gateway does not \
+                 terminate TLS. Put a TLS-terminating ingress/reverse proxy (or mTLS) in \
+                 front of it, or restrict --addr to a trusted network, or a captured \
+                 token can be replayed indefinitely (tokens do not expire yet)."
+            );
             GatewayAuth::RequireToken(Arc::new(SqliteIdentityStore::open(&path)?))
         }
         None => {
@@ -102,24 +112,38 @@ async fn serve(
     Ok(())
 }
 
-fn create_user(identity_db: &PathBuf, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn create_user(identity_db: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let store = SqliteIdentityStore::open(identity_db)?;
     let principal = store.create_user(name)?;
     println!("{principal}");
     Ok(())
 }
 
-fn issue_token(identity_db: &PathBuf, principal: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn issue_token(identity_db: &Path, principal: &str) -> Result<(), Box<dyn std::error::Error>> {
     let store = SqliteIdentityStore::open(identity_db)?;
     let token = store.issue_token(&PrincipalId::new(principal.to_string()))?;
     println!("{token}");
     Ok(())
 }
 
-fn revoke_token(identity_db: &PathBuf, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn revoke_token(identity_db: &Path, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let token = read_secret_arg(token)?;
     let store = SqliteIdentityStore::open(identity_db)?;
-    store.revoke_token(token)?;
+    store.revoke_token(&token)?;
     Ok(())
+}
+
+/// Reads a secret CLI argument, treating the literal value `-` as "read one
+/// line from stdin instead". A secret passed directly as an argv value sits
+/// in shell history and is briefly visible to other local processes via
+/// `ps`; `-` avoids both.
+fn read_secret_arg(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if value != "-" {
+        return Ok(value.to_string());
+    }
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
 async fn shutdown_signal() {

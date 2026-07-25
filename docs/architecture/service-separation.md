@@ -213,8 +213,23 @@ tokens for one model"; everything multi-user is layered on top.
   typed `401` before it reaches a replica; omitting the flag keeps the
   gateway's original unauthenticated pass-through unchanged. `create-user`,
   `issue-token`, and `revoke-token` subcommands manage the local database.
-  Still missing: no way to require auth by default, no per-request identity
-  reaching receipts, no routing or quotas.
+  **Bearer tokens are only as safe as the transport they travel over:** this
+  gateway does not terminate TLS, tokens do not expire, and a plaintext HTTP
+  hop lets any on-path observer capture and replay one indefinitely. Enabling
+  `--identity-db` without a TLS-terminating ingress/reverse proxy (or mTLS, or
+  a genuinely trusted private network) in front of it is not a secure
+  deployment; the gateway logs a warning to this effect at startup. Still
+  missing: no way to require auth by default, no token expiry/rotation, no
+  per-request identity reaching receipts, no routing or quotas.
+
+   **Rebase hazard:** this work is cut from `main` before admission control
+   (a bounded in-flight semaphore) lands in the separate gateway-hardening
+   PR. When rebased onto that work, the auth check must run *before* the
+   admission permit is acquired — otherwise an unauthenticated flood consumes
+   permits (and the SQLite lookup time behind each one) before ever being
+   rejected, starving legitimate authenticated traffic — and any local
+   health-check route that work introduces must stay exempt from auth the
+   way it stays exempt from admission.
 4. **Multi-user routing & quotas — not started.** Gateway routes by model and
   enforces per-user/per-org limits; usage metering begins. Still no state in
   replicas.
