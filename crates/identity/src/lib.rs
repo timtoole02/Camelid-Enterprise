@@ -19,6 +19,25 @@
 //! secret in one transaction. Both are opt-in and neither changes what an
 //! existing credential does: a token issued without an expiry never expires,
 //! which is exactly what every token issued before this existed already did.
+//!
+//! Three bounds on that, none of them accidental:
+//!
+//! - Expiry is evaluated against the local system clock, so a clock moved
+//!   backwards extends every outstanding token by the size of the move.
+//!   Revocation consults no clock and is the control that does not share this
+//!   property.
+//! - Rotation needs the plaintext of the token being replaced, so it is
+//!   reachable only by something holding that credential -- today, an operator
+//!   at the machine running the CLI. There is no remote refresh: a client that
+//!   is told its token expired cannot obtain a replacement over the network.
+//! - Lapsed tokens are not collected. An expired row stays until it is rotated
+//!   or its membership is removed, and [`SqliteIdentityStore::resolve_context`]
+//!   keeps finding it in order to report [`IdentityError::ExpiredToken`]
+//!   rather than a misleading [`IdentityError::InvalidToken`]. Short lifetimes
+//!   therefore accumulate rows. That is a deliberate trade -- an accurate
+//!   refusal over a self-pruning table -- and sweeping them is left to a later
+//!   change with a policy behind it, not folded into the read path where it
+//!   would let anyone force a write by replaying a dead token.
 
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -283,7 +302,7 @@ impl SqliteIdentityStore {
         let principal = PrincipalId(random_id("usr"));
         let organization = OrganizationId(random_organization_id());
         let mut conn = self.locked_connection();
-        let transaction = conn.transaction()?;
+        let transaction = begin_write(&mut conn)?;
         let now = unix_now();
         transaction.execute(
             "INSERT INTO users (principal_id, name, created_at_unix) VALUES (?1, ?2, ?3)",
@@ -321,7 +340,7 @@ impl SqliteIdentityStore {
     ) -> Result<PrincipalId, IdentityError> {
         let principal = PrincipalId(random_id("usr"));
         let mut conn = self.locked_connection();
-        let transaction = conn.transaction()?;
+        let transaction = begin_write(&mut conn)?;
         require_organization(&transaction, organization)?;
         let now = unix_now();
         transaction.execute(
@@ -344,7 +363,7 @@ impl SqliteIdentityStore {
         organization: &OrganizationId,
     ) -> Result<(), IdentityError> {
         let mut conn = self.locked_connection();
-        let transaction = conn.transaction()?;
+        let transaction = begin_write(&mut conn)?;
         require_organization(&transaction, organization)?;
         let principal_exists: Option<i64> = transaction
             .query_row(
@@ -402,7 +421,7 @@ impl SqliteIdentityStore {
         organization: &OrganizationId,
     ) -> Result<(), IdentityError> {
         let mut conn = self.locked_connection();
-        let transaction = conn.transaction()?;
+        let transaction = begin_write(&mut conn)?;
         if !principal_exists(&transaction, principal)? {
             return Err(IdentityError::UnknownPrincipal);
         }
@@ -435,7 +454,7 @@ impl SqliteIdentityStore {
         expires_at_unix: Option<i64>,
     ) -> Result<String, IdentityError> {
         let mut conn = self.locked_connection();
-        let transaction = conn.transaction()?;
+        let transaction = begin_write(&mut conn)?;
         let organizations: Vec<String> = {
             let mut statement = transaction.prepare(
                 "SELECT organization_id FROM organization_memberships WHERE principal_id = ?1 ORDER BY organization_id",
@@ -479,7 +498,7 @@ impl SqliteIdentityStore {
         expires_at_unix: Option<i64>,
     ) -> Result<String, IdentityError> {
         let mut conn = self.locked_connection();
-        let transaction = conn.transaction()?;
+        let transaction = begin_write(&mut conn)?;
         let token =
             issue_token_in_transaction(&transaction, principal, organization, expires_at_unix)?;
         transaction.commit()?;
@@ -506,7 +525,7 @@ impl SqliteIdentityStore {
         expires_at_unix: Option<i64>,
     ) -> Result<String, IdentityError> {
         let mut conn = self.locked_connection();
-        let transaction = conn.transaction()?;
+        let transaction = begin_write(&mut conn)?;
         // An expired token cannot buy a live one. Otherwise expiry would bound
         // only the credential rather than the access it grants, and any lapsed
         // token would remain a permanent key to a new one.
@@ -515,10 +534,21 @@ impl SqliteIdentityStore {
         let organization = OrganizationId(credential.organization_id);
         let replacement =
             issue_token_in_transaction(&transaction, &principal, &organization, expires_at_unix)?;
-        transaction.execute(
+        let retired = transaction.execute(
             "DELETE FROM tokens WHERE token_hash = ?1",
             rusqlite::params![hash_token(token)],
         )?;
+        // The lookup above already proved this row exists and this transaction
+        // holds the write lock, so this cannot currently be anything but 1.
+        // It is asserted rather than assumed because the invariant -- that a
+        // rotation retires exactly the credential it replaced, no more and no
+        // fewer -- is the reason a caller can trust the operation at all, and
+        // a future change that broke it would otherwise do so silently.
+        if retired != 1 {
+            return Err(IdentityError::Storage(format!(
+                "rotation retired {retired} tokens instead of exactly 1"
+            )));
+        }
         transaction.commit()?;
         Ok(replacement)
     }
@@ -665,28 +695,80 @@ fn issue_token_in_transaction(
     Ok(token)
 }
 
+/// Brings the database up to [`IDENTITY_SCHEMA_VERSION`], or confirms it is
+/// already there.
+///
+/// Every path through here is a read-then-write: decide what the schema is,
+/// then change it. That decision is made while *holding* the write lock rather
+/// than before asking for it, and the distinction is the whole correctness
+/// argument. This crate is explicitly built for a long-lived `serve` process
+/// and a short-lived CLI process sharing one database file, and a database in
+/// the field is already in WAL mode -- the journal-mode switch in
+/// [`SqliteIdentityStore::open`] put it there, so it no longer serializes
+/// openers the way it does on a not-yet-WAL file. Two processes therefore
+/// reach an unmigrated database at the same instant routinely. Deciding first
+/// and locking second lets both act on the same stale answer, and the loser
+/// fails to start: a duplicate column on either migration step, or
+/// `SQLITE_BUSY` from a deferred transaction's write upgrade -- an upgrade the
+/// busy handler deliberately does not retry.
+///
+/// The whole chain runs in that one transaction, so an upgrade is atomic
+/// across every step it traverses. A database is either fully migrated or
+/// untouched; it is never stranded between two versions by a failure partway.
 fn initialize_schema(conn: &mut Connection) -> Result<(), IdentityError> {
-    let schema_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    match schema_version {
-        0 => initialize_unversioned_database(conn),
-        // Each step is applied in its own transaction and commits its own
-        // version stamp, so a database that fails partway through the chain is
-        // left at the last version that fully applied rather than at one that
-        // half did.
-        1 => {
-            migrate_v1_to_v2(conn)?;
-            migrate_v2_to_v3(conn)
-        }
-        2 => migrate_v2_to_v3(conn),
-        3 => validate_v3_schema(conn),
-        _ => Err(IdentityError::UnsupportedSchemaVersion {
-            found: schema_version,
-            supported: IDENTITY_SCHEMA_VERSION,
-        }),
+    // Nothing to do is the overwhelmingly common case -- every open after the
+    // first -- and it needs no write lock at all. Taking one unconditionally
+    // would serialize every process start against every other for no reason.
+    if schema_version(conn)? == IDENTITY_SCHEMA_VERSION {
+        return validate_v3_schema(conn);
     }
+
+    let transaction = begin_write(conn)?;
+    // Re-read under the lock: another process may have migrated between the
+    // check above and this `BEGIN`, in which case the version below is already
+    // current and its arm does nothing.
+    match schema_version(&transaction)? {
+        0 => initialize_unversioned_database(&transaction)?,
+        1 => {
+            migrate_v1_to_v2(&transaction)?;
+            migrate_v2_to_v3(&transaction)?;
+        }
+        2 => migrate_v2_to_v3(&transaction)?,
+        3 => validate_v3_schema(&transaction)?,
+        found => {
+            return Err(IdentityError::UnsupportedSchemaVersion {
+                found,
+                supported: IDENTITY_SCHEMA_VERSION,
+            })
+        }
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
-fn initialize_unversioned_database(conn: &mut Connection) -> Result<(), IdentityError> {
+fn schema_version(conn: &Connection) -> Result<i64, IdentityError> {
+    Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
+}
+
+/// Begins a transaction that takes the write lock at `BEGIN` rather than on
+/// its first write.
+///
+/// Every write path in this store reads before it writes -- resolve a
+/// membership, check a principal exists, look a credential up -- and then
+/// writes based on what it read. A deferred transaction acquires only a read
+/// lock for that first step and tries to upgrade later, and in WAL mode that
+/// upgrade fails with `SQLITE_BUSY` the moment another writer has committed in
+/// between. The busy handler does not retry a write upgrade, so `busy_timeout`
+/// does not save it: the operation simply fails.
+///
+/// Taking the lock up front turns that failure into a wait. Contention becomes
+/// a slower call instead of an error a caller has to know how to retry, and
+/// the value each path read is guaranteed still to hold when it writes.
+fn begin_write(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>, IdentityError> {
+    Ok(conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?)
+}
+
+fn initialize_unversioned_database(conn: &Connection) -> Result<(), IdentityError> {
     let users_exists = table_exists(conn, "users")?;
     let tokens_exists = table_exists(conn, "tokens")?;
     let organizations_exists = table_exists(conn, "organizations")?;
@@ -697,11 +779,7 @@ fn initialize_unversioned_database(conn: &mut Connection) -> Result<(), Identity
         organizations_exists,
         memberships_exist,
     ) {
-        (false, false, false, false) => {
-            create_schema_v3(conn)?;
-            conn.pragma_update(None, "user_version", IDENTITY_SCHEMA_VERSION)?;
-            Ok(())
-        }
+        (false, false, false, false) => create_schema_v3(conn),
         (true, true, false, false) => {
             migrate_v1_to_v2(conn)?;
             migrate_v2_to_v3(conn)
@@ -744,7 +822,8 @@ fn create_schema_v3(conn: &Connection) -> Result<(), IdentityError> {
                 ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_tokens_principal ON tokens(principal_id);
-        CREATE INDEX IF NOT EXISTS idx_memberships_principal ON organization_memberships(principal_id);",
+        CREATE INDEX IF NOT EXISTS idx_memberships_principal ON organization_memberships(principal_id);
+        PRAGMA user_version = 3;",
     )?;
     Ok(())
 }
@@ -753,29 +832,20 @@ fn create_schema_v3(conn: &Connection) -> Result<(), IdentityError> {
 /// "never expires" — the behavior those tokens were issued under. A migration
 /// must not silently start expiring credentials that are in use.
 ///
-/// Takes the write lock at `BEGIN` and re-reads the schema version inside it.
-/// This crate is explicitly built for a long-lived `serve` process and a
-/// short-lived CLI process sharing one database, so two of them can reach an
-/// unmigrated file at the same moment. Without the recheck both would read
-/// version 2 outside any transaction and the loser would fail on a duplicate
-/// column, turning a supported concurrency into a startup error.
-fn migrate_v2_to_v3(conn: &mut Connection) -> Result<(), IdentityError> {
-    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let schema_version: i64 =
-        transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if schema_version >= IDENTITY_SCHEMA_VERSION {
-        return Ok(());
-    }
-    transaction.execute_batch(
+/// A step inside the caller's write transaction; see [`initialize_schema`].
+fn migrate_v2_to_v3(conn: &Connection) -> Result<(), IdentityError> {
+    conn.execute_batch(
         "ALTER TABLE tokens ADD COLUMN expires_at_unix INTEGER;
          PRAGMA user_version = 3;",
     )?;
-    transaction.commit()?;
     Ok(())
 }
 
-fn migrate_v1_to_v2(conn: &mut Connection) -> Result<(), IdentityError> {
-    let transaction = conn.transaction()?;
+/// Gives every legacy principal a personal organization and rewrites its
+/// tokens to be scoped to it.
+///
+/// A step inside the caller's write transaction; see [`initialize_schema`].
+fn migrate_v1_to_v2(transaction: &Connection) -> Result<(), IdentityError> {
     let orphaned_principal: Option<String> = transaction
         .query_row(
             "SELECT tokens.principal_id
@@ -849,7 +919,6 @@ fn migrate_v1_to_v2(conn: &mut Connection) -> Result<(), IdentityError> {
         CREATE INDEX idx_memberships_principal ON organization_memberships(principal_id);
         PRAGMA user_version = 2;",
     )?;
-    transaction.commit()?;
     Ok(())
 }
 
@@ -873,7 +942,27 @@ fn validate_v3_schema(conn: &Connection) -> Result<(), IdentityError> {
     ] {
         conn.prepare(query)?;
     }
-    Ok(())
+    // That the column exists is not the claim this schema makes; that it is
+    // nullable is. `NULL` is how a non-expiring token is stored, so a `NOT
+    // NULL` version of this column would force every issuance to invent an
+    // expiry date -- precisely the design this rejected.
+    let expiry_is_nullable: Option<bool> = conn
+        .query_row(
+            "SELECT \"notnull\" = 0 FROM pragma_table_info('tokens') WHERE name = 'expires_at_unix'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match expiry_is_nullable {
+        Some(true) => Ok(()),
+        Some(false) => Err(IdentityError::MigrationIntegrity(
+            "tokens.expires_at_unix must be nullable: NULL is how a non-expiring token is stored"
+                .into(),
+        )),
+        None => Err(IdentityError::MigrationIntegrity(
+            "tokens table has no expires_at_unix column".into(),
+        )),
+    }
 }
 
 fn require_organization(
@@ -923,11 +1012,18 @@ fn to_hex(bytes: &[u8]) -> String {
 /// asserting that its clock and this one agree, and that assertion is better
 /// made explicit than assumed. [`expires_in`] covers the ordinary case of a
 /// lifetime starting now.
+///
+/// Total, deliberately. A clock set before 1970 yields a negative instant,
+/// which still orders correctly against any stored expiry, and one set
+/// absurdly far forward saturates. Neither is a reason for a function on an
+/// authentication path to abort the process.
 pub fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is before the Unix epoch")
-        .as_secs() as i64
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(since_epoch) => i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
+        Err(before_epoch) => i64::try_from(before_epoch.duration().as_secs())
+            .map(|seconds| -seconds)
+            .unwrap_or(i64::MIN),
+    }
 }
 
 #[cfg(test)]
@@ -1657,9 +1753,107 @@ mod tests {
         );
     }
 
-    #[test]
-    fn concurrent_openers_never_observe_a_half_migrated_database() {
+    /// Writes an unversioned (`user_version` 0) legacy identity database:
+    /// users and principal-scoped tokens, no organizations.
+    ///
+    /// WAL for the same reason [`write_v2_database`] is.
+    fn write_legacy_database(path: &std::path::Path, principal: &PrincipalId, token: &str) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE users (
+                    principal_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    created_at_unix INTEGER NOT NULL
+                 );
+                 CREATE TABLE tokens (
+                    token_hash TEXT PRIMARY KEY,
+                    principal_id TEXT NOT NULL REFERENCES users(principal_id),
+                    created_at_unix INTEGER NOT NULL
+                 );
+                 CREATE INDEX idx_tokens_principal ON tokens(principal_id);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO users (principal_id, name, created_at_unix) VALUES (?1, 'ada', 1)",
+                rusqlite::params![principal.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tokens (token_hash, principal_id, created_at_unix) VALUES (?1, ?2, 1)",
+                rusqlite::params![hash_token(token), principal.as_str()],
+            )
+            .unwrap();
+    }
+
+    /// Opens `path` from 16 threads released together and returns every
+    /// outcome. Schema initialization is the one moment all processes contend
+    /// for the same write, so it is the one worth driving from more than one.
+    fn open_concurrently(
+        path: &std::path::Path,
+    ) -> Vec<Result<SqliteIdentityStore, IdentityError>> {
         const OPENERS: usize = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+        let mut threads = Vec::new();
+        for _ in 0..OPENERS {
+            let path = path.to_path_buf();
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                SqliteIdentityStore::open(&path)
+            }));
+        }
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect()
+    }
+
+    /// Requires every opener to have succeeded and to see a fully migrated
+    /// database, reporting the first failure's error rather than a bare panic.
+    ///
+    /// All of them, not merely one: schema initialization happens during
+    /// startup, so an opener turned away here is a process that failed to
+    /// boot. A weaker assertion would pass while most of a deployment is
+    /// crash-looping.
+    fn assert_all_opened(
+        outcomes: Vec<Result<SqliteIdentityStore, IdentityError>>,
+    ) -> Vec<SqliteIdentityStore> {
+        let total = outcomes.len();
+        let mut stores = Vec::with_capacity(total);
+        let mut failures = Vec::new();
+        for outcome in outcomes {
+            match outcome {
+                Ok(store) => stores.push(store),
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {total} openers failed; first: {}",
+            failures.len(),
+            failures[0]
+        );
+        for store in &stores {
+            assert_eq!(
+                store
+                    .locked_connection()
+                    .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                IDENTITY_SCHEMA_VERSION
+            );
+        }
+        stores
+    }
+
+    #[test]
+    fn concurrent_openers_all_migrate_a_v2_database() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("identity.sqlite");
         let principal = PrincipalId::new("usr_v2_ada".to_string());
@@ -1667,55 +1861,159 @@ mod tests {
         let token = "cme_v2_ada";
         write_v2_database(&path, &principal, &organization, token);
 
-        // A `serve` process and a CLI process are expected to share one
-        // database file, so both can reach an unmigrated one at the same
-        // moment.
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+        for store in assert_all_opened(open_concurrently(&path)) {
+            assert_eq!(stored_expiry(&store, token), None);
+            assert_eq!(
+                store.resolve_context(token).unwrap().organization_id(),
+                &organization
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_openers_all_migrate_a_legacy_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.sqlite");
+        let principal = PrincipalId::new("usr_legacy_ada".to_string());
+        let token = "cme_legacy_ada";
+        write_legacy_database(&path, &principal, token);
+
+        // The same contention over the longer chain: an unversioned database
+        // runs v1 -> v2 -> v3 in one go. Covering only the v2 -> v3 step would
+        // leave the reachable legacy path untested, and it is the path doing
+        // the most work while holding the write lock.
+        for store in assert_all_opened(open_concurrently(&path)) {
+            assert_eq!(stored_expiry(&store, token), None);
+            assert_eq!(
+                store.resolve_context(token).unwrap().principal_id(),
+                &principal
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_openers_all_share_an_established_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.sqlite");
+        // Establish the file first, which is what an operator does by creating
+        // the first user. Concurrent creation of a database that does not yet
+        // exist is a separate, pre-existing contention on the journal-mode
+        // switch in `open` and is documented rather than asserted here.
+        let principal = {
+            let store = SqliteIdentityStore::open(&path).unwrap();
+            store.create_user("ada").unwrap()
+        };
+        let token = {
+            let store = SqliteIdentityStore::open(&path).unwrap();
+            store.issue_token(&principal).unwrap()
+        };
+
+        let stores = assert_all_opened(open_concurrently(&path));
+        for store in &stores {
+            assert_eq!(store.resolve(&token).unwrap(), principal);
+        }
+    }
+
+    #[test]
+    fn concurrent_rotations_of_distinct_tokens_all_succeed() {
+        const ROTATORS: usize = 16;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.sqlite");
+        let store = std::sync::Arc::new(SqliteIdentityStore::open(&path).unwrap());
+        let organization = store.create_organization("Acme").unwrap();
+        let principal = store
+            .create_user_in_organization("ada", &organization)
+            .unwrap();
+        let tokens: Vec<String> = (0..ROTATORS)
+            .map(|_| {
+                store
+                    .issue_token_for_organization(&principal, &organization)
+                    .unwrap()
+            })
+            .collect();
+
+        // Sixteen holders refreshing their own credentials at once. Nothing
+        // here conflicts semantically -- every rotation touches a different
+        // row -- so every one of them must succeed. Contention between
+        // unrelated writers is the store's problem to absorb, not something a
+        // caller should have to retry.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(ROTATORS));
         let mut threads = Vec::new();
-        for _ in 0..OPENERS {
-            let path = path.clone();
+        for token in tokens {
+            let store = std::sync::Arc::clone(&store);
             let barrier = std::sync::Arc::clone(&barrier);
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
-                SqliteIdentityStore::open(&path)
+                store.rotate_token(&token, None)
             }));
         }
+        let outcomes: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
 
-        let mut opened = 0;
-        for thread in threads {
-            match thread.join().unwrap() {
-                Ok(store) => {
-                    opened += 1;
-                    // Whoever gets in sees the whole migration or none of it,
-                    // never a table with the column and a version without it.
-                    assert_eq!(stored_expiry(&store, token), None);
-                    assert_eq!(
-                        store.resolve_context(token).unwrap().organization_id(),
-                        &organization
-                    );
-                    assert_eq!(
-                        store
-                            .locked_connection()
-                            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-                            .unwrap(),
-                        IDENTITY_SCHEMA_VERSION
-                    );
-                }
-                // Losing first-open contention is allowed and is not what this
-                // test is about: SQLite refuses to switch a database to WAL
-                // while another connection holds it, so a simultaneous first
-                // open can be turned away. Matching the message is deliberate
-                // and confined to this assertion -- SQLite reports contention
-                // and a duplicate column through the same variant, and the
-                // whole point here is that the second one must never happen.
-                Err(IdentityError::Storage(message)) => {
-                    let contention = message.contains("locked") || message.contains("busy");
-                    assert!(contention, "expected lock contention, got: {message}");
-                }
-                Err(other) => panic!("migration must not fail this way: {other}"),
+        let failures: Vec<String> = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().err().map(|error| error.to_string()))
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} of {ROTATORS} rotations failed; first: {}",
+            failures.len(),
+            failures.first().map_or("", String::as_str)
+        );
+        for replacement in outcomes.into_iter().flatten() {
+            assert_eq!(
+                store.resolve_context(&replacement).unwrap().principal_id(),
+                &principal
+            );
+        }
+        assert_eq!(token_count(&store), ROTATORS as i64);
+    }
+
+    #[test]
+    fn concurrent_rotations_of_one_token_leave_a_single_winner() {
+        const ROTATORS: usize = 16;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.sqlite");
+        let store = std::sync::Arc::new(SqliteIdentityStore::open(&path).unwrap());
+        let principal = store.create_user("ada").unwrap();
+        let token = store.issue_token(&principal).unwrap();
+
+        // The same credential presented by sixteen racers. Exactly one may
+        // win: rotation consumes what it replaces, so a second success would
+        // mean the retired token bought a live one twice.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(ROTATORS));
+        let mut threads = Vec::new();
+        for _ in 0..ROTATORS {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let token = token.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.rotate_token(&token, None)
+            }));
+        }
+        let outcomes: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+
+        let winners: Vec<&String> = outcomes.iter().filter_map(|o| o.as_ref().ok()).collect();
+        assert_eq!(winners.len(), 1, "exactly one rotation may consume a token");
+        for outcome in &outcomes {
+            if let Err(error) = outcome {
+                // The losers must be told the token is gone, not that the
+                // database was busy. A retryable-looking error here would
+                // invite a client to replay a credential that no longer exists.
+                assert!(
+                    matches!(error, IdentityError::InvalidToken),
+                    "loser saw {error} instead of a retired credential"
+                );
             }
         }
-        assert!(opened > 0, "no opener completed the migration");
+        assert_eq!(store.resolve(winners[0]).unwrap(), principal);
+        assert_eq!(token_count(&store), 1);
     }
 
     #[test]

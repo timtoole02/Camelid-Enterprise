@@ -644,6 +644,10 @@ async fn forwards_requests_carrying_a_token_that_has_not_expired_yet() {
 
     let response = client().request(request).await.unwrap();
 
+    // 429 is what `capture_request` answers with, not a quota verdict: reaching
+    // the upstream at all is the assertion here, and the status it returns is
+    // arbitrary. `captured` being populated is what proves the request was
+    // forwarded rather than refused at the gateway.
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(captured.lock().unwrap().is_some());
 }

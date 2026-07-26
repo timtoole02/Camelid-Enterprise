@@ -253,6 +253,24 @@ tokens for one model"; everything multi-user is layered on top.
   backwards clock jump extends every outstanding token, and an expired token is
   still valid for the whole window before it lapses. Revocation remains the
   only control that takes effect immediately and does not consult a clock.
+  Four further bounds, stated because they are easy to assume away:
+  **rotation is operator-only** — it requires the plaintext token *and*
+  filesystem access to the identity database, so a remote client told
+  `401 expired bearer token` has no shipped way to obtain a replacement; the
+  distinct reason exists for humans reading logs and for a future refresh
+  endpoint, not for today's API clients. **Expiry is checked at admission
+  only**, so a stream that began before its token lapsed runs to completion,
+  bounded by `--max-connection-seconds` (300s default) rather than by the
+  token. **Lapsed tokens are not swept** — an expired row survives until it is
+  rotated or its membership is removed, because resolution keeps reading it in
+  order to answer "expired" instead of "invalid"; short lifetimes accumulate
+  rows, and pruning is left to a change with a retention policy behind it
+  rather than folded into a read path where replaying a dead token would force
+  a write. **Creating the database concurrently is not supported**: schema
+  migration is serialized under a write lock, but the initial `journal_mode`
+  switch to WAL in a brand-new file is not, so several processes opening a
+  database that does not yet exist can collide. Create it once — any CLI
+  subcommand does — before starting processes that share it.
   Per-request
   identity now reaches an audit trail without the replica learning identity:
   the gateway stamps an opaque `x-camelid-request-id` on each forwarded
