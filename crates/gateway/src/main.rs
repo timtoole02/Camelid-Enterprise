@@ -60,6 +60,11 @@ enum Command {
         /// see which deterministic configuration served each caller's request.
         #[arg(long, env = "CAMELID_GATEWAY_AUDIT_LOG")]
         audit_log: Option<PathBuf>,
+        /// Path to an append-only JSONL transport-usage log. Each handled
+        /// request records its terminal stream outcome and raw payload bytes
+        /// observed by the gateway. This is not tokenizer usage or billing.
+        #[arg(long, env = "CAMELID_GATEWAY_USAGE_LOG", requires = "identity_db")]
+        usage_log: Option<PathBuf>,
         /// Maximum requests one organization may send per fixed quota window.
         /// Requires `--identity-db`, since a request needs a resolved
         /// organization to be charged against a quota. Omitted by default:
@@ -154,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_connection_seconds,
             identity_db,
             audit_log,
+            usage_log,
             org_request_quota,
             org_request_quota_window_seconds,
         } => {
@@ -163,7 +169,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_in_flight,
                 max_connection_seconds,
                 identity_db,
-                audit_log,
+                GatewayLogArgs {
+                    audit_log,
+                    usage_log,
+                },
                 OrgQuotaArgs {
                     limit: org_request_quota,
                     window_seconds: org_request_quota_window_seconds,
@@ -206,16 +215,30 @@ struct OrgQuotaArgs {
     window_seconds: NonZeroU64,
 }
 
+/// Append-only gateway telemetry sinks. Audit remains a response-head and
+/// identity-correlation record; usage is a terminal raw-payload record.
+struct GatewayLogArgs {
+    audit_log: Option<PathBuf>,
+    usage_log: Option<PathBuf>,
+}
+
 async fn serve(
     upstream: &str,
     addr: SocketAddr,
     max_in_flight: NonZeroUsize,
     max_connection_seconds: u64,
     identity_db: Option<PathBuf>,
-    audit_log: Option<PathBuf>,
+    logs: GatewayLogArgs,
     org_request_quota: OrgQuotaArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream = UpstreamOrigin::parse(upstream)?;
+    let usage = match logs.usage_log {
+        Some(path) => {
+            tracing::info!(path = %path.display(), "gateway transport usage log enabled");
+            Some(Arc::new(path))
+        }
+        None => None,
+    };
     let auth = match identity_db {
         Some(path) => {
             tracing::info!(path = %path.display(), "gateway auth enforcement enabled");
@@ -236,16 +259,20 @@ async fn serve(
             GatewayAuth::RequireToken {
                 store: Arc::new(SqliteIdentityStore::open(&path)?),
                 quota,
+                usage,
             }
         }
         None => {
+            if usage.is_some() {
+                return Err("--usage-log requires --identity-db".into());
+            }
             tracing::warn!(
                 "no --identity-db configured; the gateway is forwarding every request unauthenticated"
             );
             GatewayAuth::Disabled
         }
     };
-    let audit = match audit_log {
+    let audit = match logs.audit_log {
         Some(path) => {
             tracing::info!(path = %path.display(), "gateway request audit log enabled");
             Some(Arc::new(path))
@@ -482,7 +509,10 @@ mod tests {
             panic!("expected the parsed command to be Serve");
         };
         assert_eq!(org_request_quota, None);
-        assert_eq!(org_request_quota_window_seconds, NonZeroU64::new(60).unwrap());
+        assert_eq!(
+            org_request_quota_window_seconds,
+            NonZeroU64::new(60).unwrap()
+        );
     }
 
     #[test]
@@ -520,6 +550,19 @@ mod tests {
             "http://127.0.0.1:8181",
             "--org-request-quota",
             "10",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn usage_log_requires_identity_db() {
+        let result = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+            "--usage-log",
+            "usage.jsonl",
         ]);
         assert!(result.is_err());
     }

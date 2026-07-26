@@ -12,6 +12,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, MethodRouter};
 use axum::{Json, Router};
+use bytes::Buf;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -25,10 +26,11 @@ use std::io::Write;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::cors::CorsLayer;
 
@@ -234,6 +236,11 @@ pub enum GatewayAuth {
         /// the authenticated organization as its key. `None` retains the
         /// original authenticated-but-unlimited behavior.
         quota: Option<Arc<OrgQuota>>,
+        /// Optional append-only JSONL terminal transport-accounting sink. It
+        /// belongs to the authenticated mode so every usage record carries a
+        /// resolved principal and organization; it cannot be configured for
+        /// anonymous traffic that a later aggregator could not attribute.
+        usage: Option<Arc<PathBuf>>,
     },
 }
 
@@ -324,18 +331,32 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
     // Path only, never the query string: the audit log records which route was
     // called, not caller-supplied query parameters.
     let path = request.uri().path().to_string();
-
     // Authentication runs before admission is checked. Otherwise an
     // unauthenticated flood would consume in-flight permits (and the SQLite
     // lookup time behind each one) meant for legitimate authenticated
     // traffic before ever being rejected; a request that fails auth must
     // never take a permit at all.
-    let identity = match &state.auth {
-        GatewayAuth::RequireToken { store, quota } => {
+    let (identity, usage) = match &state.auth {
+        GatewayAuth::RequireToken {
+            store,
+            quota,
+            usage,
+        } => {
             let identity = match authenticate(store, request.headers()).await {
                 Ok(context) => context,
                 Err(response) => {
-                    return audited(&state, &request_id, None, &method, &path, response)
+                    return audited(
+                        &state,
+                        AuditedRequest {
+                            request_id: &request_id,
+                            identity: None,
+                            method: &method,
+                            path: &path,
+                            usage: None,
+                            request_bytes: None,
+                        },
+                        response,
+                    )
                 }
             };
 
@@ -348,18 +369,34 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
                     let response = quota_exceeded(retry_after);
                     return audited(
                         &state,
-                        &request_id,
-                        Some(&identity),
-                        &method,
-                        &path,
+                        AuditedRequest {
+                            request_id: &request_id,
+                            identity: Some(&identity),
+                            method: &method,
+                            path: &path,
+                            usage: None,
+                            request_bytes: None,
+                        },
                         response,
                     );
                 }
             }
-            Some(identity)
+            (Some(identity), usage.clone())
         }
-        GatewayAuth::Disabled => None,
+        GatewayAuth::Disabled => (None, None),
     };
+
+    // Count exactly the request payload bytes this gateway observes. The
+    // wrapper is installed only after successful auth and quota admission, so
+    // anonymous and over-quota traffic cannot create ambiguous usage records.
+    let request_bytes = usage.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
+    if let Some(request_bytes) = &request_bytes {
+        let (parts, body) = request.into_parts();
+        request = Request::from_parts(
+            parts,
+            Body::new(CountingBody::new(body, Arc::clone(request_bytes))),
+        );
+    }
 
     let permit = match Arc::clone(&state.admission).try_acquire_owned() {
         Ok(permit) => permit,
@@ -377,10 +414,14 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
             );
             return audited(
                 &state,
-                &request_id,
-                identity.as_ref(),
-                &method,
-                &path,
+                AuditedRequest {
+                    request_id: &request_id,
+                    identity: identity.as_ref(),
+                    method: &method,
+                    path: &path,
+                    usage: usage.clone(),
+                    request_bytes,
+                },
                 response,
             );
         }
@@ -391,10 +432,14 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
             tracing::error!(%error, "could not construct upstream request URI");
             return audited(
                 &state,
-                &request_id,
-                identity.as_ref(),
-                &method,
-                &path,
+                AuditedRequest {
+                    request_id: &request_id,
+                    identity: identity.as_ref(),
+                    method: &method,
+                    path: &path,
+                    usage: usage.clone(),
+                    request_bytes,
+                },
                 gateway_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "gateway could not construct the upstream request",
@@ -430,17 +475,21 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
     };
     audited(
         &state,
-        &request_id,
-        identity.as_ref(),
-        &method,
-        &path,
+        AuditedRequest {
+            request_id: &request_id,
+            identity: identity.as_ref(),
+            method: &method,
+            path: &path,
+            usage,
+            request_bytes,
+        },
         response,
     )
 }
 
 /// Records the audit line for a handled request, when auditing is enabled, and
-/// returns the response unchanged so it can wrap every return path in
-/// [`proxy`].
+/// wraps its response in terminal usage accounting when configured. It is the
+/// single funnel for every return path in [`proxy`].
 ///
 /// The recorded `status` is the response *head* status, known as soon as the
 /// upstream response head arrives; the streaming body is never buffered or
@@ -448,21 +497,49 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
 /// cut short mid-generation is still recorded as `200`. This makes the audit
 /// log a request-**initiation** and correlation record — not a
 /// stream-completion or metering substrate: it cannot, on its own, distinguish
-/// a full generation from one truncated after three tokens. Metering must not
-/// be built on head status alone; that needs stream-completion accounting the
-/// gateway does not do here.
-fn audited(
-    state: &GatewayState,
-    request_id: &str,
-    identity: Option<&AuthenticatedContext>,
-    method: &str,
-    path: &str,
-    response: Response,
-) -> Response {
+/// a full generation from one truncated after three tokens. The optional usage
+/// sink below supplies that separate terminal transport-accounting record.
+struct AuditedRequest<'a> {
+    request_id: &'a str,
+    identity: Option<&'a AuthenticatedContext>,
+    method: &'a str,
+    path: &'a str,
+    usage: Option<Arc<PathBuf>>,
+    request_bytes: Option<Arc<AtomicU64>>,
+}
+
+fn audited(state: &GatewayState, request: AuditedRequest<'_>, response: Response) -> Response {
     if let Some(log) = &state.audit {
-        write_audit_record(log, request_id, identity, method, path, response.status());
+        write_audit_record(
+            log,
+            request.request_id,
+            request.identity,
+            request.method,
+            request.path,
+            response.status(),
+        );
     }
-    response
+    let Some((log, request_bytes, identity)) = request
+        .usage
+        .zip(request.request_bytes)
+        .zip(request.identity)
+        .map(|((log, request_bytes), identity)| (log, request_bytes, identity))
+    else {
+        return response;
+    };
+    let (parts, body) = response.into_parts();
+    let tracker = UsageTracker::new(UsageRecord {
+        log,
+        request_id: request.request_id.to_string(),
+        principal: identity.principal_id().as_str().to_string(),
+        organization: identity.organization_id().as_str().to_string(),
+        method: request.method.to_string(),
+        path: request.path.to_string(),
+        response_head_status: parts.status.as_u16(),
+        request_bytes,
+        response_bytes: 0,
+    });
+    Response::from_parts(parts, Body::new(UsageBody::new(body, tracker)))
 }
 
 /// Serializes whole-record appends to the audit log within this process,
@@ -477,6 +554,14 @@ fn audited(
 /// so this lock is deliberately per-process and independent of the replica's
 /// receipt lock; there is no cross-process contention to coordinate.
 fn audit_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Serializes complete append-only usage records within this process. This is
+/// independent of the audit lock because the files are independent and a slow
+/// usage filesystem must not serialize audit initiation records behind it.
+fn usage_write_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -537,6 +622,90 @@ fn write_audit_record(
     });
 }
 
+struct UsageRecord {
+    log: Arc<PathBuf>,
+    request_id: String,
+    principal: String,
+    organization: String,
+    method: String,
+    path: String,
+    response_head_status: u16,
+    request_bytes: Arc<AtomicU64>,
+    response_bytes: u64,
+}
+
+/// Owns one terminal usage record until a response body finishes, errors, or
+/// is dropped because the client disconnected. Its `Drop` implementation makes
+/// an incomplete response observable rather than silently mistaking it for a
+/// completed generation.
+struct UsageTracker {
+    record: Option<UsageRecord>,
+}
+
+impl UsageTracker {
+    fn new(record: UsageRecord) -> Self {
+        Self {
+            record: Some(record),
+        }
+    }
+
+    fn add_response_bytes(&mut self, bytes: u64) {
+        if let Some(record) = &mut self.record {
+            record.response_bytes = record.response_bytes.saturating_add(bytes);
+        }
+    }
+
+    fn finish(&mut self, outcome: &'static str) {
+        if let Some(record) = self.record.take() {
+            write_usage_record(record, outcome);
+        }
+    }
+}
+
+impl Drop for UsageTracker {
+    fn drop(&mut self) {
+        self.finish("client_disconnect");
+    }
+}
+
+/// Appends one terminal JSONL usage record:
+/// `{ts, request_id, principal, organization, method, path, response_head_status,
+/// request_bytes, response_bytes, outcome}`. Byte counts are raw payload bytes
+/// the gateway read or forwarded, never tokenizer counts, so this record must
+/// not be used as an inference token-billing source.
+fn write_usage_record(record: UsageRecord, outcome: &'static str) {
+    let line = serde_json::json!({
+        "ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or(0.0),
+        "request_id": record.request_id,
+        "principal": record.principal,
+        "organization": record.organization,
+        "method": record.method,
+        "path": record.path,
+        "response_head_status": record.response_head_status,
+        "request_bytes": record.request_bytes.load(Ordering::Relaxed),
+        "response_bytes": record.response_bytes,
+        "outcome": outcome,
+    });
+    let log = record.log;
+    tokio::task::spawn_blocking(move || {
+        let _guard = usage_write_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&*log)
+        {
+            let mut line = line.to_string();
+            line.push('\n');
+            let _ = file.write_all(line.as_bytes());
+        }
+    });
+}
+
 /// Mints an opaque, gateway-authoritative request correlation id. 128 bits of
 /// randomness make a collision between two records probabilistically negligible
 /// (a birthday bound around 2^64 mints), though not guaranteed unique, which is
@@ -546,6 +715,111 @@ fn write_audit_record(
 /// ordering source.
 fn mint_request_id() -> String {
     format!("req_{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..))
+}
+
+pin_project! {
+    struct CountingBody<B> {
+        #[pin]
+        inner: B,
+        bytes: Arc<AtomicU64>,
+    }
+}
+
+impl<B> CountingBody<B> {
+    fn new(inner: B, bytes: Arc<AtomicU64>) -> Self {
+        Self { inner, bytes }
+    }
+}
+
+impl<B> HttpBody for CountingBody<B>
+where
+    B: HttpBody,
+    B::Data: Buf,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let mut this = self.project();
+        let poll = this.inner.as_mut().poll_frame(context);
+        if let Poll::Ready(Some(Ok(frame))) = &poll {
+            if let Some(data) = frame.data_ref() {
+                this.bytes
+                    .fetch_add(data.remaining() as u64, Ordering::Relaxed);
+            }
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+pin_project! {
+    struct UsageBody<B> {
+        #[pin]
+        inner: B,
+        tracker: UsageTracker,
+    }
+}
+
+impl<B> UsageBody<B>
+where
+    B: HttpBody,
+{
+    fn new(inner: B, mut tracker: UsageTracker) -> Self {
+        if inner.is_end_stream() {
+            tracker.finish("completed");
+        }
+        Self { inner, tracker }
+    }
+}
+
+impl<B> HttpBody for UsageBody<B>
+where
+    B: HttpBody,
+    B::Data: Buf,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let mut this = self.project();
+        let poll = this.inner.as_mut().poll_frame(context);
+        match &poll {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.tracker.add_response_bytes(data.remaining() as u64);
+                }
+            }
+            Poll::Ready(Some(Err(_))) => this.tracker.finish("body_error"),
+            Poll::Ready(None) => this.tracker.finish("completed"),
+            Poll::Pending => {}
+        }
+        if this.inner.as_ref().is_end_stream() {
+            this.tracker.finish("completed");
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 pin_project! {
