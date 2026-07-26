@@ -22,7 +22,7 @@ use replica_contract::HttpMethod;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -122,18 +122,12 @@ struct GatewayState {
     /// admission. `None` disables auditing entirely. CORS preflight and
     /// `/healthz` are answered before this path and are never audited.
     audit: Option<Arc<PathBuf>>,
-    /// Optional per-organization request-rate quota. Only meaningful when
-    /// `auth` is [`GatewayAuth::RequireToken`]: a request must resolve to an
-    /// organization before it can be charged against that organization's
-    /// quota. `None` disables quota enforcement entirely, unchanged from
-    /// prior releases.
-    quota: Option<Arc<OrgQuota>>,
 }
 
 /// Per-organization request-rate quota, independent of admission control.
 /// Admission ([`DEFAULT_MAX_IN_FLIGHT`]) bounds how much concurrent work the
 /// gateway does in total; [`OrgQuota`] bounds how much of that shared budget
-/// one organization may consume in a rolling window, so one oversubscribed or
+/// one organization may consume in a fixed window, so one oversubscribed or
 /// misbehaving tenant cannot starve every other tenant's share of it.
 ///
 /// State is in-memory and per-process: it resets on restart and is not
@@ -141,7 +135,16 @@ struct GatewayState {
 /// consistent with this gateway's other non-durable state (the request audit
 /// log): a fixed-window approximation is enough to stop one tenant from
 /// monopolizing shared capacity, it is not a durable metering or billing
-/// substrate.
+/// substrate. The quota is charged after successful authentication but before
+/// admission and forwarding, so a request that later receives a gateway `503`
+/// or an upstream `502` still counts: this is an anti-starvation control for
+/// gateway work, not a record of successful inference.
+///
+/// Authentication necessarily resolves the bearer token in SQLite before the
+/// gateway knows which organization to charge. Consequently, this quota does
+/// not bound per-request identity-store work from an over-budget valid token.
+/// A token cache would change token-revocation semantics, so it needs its own
+/// bounded, invalidation-aware design rather than an implicit fast path here.
 pub struct OrgQuota {
     limit: NonZeroU32,
     window: Duration,
@@ -154,11 +157,13 @@ struct OrgWindow {
 }
 
 impl OrgQuota {
-    /// Allows at most `limit` requests per organization in every `window`.
-    pub fn new(limit: NonZeroU32, window: Duration) -> Self {
+    /// Allows at most `limit` requests per organization in every fixed window
+    /// of `window_seconds`. A nonzero type makes a configuration that resets
+    /// on every request impossible.
+    pub fn new(limit: NonZeroU32, window_seconds: NonZeroU64) -> Self {
         Self {
             limit,
-            window,
+            window: Duration::from_secs(window_seconds.get()),
             windows: Mutex::new(HashMap::new()),
         }
     }
@@ -172,27 +177,42 @@ impl OrgQuota {
     /// immediately after it resets, so the true worst case across a window
     /// boundary is under `2 * limit` requests in a short span, not exactly
     /// `limit`. That trade-off is intentional: admission is a single hash-map
-    /// lookup and increment under one lock, with no per-request timer queue.
+    /// lookup and increment under one process-wide lock, with no per-request
+    /// timer queue. At the gateway's default 256 in-flight requests this
+    /// short critical section is deliberate; revisit sharding only if real
+    /// traffic proves it contended.
     fn admit(&self, organization: &OrganizationId) -> Result<(), Duration> {
         let now = Instant::now();
         let mut windows = self
             .windows
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let window = self.window;
+        if let Some(entry) = windows.get_mut(organization.as_str()) {
+            return self.admit_window(entry, now);
+        }
+
+        // A key is created only for a previously unseen organization. Sweep
+        // expired windows on that slow path so deleted or long-idle tenants do
+        // not remain resident forever, without adding work to steady-state
+        // authenticated requests.
+        windows.retain(|_, entry| now.duration_since(entry.started_at) < self.window);
         let entry = windows
             .entry(organization.as_str().to_string())
             .or_insert(OrgWindow {
                 started_at: now,
                 count: 0,
             });
-        if now.duration_since(entry.started_at) >= window {
+        self.admit_window(entry, now)
+    }
+
+    fn admit_window(&self, entry: &mut OrgWindow, now: Instant) -> Result<(), Duration> {
+        if now.duration_since(entry.started_at) >= self.window {
             entry.started_at = now;
             entry.count = 0;
         }
         if entry.count >= self.limit.get() {
             let elapsed = now.duration_since(entry.started_at);
-            return Err(window.saturating_sub(elapsed));
+            return Err(self.window.saturating_sub(elapsed));
         }
         entry.count += 1;
         Ok(())
@@ -208,7 +228,13 @@ impl OrgQuota {
 #[derive(Clone)]
 pub enum GatewayAuth {
     Disabled,
-    RequireToken(Arc<SqliteIdentityStore>),
+    RequireToken {
+        store: Arc<SqliteIdentityStore>,
+        /// A quota exists only inside the authenticated mode because it needs
+        /// the authenticated organization as its key. `None` retains the
+        /// original authenticated-but-unlimited behavior.
+        quota: Option<Arc<OrgQuota>>,
+    },
 }
 
 pub fn router(upstream: UpstreamOrigin) -> Router {
@@ -216,7 +242,7 @@ pub fn router(upstream: UpstreamOrigin) -> Router {
 }
 
 pub fn router_with_max_in_flight(upstream: UpstreamOrigin, max_in_flight: NonZeroUsize) -> Router {
-    router_with_options(upstream, max_in_flight, GatewayAuth::Disabled, None, None)
+    router_with_options(upstream, max_in_flight, GatewayAuth::Disabled, None)
 }
 
 // The forwarded route surface is derived from `replica_contract::PUBLIC_ROUTES`,
@@ -231,7 +257,6 @@ pub fn router_with_options(
     max_in_flight: NonZeroUsize,
     auth: GatewayAuth,
     audit: Option<Arc<PathBuf>>,
-    quota: Option<Arc<OrgQuota>>,
 ) -> Router {
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
@@ -263,7 +288,6 @@ pub fn router_with_options(
             admission: Arc::new(Semaphore::new(max_in_flight.get())),
             auth,
             audit,
-            quota,
         })
 }
 
@@ -307,31 +331,35 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
     // traffic before ever being rejected; a request that fails auth must
     // never take a permit at all.
     let identity = match &state.auth {
-        GatewayAuth::RequireToken(store) => match authenticate(store, request.headers()).await {
-            Ok(context) => Some(context),
-            Err(response) => return audited(&state, &request_id, None, &method, &path, response),
-        },
+        GatewayAuth::RequireToken { store, quota } => {
+            let identity = match authenticate(store, request.headers()).await {
+                Ok(context) => context,
+                Err(response) => {
+                    return audited(&state, &request_id, None, &method, &path, response)
+                }
+            };
+
+            // Quota is checked after authentication (it needs a resolved
+            // organization to charge) but before the admission permit is
+            // acquired. A request the gateway is about to reject must never
+            // first take a permit meant for traffic that will be forwarded.
+            if let Some(quota) = quota {
+                if let Err(retry_after) = quota.admit(identity.organization_id()) {
+                    let response = quota_exceeded(retry_after);
+                    return audited(
+                        &state,
+                        &request_id,
+                        Some(&identity),
+                        &method,
+                        &path,
+                        response,
+                    );
+                }
+            }
+            Some(identity)
+        }
         GatewayAuth::Disabled => None,
     };
-
-    // Quota is checked after authentication (it needs a resolved organization
-    // to charge) but before the admission permit is acquired, for the same
-    // reason auth runs before admission: a request this gateway is about to
-    // reject must never first take a permit meant for traffic that will
-    // actually be forwarded.
-    if let (Some(quota), Some(identity)) = (&state.quota, &identity) {
-        if let Err(retry_after) = quota.admit(identity.organization_id()) {
-            let response = quota_exceeded(retry_after);
-            return audited(
-                &state,
-                &request_id,
-                Some(identity),
-                &method,
-                &path,
-                response,
-            );
-        }
-    }
 
     let permit = match Arc::clone(&state.admission).try_acquire_owned() {
         Ok(permit) => permit,
@@ -664,13 +692,20 @@ fn quota_exceeded(retry_after: Duration) -> Response {
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let retry_after_seconds = retry_after.as_secs().max(1);
+    let retry_after_seconds = retry_after_seconds(retry_after);
     response.headers_mut().insert(
         "retry-after",
         HeaderValue::from_str(&retry_after_seconds.to_string())
             .expect("a small decimal integer is a valid header value"),
     );
     response
+}
+
+fn retry_after_seconds(retry_after: Duration) -> u64 {
+    retry_after
+        .as_secs()
+        .saturating_add(u64::from(retry_after.subsec_nanos() > 0))
+        .max(1)
 }
 
 fn remove_hop_by_hop(headers: &mut HeaderMap) {
@@ -880,7 +915,7 @@ mod tests {
 
     #[test]
     fn org_quota_admits_up_to_the_limit_then_rejects() {
-        let quota = OrgQuota::new(NonZeroU32::new(2).unwrap(), Duration::from_secs(60));
+        let quota = OrgQuota::new(NonZeroU32::new(2).unwrap(), NonZeroU64::new(60).unwrap());
         let organization = OrganizationId::new("org_acme".to_string());
         assert!(quota.admit(&organization).is_ok());
         assert!(quota.admit(&organization).is_ok());
@@ -890,7 +925,7 @@ mod tests {
 
     #[test]
     fn org_quota_tracks_organizations_independently() {
-        let quota = OrgQuota::new(NonZeroU32::new(1).unwrap(), Duration::from_secs(60));
+        let quota = OrgQuota::new(NonZeroU32::new(1).unwrap(), NonZeroU64::new(60).unwrap());
         let acme = OrganizationId::new("org_acme".to_string());
         let globex = OrganizationId::new("org_globex".to_string());
         assert!(quota.admit(&acme).is_ok());
@@ -901,11 +936,19 @@ mod tests {
 
     #[test]
     fn org_quota_resets_once_the_window_elapses() {
-        let quota = OrgQuota::new(NonZeroU32::new(1).unwrap(), Duration::from_millis(20));
+        let quota = OrgQuota::new(NonZeroU32::new(1).unwrap(), NonZeroU64::new(1).unwrap());
         let organization = OrganizationId::new("org_acme".to_string());
         assert!(quota.admit(&organization).is_ok());
         assert!(quota.admit(&organization).is_err());
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(1_100));
         assert!(quota.admit(&organization).is_ok());
+    }
+
+    #[test]
+    fn retry_after_seconds_rounds_up_and_never_returns_zero() {
+        assert_eq!(retry_after_seconds(Duration::ZERO), 1);
+        assert_eq!(retry_after_seconds(Duration::from_millis(1)), 1);
+        assert_eq!(retry_after_seconds(Duration::from_secs(1)), 1);
+        assert_eq!(retry_after_seconds(Duration::new(59, 999_999_999)), 60);
     }
 }

@@ -269,12 +269,21 @@ tokens for one model"; everything multi-user is layered on top.
   fixed-window counter, keyed by the organization resolved during
   authentication, rejects a request over budget with a typed `429` and a
   `Retry-After` header before it consumes an admission permit or reaches a
-  replica, without charging requests that fail authentication. The counter is
-  in-memory and per-process — it resets on restart and is not shared across
-  gateway replicas behind the same Service, which is an explicit trade-off
-  (a coarse per-tenant cap, not a durable metering/billing substrate). Still
-  missing: routing by model (there is exactly one upstream today), and usage
-  metering. Still no state in replicas.
+  replica, without charging requests that fail authentication. A successfully
+  authenticated request is charged before admission and forwarding, so a
+  gateway `503` or upstream `502` also counts: quota is a bound on attempted
+  gateway work, not a record of completed inference. Authentication must query
+  SQLite before the organization is known, so the quota does not bound
+  identity-store lookup load from a valid over-budget token; token caching is a
+  separate revocation-sensitive design problem. The counter is in-memory and
+  per-process — it resets on restart and is not shared across gateway replicas
+  behind the same Service, which is an explicit trade-off (a coarse per-tenant
+  cap, not a durable metering/billing substrate). The shipped gateway manifest
+  has two replicas: each process can admit under `2 × limit` in a short burst
+  across a fixed-window boundary, so the two-pod deployment can admit under
+  `4 × limit` for one organization in that span, distributed nondeterministically
+  by Kubernetes. Still missing: routing by model (there is exactly one upstream
+  today), and usage metering. Still no state in replicas.
 5. **Model/catalog service — not started.** Promote model management out of
   ad-hoc `--model` + `/api/models/load` into a catalog that maps model → pool.
 6. **Platform data + observability — not started.** Introduce the durable store

@@ -5,7 +5,7 @@ use camelid_enterprise_gateway::{
 use clap::{Parser, Subcommand};
 use identity::{OrganizationId, PrincipalId, SqliteIdentityStore};
 use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,20 +60,24 @@ enum Command {
         /// see which deterministic configuration served each caller's request.
         #[arg(long, env = "CAMELID_GATEWAY_AUDIT_LOG")]
         audit_log: Option<PathBuf>,
-        /// Maximum requests one organization may send per quota window.
+        /// Maximum requests one organization may send per fixed quota window.
         /// Requires `--identity-db`, since a request needs a resolved
         /// organization to be charged against a quota. Omitted by default:
         /// no organization is rate-limited unless this is set.
-        #[arg(long, env = "CAMELID_GATEWAY_ORG_REQUEST_QUOTA")]
+        #[arg(
+            long,
+            env = "CAMELID_GATEWAY_ORG_REQUEST_QUOTA",
+            requires = "identity_db"
+        )]
         org_request_quota: Option<NonZeroU32>,
-        /// Length, in seconds, of the rolling window `--org-request-quota`
+        /// Length, in seconds, of the fixed window `--org-request-quota`
         /// counts requests over. Ignored unless `--org-request-quota` is set.
         #[arg(
             long,
-            default_value_t = 60,
+            default_value_t = NonZeroU64::new(60).unwrap(),
             env = "CAMELID_GATEWAY_ORG_REQUEST_QUOTA_WINDOW_SECONDS"
         )]
-        org_request_quota_window_seconds: u64,
+        org_request_quota_window_seconds: NonZeroU64,
     },
     /// Create a user and its personal organization, then print the principal id.
     CreateUser {
@@ -199,7 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// always travel together.
 struct OrgQuotaArgs {
     limit: Option<NonZeroU32>,
-    window_seconds: u64,
+    window_seconds: NonZeroU64,
 }
 
 async fn serve(
@@ -211,11 +215,6 @@ async fn serve(
     audit_log: Option<PathBuf>,
     org_request_quota: OrgQuotaArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if org_request_quota.limit.is_some() && identity_db.is_none() {
-        return Err("--org-request-quota requires --identity-db: a request needs a \
-                     resolved organization before it can be charged against a quota"
-            .into());
-    }
     let upstream = UpstreamOrigin::parse(upstream)?;
     let auth = match identity_db {
         Some(path) => {
@@ -226,7 +225,18 @@ async fn serve(
                  front of it, or restrict --addr to a trusted network, or a captured \
                  token can be replayed indefinitely (tokens do not expire yet)."
             );
-            GatewayAuth::RequireToken(Arc::new(SqliteIdentityStore::open(&path)?))
+            let quota = org_request_quota.limit.map(|limit| {
+                tracing::info!(
+                    limit = limit.get(),
+                    window_seconds = org_request_quota.window_seconds.get(),
+                    "gateway per-organization request quota enabled"
+                );
+                Arc::new(OrgQuota::new(limit, org_request_quota.window_seconds))
+            });
+            GatewayAuth::RequireToken {
+                store: Arc::new(SqliteIdentityStore::open(&path)?),
+                quota,
+            }
         }
         None => {
             tracing::warn!(
@@ -242,15 +252,6 @@ async fn serve(
         }
         None => None,
     };
-    let quota = org_request_quota.limit.map(|limit| {
-        let window = Duration::from_secs(org_request_quota.window_seconds);
-        tracing::info!(
-            limit = limit.get(),
-            window_seconds = org_request_quota.window_seconds,
-            "gateway per-organization request quota enabled"
-        );
-        Arc::new(OrgQuota::new(limit, window))
-    });
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let max_connection_duration = Duration::from_secs(max_connection_seconds);
     tracing::info!(
@@ -261,7 +262,7 @@ async fn serve(
     );
     camelid_enterprise_gateway::serve(
         listener,
-        router_with_options(upstream, max_in_flight, auth, audit, quota),
+        router_with_options(upstream, max_in_flight, auth, audit),
         max_connection_duration,
         shutdown_signal(),
     )
@@ -481,7 +482,7 @@ mod tests {
             panic!("expected the parsed command to be Serve");
         };
         assert_eq!(org_request_quota, None);
-        assert_eq!(org_request_quota_window_seconds, 60);
+        assert_eq!(org_request_quota_window_seconds, NonZeroU64::new(60).unwrap());
     }
 
     #[test]
@@ -497,22 +498,29 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn serve_rejects_org_request_quota_without_identity_db() {
-        let error = serve(
+    #[test]
+    fn org_request_quota_window_must_be_nonzero() {
+        let result = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
             "http://127.0.0.1:8181",
-            "127.0.0.1:0".parse().unwrap(),
-            DEFAULT_MAX_IN_FLIGHT,
-            30,
-            None,
-            None,
-            OrgQuotaArgs {
-                limit: Some(NonZeroU32::new(10).unwrap()),
-                window_seconds: 60,
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("--org-request-quota requires --identity-db"));
+            "--org-request-quota-window-seconds",
+            "0",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn org_request_quota_requires_identity_db() {
+        let result = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+            "--org-request-quota",
+            "10",
+        ]);
+        assert!(result.is_err());
     }
 }
