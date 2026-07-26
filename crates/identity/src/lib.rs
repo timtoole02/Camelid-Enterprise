@@ -904,9 +904,11 @@ mod tests {
             .add_principal_to_organization(&principal, &second)
             .unwrap();
 
+        let mut expected_organizations = vec![first.clone(), second.clone()];
+        expected_organizations.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         assert_eq!(
             store.organizations_for_principal(&principal).unwrap(),
-            vec![first.clone(), second.clone()]
+            expected_organizations
         );
         assert!(matches!(
             store.issue_token(&principal).unwrap_err(),
