@@ -19,7 +19,10 @@ The gateway in this release is deliberately transparent: one fixed upstream,
 opaque streaming request/response bodies, no retries, and no response rewriting.
 On Kubernetes, point it at the replica Service and let Kubernetes balance the
 identical pool. On one box, point it directly at the replica. Authentication and
-tenant-aware routing have not landed; keep both services on a trusted network.
+per-organization quotas are optional gateway features; tenant-aware model
+routing has not landed. The stock Kubernetes manifest configures neither an
+identity database nor a quota, so keep both services on a trusted network until
+an operator supplies an identity deployment and enables authentication.
 Only the OpenAI-compatible `/v1` inference surface is public through the gateway;
 replica `/api`, embedded WebUI, workspace, and model-lifecycle routes return 404.
 The gateway admits at most 256 concurrent request streams by default (including
@@ -115,6 +118,14 @@ Adjust before applying:
 - **Gateway probes** — readiness and liveness use the local `/healthz` endpoint.
   Replica availability is represented by the replica Deployment's own readiness
   and by typed gateway `502` responses, not by removing healthy gateway pods.
+- **Per-organization quota** — when you opt in with an identity database plus
+  `CAMELID_GATEWAY_ORG_REQUEST_QUOTA`, the counter is fixed-window, in-memory,
+  and local to each gateway process. The supplied manifest runs **two** gateway
+  replicas, so Kubernetes distributes an organization's traffic across two
+  independent counters: each process can admit under `2 × limit` in a short
+  fixed-window-boundary burst, making the deployment-wide worst case under
+  `4 × limit`. Size the per-pod value with that bound in mind. A strict global
+  organization quota needs durable, shared state and is not implemented.
 - **Shutdown drain** — both gateway and replica stop accepting connections on
   SIGTERM and drain active streams. The examples grant 300 seconds before
   kubelet may send SIGKILL; keep the replica window at least as long as the

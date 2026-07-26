@@ -151,6 +151,13 @@ docker run -p 8181:8181 -v /path/to/models:/models:ro \
 kubectl apply -f deploy/k8s/deployment.yaml -f deploy/k8s/service.yaml
 ```
 
+The supplied gateway Deployment runs two replicas. If you later opt into its
+per-organization fixed-window quota, each gateway process has an independent
+in-memory counter; a short burst across a window boundary can therefore admit
+under `4 ×` the configured limit across the two pods. See
+[deploy/README.md](deploy/README.md) for the full quota sizing constraint and
+deployment requirements.
+
 See [deploy/README.md](deploy/README.md) for the full scaling model, probe configuration, and sizing guidance.
 
 ## Scope

@@ -7,7 +7,7 @@ use axum::Router;
 use bytes::Bytes;
 use camelid_enterprise_gateway::{
     router as gateway_router, router_with_max_in_flight, router_with_options, GatewayAuth,
-    UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT,
+    OrgQuota, UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT,
 };
 use futures_util::stream;
 use http_body_util::BodyExt;
@@ -18,7 +18,7 @@ use identity::SqliteIdentityStore;
 use replica_contract::{HttpMethod, PUBLIC_ROUTES};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -482,7 +482,11 @@ async fn rejects_requests_with_no_bearer_token_when_auth_is_required() {
         .unwrap();
 
     let gateway =
-        spawn_gateway_with_auth(unreachable_upstream, GatewayAuth::RequireToken(store)).await;
+        spawn_gateway_with_auth(
+            unreachable_upstream,
+            GatewayAuth::RequireToken { store, quota: None },
+        )
+        .await;
     let request = Request::get(format!("http://{}/v1/models", gateway.addr))
         .body(Body::empty())
         .unwrap();
@@ -509,7 +513,11 @@ async fn rejects_requests_with_an_invalid_bearer_token() {
         .unwrap();
 
     let gateway =
-        spawn_gateway_with_auth(unreachable_upstream, GatewayAuth::RequireToken(store)).await;
+        spawn_gateway_with_auth(
+            unreachable_upstream,
+            GatewayAuth::RequireToken { store, quota: None },
+        )
+        .await;
     let request = Request::get(format!("http://{}/v1/models", gateway.addr))
         .header("authorization", "Bearer not-a-real-token")
         .body(Body::empty())
@@ -533,8 +541,14 @@ async fn forwards_requests_carrying_a_valid_bearer_token() {
             .with_state(Arc::clone(&captured)),
     )
     .await;
-    let gateway =
-        spawn_gateway_with_auth(upstream.addr, GatewayAuth::RequireToken(Arc::new(store))).await;
+    let gateway = spawn_gateway_with_auth(
+        upstream.addr,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+        },
+    )
+    .await;
     let request = Request::get(format!("http://{}/v1/models", gateway.addr))
         .header("host", "public-gateway.example")
         .header("authorization", format!("Bearer {token}"))
@@ -546,6 +560,231 @@ async fn forwards_requests_carrying_a_valid_bearer_token() {
 
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(captured.lock().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn quota_rejects_a_request_once_the_organization_exceeds_its_limit() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+
+    let upstream_calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(Router::new().fallback(any({
+        let upstream_calls = Arc::clone(&upstream_calls);
+        move || {
+            let upstream_calls = Arc::clone(&upstream_calls);
+            async move {
+                upstream_calls.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        }
+    })))
+    .await;
+    let gateway = spawn_gateway_with_auth(
+        upstream.addr,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: Some(Arc::new(OrgQuota::new(
+                NonZeroU32::new(2).unwrap(),
+                NonZeroU64::new(60).unwrap(),
+            ))),
+        },
+    )
+    .await;
+
+    let send = || {
+        let addr = gateway.addr;
+        let token = token.clone();
+        async move {
+            let request = Request::get(format!("http://{addr}/v1/models"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            client().request(request).await.unwrap()
+        }
+    };
+
+    assert_eq!(send().await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(send().await.status(), StatusCode::NO_CONTENT);
+
+    let rejected = send().await;
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = rejected.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+    assert_eq!(retry_after, 60);
+    assert_eq!(
+        to_bytes(Body::new(rejected.into_body()), 1024).await.unwrap(),
+        r#"{"error":{"message":"organization request quota exceeded","type":"quota_exceeded"}}"#
+    );
+    // The rejected request never reached the upstream replica.
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn quota_tracks_organizations_independently() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let ada = store.create_user("ada").unwrap();
+    let ada_token = store.issue_token(&ada).unwrap();
+    let grace = store.create_user("grace").unwrap();
+    let grace_token = store.issue_token(&grace).unwrap();
+
+    let upstream = spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
+    let gateway = spawn_gateway_with_auth(
+        upstream.addr,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: Some(Arc::new(OrgQuota::new(
+                NonZeroU32::new(1).unwrap(),
+                NonZeroU64::new(60).unwrap(),
+            ))),
+        },
+    )
+    .await;
+
+    let send = |token: String| {
+        let addr = gateway.addr;
+        async move {
+            let request = Request::get(format!("http://{addr}/v1/models"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            client().request(request).await.unwrap()
+        }
+    };
+
+    assert_eq!(send(ada_token.clone()).await.status(), StatusCode::NO_CONTENT);
+    // ada's organization has already used its one request for the window.
+    assert_eq!(send(ada_token).await.status(), StatusCode::TOO_MANY_REQUESTS);
+    // grace's organization has its own, unaffected budget.
+    assert_eq!(send(grace_token).await.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn quota_is_not_charged_by_requests_that_fail_authentication() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+
+    let upstream = spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
+    let gateway = spawn_gateway_with_auth(
+        upstream.addr,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: Some(Arc::new(OrgQuota::new(
+                NonZeroU32::new(1).unwrap(),
+                NonZeroU64::new(60).unwrap(),
+            ))),
+        },
+    )
+    .await;
+
+    let unauthenticated = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        client().request(unauthenticated).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // The organization's quota is untouched: its one request for the window
+    // is still available.
+    let authenticated = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        client().request(authenticated).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn quota_charges_a_request_rejected_by_admission_control() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+    let release = Arc::new(Notify::new());
+    let upstream = spawn_server(
+        Router::new()
+            .route("/v1/chat/completions", any(delayed_sse))
+            .with_state(Arc::clone(&release)),
+    )
+    .await;
+    let gateway = spawn_gateway_with_options(
+        upstream.addr,
+        NonZeroUsize::new(1).unwrap(),
+        Duration::from_secs(30),
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: Some(Arc::new(OrgQuota::new(
+                NonZeroU32::new(2).unwrap(),
+                NonZeroU64::new(60).unwrap(),
+            ))),
+        },
+        None,
+    )
+    .await;
+
+    let request = || {
+        Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let accepted = client().request(request()).await.unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    // This request has a valid identity and passes quota, but the active
+    // stream holds the only admission permit. It still consumes quota.
+    assert_eq!(
+        client().request(request()).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    drop(accepted);
+
+    // Both prior valid requests were charged, including the admission 503.
+    assert_eq!(
+        client().request(request()).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    release.notify_waiters();
+}
+
+#[tokio::test]
+async fn quota_charges_a_request_when_the_upstream_is_unavailable() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_upstream = listener.local_addr().unwrap();
+    drop(listener);
+    let gateway = spawn_gateway_with_auth(
+        unavailable_upstream,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: Some(Arc::new(OrgQuota::new(
+                NonZeroU32::new(1).unwrap(),
+                NonZeroU64::new(60).unwrap(),
+            ))),
+        },
+    )
+    .await;
+
+    let request = || {
+        Request::get(format!("http://{}/v1/models", gateway.addr))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    assert_eq!(
+        client().request(request()).await.unwrap().status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        client().request(request()).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
 }
 
 #[tokio::test]
@@ -1051,7 +1290,10 @@ async fn audit_log_records_both_forwarded_and_rejected_requests() {
     let audit_path = dir.path().join("audit.jsonl");
     let gateway = spawn_gateway_with_audit(
         upstream.addr,
-        GatewayAuth::RequireToken(Arc::new(store)),
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+        },
         Arc::new(audit_path.clone()),
     )
     .await;

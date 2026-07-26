@@ -1,11 +1,11 @@
 use camelid_enterprise_gateway::{
-    router_with_options, GatewayAuth, UpstreamOrigin, DEFAULT_MAX_CONNECTION_DURATION,
+    router_with_options, GatewayAuth, OrgQuota, UpstreamOrigin, DEFAULT_MAX_CONNECTION_DURATION,
     DEFAULT_MAX_IN_FLIGHT,
 };
 use clap::{Parser, Subcommand};
 use identity::{OrganizationId, PrincipalId, SqliteIdentityStore};
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,6 +60,24 @@ enum Command {
         /// see which deterministic configuration served each caller's request.
         #[arg(long, env = "CAMELID_GATEWAY_AUDIT_LOG")]
         audit_log: Option<PathBuf>,
+        /// Maximum requests one organization may send per fixed quota window.
+        /// Requires `--identity-db`, since a request needs a resolved
+        /// organization to be charged against a quota. Omitted by default:
+        /// no organization is rate-limited unless this is set.
+        #[arg(
+            long,
+            env = "CAMELID_GATEWAY_ORG_REQUEST_QUOTA",
+            requires = "identity_db"
+        )]
+        org_request_quota: Option<NonZeroU32>,
+        /// Length, in seconds, of the fixed window `--org-request-quota`
+        /// counts requests over. Ignored unless `--org-request-quota` is set.
+        #[arg(
+            long,
+            default_value_t = NonZeroU64::new(60).unwrap(),
+            env = "CAMELID_GATEWAY_ORG_REQUEST_QUOTA_WINDOW_SECONDS"
+        )]
+        org_request_quota_window_seconds: NonZeroU64,
     },
     /// Create a user and its personal organization, then print the principal id.
     CreateUser {
@@ -136,6 +154,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_connection_seconds,
             identity_db,
             audit_log,
+            org_request_quota,
+            org_request_quota_window_seconds,
         } => {
             serve(
                 &upstream,
@@ -144,6 +164,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_connection_seconds,
                 identity_db,
                 audit_log,
+                OrgQuotaArgs {
+                    limit: org_request_quota,
+                    window_seconds: org_request_quota_window_seconds,
+                },
             )
             .await
         }
@@ -174,6 +198,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// The `--org-request-quota` / `--org-request-quota-window-seconds` pair,
+/// grouped so [`serve`] takes one argument for them instead of two that must
+/// always travel together.
+struct OrgQuotaArgs {
+    limit: Option<NonZeroU32>,
+    window_seconds: NonZeroU64,
+}
+
 async fn serve(
     upstream: &str,
     addr: SocketAddr,
@@ -181,6 +213,7 @@ async fn serve(
     max_connection_seconds: u64,
     identity_db: Option<PathBuf>,
     audit_log: Option<PathBuf>,
+    org_request_quota: OrgQuotaArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream = UpstreamOrigin::parse(upstream)?;
     let auth = match identity_db {
@@ -192,7 +225,18 @@ async fn serve(
                  front of it, or restrict --addr to a trusted network, or a captured \
                  token can be replayed indefinitely (tokens do not expire yet)."
             );
-            GatewayAuth::RequireToken(Arc::new(SqliteIdentityStore::open(&path)?))
+            let quota = org_request_quota.limit.map(|limit| {
+                tracing::info!(
+                    limit = limit.get(),
+                    window_seconds = org_request_quota.window_seconds.get(),
+                    "gateway per-organization request quota enabled"
+                );
+                Arc::new(OrgQuota::new(limit, org_request_quota.window_seconds))
+            });
+            GatewayAuth::RequireToken {
+                store: Arc::new(SqliteIdentityStore::open(&path)?),
+                quota,
+            }
         }
         None => {
             tracing::warn!(
@@ -418,5 +462,65 @@ mod tests {
         };
         assert_eq!(principal, "usr_ada");
         assert_eq!(organization, "org_acme");
+    }
+
+    #[test]
+    fn org_request_quota_window_defaults_to_sixty_seconds() {
+        let cli = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+        ])
+        .unwrap();
+        let Command::Serve {
+            org_request_quota,
+            org_request_quota_window_seconds,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the parsed command to be Serve");
+        };
+        assert_eq!(org_request_quota, None);
+        assert_eq!(org_request_quota_window_seconds, NonZeroU64::new(60).unwrap());
+    }
+
+    #[test]
+    fn org_request_quota_must_be_nonzero() {
+        let result = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+            "--org-request-quota",
+            "0",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn org_request_quota_window_must_be_nonzero() {
+        let result = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+            "--org-request-quota-window-seconds",
+            "0",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn org_request_quota_requires_identity_db() {
+        let result = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+            "--org-request-quota",
+            "10",
+        ]);
+        assert!(result.is_err());
     }
 }
