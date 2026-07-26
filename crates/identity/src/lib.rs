@@ -30,14 +30,17 @@
 //!   reachable only by something holding that credential -- today, an operator
 //!   at the machine running the CLI. There is no remote refresh: a client that
 //!   is told its token expired cannot obtain a replacement over the network.
-//! - Lapsed tokens are not collected. An expired row stays until it is rotated
-//!   or its membership is removed, and [`SqliteIdentityStore::resolve_context`]
-//!   keeps finding it in order to report [`IdentityError::ExpiredToken`]
-//!   rather than a misleading [`IdentityError::InvalidToken`]. Short lifetimes
-//!   therefore accumulate rows. That is a deliberate trade -- an accurate
-//!   refusal over a self-pruning table -- and sweeping them is left to a later
-//!   change with a policy behind it, not folded into the read path where it
-//!   would let anyone force a write by replaying a dead token.
+//! - Lapsed tokens are not collected. An expired row stays until something
+//!   names it -- [`SqliteIdentityStore::rotate_token`] retiring it,
+//!   [`SqliteIdentityStore::revoke_token`], or the removal of the membership
+//!   it hangs off -- and [`SqliteIdentityStore::resolve_context`] keeps
+//!   finding it in order to report [`IdentityError::ExpiredToken`] rather than
+//!   a misleading [`IdentityError::InvalidToken`]. Nothing sweeps on a timer,
+//!   so short lifetimes accumulate rows. That is a deliberate trade -- an
+//!   accurate refusal over a self-pruning table -- and sweeping them is left
+//!   to a later change with a retention policy behind it, not folded into the
+//!   read path where it would let anyone force a write by replaying a dead
+//!   token.
 
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -205,21 +208,81 @@ const ORGANIZATION_BYTES: usize = 16; // 128-bit opaque organization id
 const TOKEN_PREFIX: &str = "cme_"; // Camelid Enterprise token marker
 const IDENTITY_SCHEMA_VERSION: i64 = 3;
 
-/// The absolute expiry instant `seconds` from now, for callers that think in
-/// lifetimes rather than in instants.
+/// How long a newly issued token stays valid.
 ///
-/// Expiry is stored absolute rather than as a duration so that a token's
-/// validity does not depend on when it is next read. The lifetime is nonzero
-/// because a zero-second lifetime issues a credential that is already dead:
-/// that is a misconfiguration, and it is better refused where it is written
-/// than honored at the point of use.
-///
-/// Both this and expiry checking read the system clock, so a backwards clock
-/// jump extends the validity of every outstanding token by the size of the
-/// jump. Revocation, which does not consult the clock, remains the control
-/// that does not depend on it.
-pub fn expires_in(seconds: NonZeroU64) -> i64 {
-    unix_now().saturating_add(i64::try_from(seconds.get()).unwrap_or(i64::MAX))
+/// One parameter rather than a second pair of `*_expiring_at` methods. Lifetime
+/// and organization scope are orthogonal, and spelling every combination as its
+/// own function doubles the surface each time another orthogonal attribute
+/// arrives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TokenLifetime {
+    /// Valid until revoked. What every token issued before expiry existed is,
+    /// and what every token carried across a migration stays.
+    Never,
+    /// Valid until this absolute instant, exclusive, on the clock
+    /// [`unix_now`] reads.
+    Until(i64),
+}
+
+impl TokenLifetime {
+    /// A lifetime of `seconds` starting now.
+    ///
+    /// Stored as the instant it resolves to rather than as a duration, so a
+    /// token's validity never depends on when it is next read.
+    ///
+    /// Nonzero because a zero-second lifetime is a typo, not a policy: it
+    /// issues a credential that is already dead. It is not a claim about
+    /// granularity -- expiry is compared in whole seconds, so the shortest
+    /// lifetime this can express in practice lands anywhere in `(0, 1]`
+    /// depending on where in the current second it is called.
+    pub fn expires_in(seconds: NonZeroU64) -> Self {
+        Self::Until(unix_now().saturating_add(i64::try_from(seconds.get()).unwrap_or(i64::MAX)))
+    }
+
+    fn expires_at(self) -> Option<i64> {
+        match self {
+            Self::Never => None,
+            Self::Until(instant) => Some(instant),
+        }
+    }
+}
+
+/// What lifetime a rotation gives the replacement credential.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RotationLifetime {
+    /// Reissue with the same lifetime the presented token was *issued* with,
+    /// measured from now.
+    ///
+    /// The default, and deliberately so. The commonest reason to rotate is a
+    /// credential nearing its expiry, and the safe outcome of that is another
+    /// credential with the same bound -- not a permanent one. Dropping the
+    /// bound is available, but it has to be asked for.
+    ///
+    /// A token issued without an expiry preserves that: nothing to inherit
+    /// means nothing is imposed.
+    Preserved,
+    /// Give the replacement this lifetime regardless of what the presented
+    /// token carried.
+    Replaced(TokenLifetime),
+}
+
+/// A user, for the operator who needs to find one again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct User {
+    principal_id: PrincipalId,
+    name: String,
+}
+
+impl User {
+    pub fn principal_id(&self) -> &PrincipalId {
+        &self.principal_id
+    }
+
+    /// The display label given at creation. Never a lookup key: two users may
+    /// share one.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// SQLite-backed identity store: users and their hashed tokens.
@@ -283,7 +346,8 @@ impl SqliteIdentityStore {
     /// it is held. Propagating that poisoning here would mean one unrelated
     /// panic during any identity operation permanently breaks every later
     /// one for the life of the process — in the gateway, that means every
-    /// request fails once this lock is poisoned, until restart. Every
+    /// request fails once this lock is poisoned, until restart.
+    ///
     /// Operations can use SQLite transactions while holding this guard. If a
     /// panic unwinds through one, `Transaction::drop` rolls it back before the
     /// mutex guard is released; rollback failures cannot be reported during
@@ -438,20 +502,14 @@ impl SqliteIdentityStore {
         Ok(())
     }
 
-    /// Issues a non-expiring token for a principal that belongs to exactly one
+    /// Issues a bearer token for a principal that belongs to exactly one
     /// organization. Multi-organization principals must use
     /// [`Self::issue_token_for_organization`] so the selected tenant is
     /// unambiguous.
-    pub fn issue_token(&self, principal: &PrincipalId) -> Result<String, IdentityError> {
-        self.issue_token_expiring_at(principal, None)
-    }
-
-    /// Issues a token for a principal that belongs to exactly one organization,
-    /// valid until `expires_at_unix`. `None` issues a token that never expires.
-    pub fn issue_token_expiring_at(
+    pub fn issue_token(
         &self,
         principal: &PrincipalId,
-        expires_at_unix: Option<i64>,
+        lifetime: TokenLifetime,
     ) -> Result<String, IdentityError> {
         let mut conn = self.locked_connection();
         let transaction = begin_write(&mut conn)?;
@@ -472,43 +530,56 @@ impl SqliteIdentityStore {
             [] => return Err(IdentityError::UnknownPrincipal),
             _ => return Err(IdentityError::AmbiguousOrganization),
         };
-        let token =
-            issue_token_in_transaction(&transaction, principal, &organization, expires_at_unix)?;
+        let token = issue_token_in_transaction(&transaction, principal, &organization, lifetime)?;
         transaction.commit()?;
         Ok(token)
     }
 
-    /// Issues a non-expiring bearer token for one principal in one
-    /// organization. Both the principal and organization must exist, and their
-    /// membership is required.
+    /// Issues a bearer token for one principal in one organization. Both the
+    /// principal and organization must exist, and their membership is
+    /// required.
     pub fn issue_token_for_organization(
         &self,
         principal: &PrincipalId,
         organization: &OrganizationId,
-    ) -> Result<String, IdentityError> {
-        self.issue_token_for_organization_expiring_at(principal, organization, None)
-    }
-
-    /// Issues a bearer token for one principal in one organization, valid until
-    /// `expires_at_unix`. `None` issues a token that never expires.
-    pub fn issue_token_for_organization_expiring_at(
-        &self,
-        principal: &PrincipalId,
-        organization: &OrganizationId,
-        expires_at_unix: Option<i64>,
+        lifetime: TokenLifetime,
     ) -> Result<String, IdentityError> {
         let mut conn = self.locked_connection();
         let transaction = begin_write(&mut conn)?;
-        let token =
-            issue_token_in_transaction(&transaction, principal, organization, expires_at_unix)?;
+        let token = issue_token_in_transaction(&transaction, principal, organization, lifetime)?;
         transaction.commit()?;
         Ok(token)
     }
 
+    /// Lists every user, so a principal id can be recovered rather than
+    /// remembered.
+    ///
+    /// Without this an operator who did not record the id printed by
+    /// `create-user` has no route back to the account: tokens are looked up by
+    /// hash, organizations are listed *from* a principal, and creating a user
+    /// again mints a different one. Expiry is what makes that reachable --
+    /// a lapsed token cannot be rotated, so re-issuing is the only way
+    /// forward, and re-issuing needs the id.
+    ///
+    /// Ordered oldest first, then by id, so repeated runs agree.
+    pub fn list_users(&self) -> Result<Vec<User>, IdentityError> {
+        let conn = self.locked_connection();
+        let mut statement = conn.prepare(
+            "SELECT principal_id, name FROM users ORDER BY created_at_unix, principal_id",
+        )?;
+        let users = statement
+            .query_map([], |row| {
+                Ok(User {
+                    principal_id: PrincipalId(row.get(0)?),
+                    name: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(users)
+    }
+
     /// Exchanges a valid token for a fresh secret with the same principal and
-    /// organization, and invalidates the presented one. `expires_at_unix`
-    /// applies to the replacement only; `None` makes the replacement
-    /// non-expiring regardless of what the presented token carried.
+    /// organization, and invalidates the presented one.
     ///
     /// Issue and revoke happen in one transaction, so there is no instant at
     /// which both secrets are live and none at which neither is: a caller that
@@ -519,10 +590,15 @@ impl SqliteIdentityStore {
     /// Rotation requires the plaintext of the token being replaced, exactly as
     /// [`Self::revoke_token`] does. It is a credential refresh for whoever
     /// holds the credential, not an administrative reset of someone else's.
+    ///
+    /// See [`RotationLifetime`] for what the replacement inherits.
+    /// [`RotationLifetime::Preserved`] carries the *original* lifetime forward
+    /// from now rather than the remaining one, because the reason to rotate a
+    /// credential nearing expiry is to get another full lifetime out of it.
     pub fn rotate_token(
         &self,
         token: &str,
-        expires_at_unix: Option<i64>,
+        lifetime: RotationLifetime,
     ) -> Result<String, IdentityError> {
         let mut conn = self.locked_connection();
         let transaction = begin_write(&mut conn)?;
@@ -530,10 +606,14 @@ impl SqliteIdentityStore {
         // only the credential rather than the access it grants, and any lapsed
         // token would remain a permanent key to a new one.
         let credential = lookup_credential(&transaction, token)?.still_valid(unix_now())?;
+        let lifetime = match lifetime {
+            RotationLifetime::Replaced(lifetime) => lifetime,
+            RotationLifetime::Preserved => credential.issued_lifetime(),
+        };
         let principal = PrincipalId(credential.principal_id);
         let organization = OrganizationId(credential.organization_id);
         let replacement =
-            issue_token_in_transaction(&transaction, &principal, &organization, expires_at_unix)?;
+            issue_token_in_transaction(&transaction, &principal, &organization, lifetime)?;
         let retired = transaction.execute(
             "DELETE FROM tokens WHERE token_hash = ?1",
             rusqlite::params![hash_token(token)],
@@ -618,6 +698,7 @@ fn principal_exists(
 struct Credential {
     principal_id: String,
     organization_id: String,
+    created_at_unix: i64,
     expires_at_unix: Option<i64>,
 }
 
@@ -634,13 +715,32 @@ impl Credential {
             _ => Ok(self),
         }
     }
+
+    /// The lifetime this credential was *issued* with, restated as an instant
+    /// that far from now.
+    ///
+    /// The original span, not the remaining one. A caller rotating a token
+    /// three days into a seven-day lifetime wants another seven days, not the
+    /// four they had left -- otherwise repeated rotation walks a credential
+    /// down to nothing while looking like it renewed it.
+    ///
+    /// Derived rather than stored: both endpoints are already columns, and a
+    /// third column would be a second place for the same fact to be wrong.
+    fn issued_lifetime(&self) -> TokenLifetime {
+        match self.expires_at_unix {
+            None => TokenLifetime::Never,
+            Some(expires_at) => TokenLifetime::Until(
+                unix_now().saturating_add(expires_at.saturating_sub(self.created_at_unix)),
+            ),
+        }
+    }
 }
 
 /// Looks a token up by hash, requiring the membership it was scoped to still
 /// exist. Says nothing about expiry; see [`Credential::still_valid`].
 fn lookup_credential(conn: &Connection, token: &str) -> Result<Credential, IdentityError> {
     conn.query_row(
-        "SELECT token.principal_id, token.organization_id, token.expires_at_unix
+        "SELECT token.principal_id, token.organization_id, token.created_at_unix, token.expires_at_unix
          FROM tokens AS token
          INNER JOIN organization_memberships AS membership
            ON membership.principal_id = token.principal_id
@@ -651,7 +751,8 @@ fn lookup_credential(conn: &Connection, token: &str) -> Result<Credential, Ident
             Ok(Credential {
                 principal_id: row.get(0)?,
                 organization_id: row.get(1)?,
-                expires_at_unix: row.get(2)?,
+                created_at_unix: row.get(2)?,
+                expires_at_unix: row.get(3)?,
             })
         },
     )
@@ -663,7 +764,7 @@ fn issue_token_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     principal: &PrincipalId,
     organization: &OrganizationId,
-    expires_at_unix: Option<i64>,
+    lifetime: TokenLifetime,
 ) -> Result<String, IdentityError> {
     if !principal_exists(transaction, principal)? {
         return Err(IdentityError::UnknownPrincipal);
@@ -689,7 +790,7 @@ fn issue_token_in_transaction(
             principal.0,
             organization.0,
             unix_now(),
-            expires_at_unix
+            lifetime.expires_at()
         ],
     )?;
     Ok(token)
@@ -1034,7 +1135,7 @@ mod tests {
     fn issued_token_resolves_to_the_issuing_principal() {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let principal = store.create_user("ada").unwrap();
-        let token = store.issue_token(&principal).unwrap();
+        let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
 
         assert_eq!(store.resolve(&token).unwrap(), principal);
     }
@@ -1050,7 +1151,7 @@ mod tests {
     fn revoked_token_no_longer_resolves() {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let principal = store.create_user("ada").unwrap();
-        let token = store.issue_token(&principal).unwrap();
+        let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
 
         store.revoke_token(&token).unwrap();
 
@@ -1092,7 +1193,7 @@ mod tests {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let ghost = PrincipalId("usr_does_not_exist".to_string());
         assert!(matches!(
-            store.issue_token(&ghost).unwrap_err(),
+            store.issue_token(&ghost, TokenLifetime::Never).unwrap_err(),
             IdentityError::UnknownPrincipal
         ));
     }
@@ -1101,8 +1202,8 @@ mod tests {
     fn a_principal_can_hold_multiple_independent_tokens() {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let principal = store.create_user("ada").unwrap();
-        let first = store.issue_token(&principal).unwrap();
-        let second = store.issue_token(&principal).unwrap();
+        let first = store.issue_token(&principal, TokenLifetime::Never).unwrap();
+        let second = store.issue_token(&principal, TokenLifetime::Never).unwrap();
 
         assert_ne!(first, second);
         assert_eq!(store.resolve(&first).unwrap(), principal);
@@ -1117,7 +1218,7 @@ mod tests {
     fn tokens_are_not_stored_in_plaintext() {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let principal = store.create_user("ada").unwrap();
-        let token = store.issue_token(&principal).unwrap();
+        let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
 
         let conn = store.conn.lock().unwrap();
         let stored_hash: String = conn
@@ -1149,7 +1250,7 @@ mod tests {
             "the poisoning thread must have panicked"
         );
 
-        let token = store.issue_token(&principal).unwrap();
+        let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
         assert_eq!(store.resolve(&token).unwrap(), principal);
     }
 
@@ -1174,7 +1275,7 @@ mod tests {
             .create_user_in_organization("ada", &organization)
             .unwrap();
         let token = store
-            .issue_token_for_organization(&principal, &organization)
+            .issue_token_for_organization(&principal, &organization, TokenLifetime::Never)
             .unwrap();
 
         let context = store.resolve_context(&token).unwrap();
@@ -1203,15 +1304,17 @@ mod tests {
             expected_organizations
         );
         assert!(matches!(
-            store.issue_token(&principal).unwrap_err(),
+            store
+                .issue_token(&principal, TokenLifetime::Never)
+                .unwrap_err(),
             IdentityError::AmbiguousOrganization
         ));
 
         let first_token = store
-            .issue_token_for_organization(&principal, &first)
+            .issue_token_for_organization(&principal, &first, TokenLifetime::Never)
             .unwrap();
         let second_token = store
-            .issue_token_for_organization(&principal, &second)
+            .issue_token_for_organization(&principal, &second, TokenLifetime::Never)
             .unwrap();
         assert_eq!(
             store
@@ -1238,7 +1341,7 @@ mod tests {
 
         assert!(matches!(
             store
-                .issue_token_for_organization(&principal, &second)
+                .issue_token_for_organization(&principal, &second, TokenLifetime::Never)
                 .unwrap_err(),
             IdentityError::NotOrganizationMember
         ));
@@ -1360,10 +1463,10 @@ mod tests {
             .add_principal_to_organization(&principal, &second)
             .unwrap();
         let first_token = store
-            .issue_token_for_organization(&principal, &first)
+            .issue_token_for_organization(&principal, &first, TokenLifetime::Never)
             .unwrap();
         let second_token = store
-            .issue_token_for_organization(&principal, &second)
+            .issue_token_for_organization(&principal, &second, TokenLifetime::Never)
             .unwrap();
 
         store
@@ -1393,7 +1496,7 @@ mod tests {
     fn context_resolution_rejects_a_corrupt_token_without_membership() {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let principal = store.create_user("ada").unwrap();
-        let token = store.issue_token(&principal).unwrap();
+        let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
         let organization = store
             .organizations_for_principal(&principal)
             .unwrap()
@@ -1430,7 +1533,7 @@ mod tests {
             let organization = organization.clone();
             threads.push(std::thread::spawn(move || {
                 store
-                    .issue_token_for_organization(&principal, &organization)
+                    .issue_token_for_organization(&principal, &organization, TokenLifetime::Never)
                     .unwrap()
             }));
         }
@@ -1478,9 +1581,9 @@ mod tests {
     fn a_token_issued_with_a_future_expiry_still_resolves() {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let principal = store.create_user("ada").unwrap();
-        let expires_at = expires_in(NonZeroU64::new(3600).unwrap());
+        let expires_at = unix_now() + 3600;
         let token = store
-            .issue_token_expiring_at(&principal, Some(expires_at))
+            .issue_token(&principal, TokenLifetime::Until(expires_at))
             .unwrap();
 
         assert_eq!(
@@ -1494,7 +1597,7 @@ mod tests {
     fn a_token_issued_without_an_expiry_stays_non_expiring() {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let principal = store.create_user("ada").unwrap();
-        let token = store.issue_token(&principal).unwrap();
+        let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
 
         assert_eq!(stored_expiry(&store, &token), None);
         assert_eq!(store.resolve(&token).unwrap(), principal);
@@ -1505,7 +1608,7 @@ mod tests {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let principal = store.create_user("ada").unwrap();
         let token = store
-            .issue_token_expiring_at(&principal, Some(unix_now() - 1))
+            .issue_token(&principal, TokenLifetime::Until(unix_now() - 1))
             .unwrap();
 
         assert!(matches!(
@@ -1525,7 +1628,7 @@ mod tests {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let principal = store.create_user("ada").unwrap();
         let token = store
-            .issue_token_expiring_at(&principal, Some(unix_now()))
+            .issue_token(&principal, TokenLifetime::Until(unix_now()))
             .unwrap();
 
         assert!(matches!(
@@ -1539,7 +1642,7 @@ mod tests {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let principal = store.create_user("ada").unwrap();
         store
-            .issue_token_expiring_at(&principal, Some(unix_now() - 1))
+            .issue_token(&principal, TokenLifetime::Until(unix_now() - 1))
             .unwrap();
 
         // A token that was never issued is still indistinguishable from a
@@ -1558,10 +1661,12 @@ mod tests {
             .create_user_in_organization("ada", &organization)
             .unwrap();
         let original = store
-            .issue_token_for_organization(&principal, &organization)
+            .issue_token_for_organization(&principal, &organization, TokenLifetime::Never)
             .unwrap();
 
-        let rotated = store.rotate_token(&original, None).unwrap();
+        let rotated = store
+            .rotate_token(&original, RotationLifetime::Replaced(TokenLifetime::Never))
+            .unwrap();
 
         assert_ne!(rotated, original);
         let context = store.resolve_context(&rotated).unwrap();
@@ -1580,14 +1685,124 @@ mod tests {
     fn rotation_sets_the_replacement_lifetime_independently_of_the_old_one() {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let principal = store.create_user("ada").unwrap();
-        let expires_at = expires_in(NonZeroU64::new(600).unwrap());
+        let expires_at = unix_now() + 600;
 
-        let non_expiring = store.issue_token(&principal).unwrap();
-        let now_expiring = store.rotate_token(&non_expiring, Some(expires_at)).unwrap();
+        let non_expiring = store.issue_token(&principal, TokenLifetime::Never).unwrap();
+        let now_expiring = store
+            .rotate_token(
+                &non_expiring,
+                RotationLifetime::Replaced(TokenLifetime::Until(expires_at)),
+            )
+            .unwrap();
         assert_eq!(stored_expiry(&store, &now_expiring), Some(expires_at));
 
-        let back_to_permanent = store.rotate_token(&now_expiring, None).unwrap();
+        let back_to_permanent = store
+            .rotate_token(
+                &now_expiring,
+                RotationLifetime::Replaced(TokenLifetime::Never),
+            )
+            .unwrap();
         assert_eq!(stored_expiry(&store, &back_to_permanent), None);
+    }
+
+    #[test]
+    fn rotation_preserves_the_issued_lifetime_by_default() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let principal = store.create_user("ada").unwrap();
+        let lifetime_seconds = 3600;
+        let token = store
+            .issue_token(
+                &principal,
+                TokenLifetime::Until(unix_now() + lifetime_seconds),
+            )
+            .unwrap();
+
+        let rotated = store
+            .rotate_token(&token, RotationLifetime::Preserved)
+            .unwrap();
+
+        // The default must not quietly convert a time-bounded credential into
+        // a permanent one: rotating because expiry is near is the commonest
+        // reason to rotate at all, and silently dropping the bound would make
+        // the feature's own happy path the one that defeats it.
+        let expiry = stored_expiry(&store, &rotated).expect("the bound must survive rotation");
+        let renewed_for = expiry - unix_now();
+        assert!(
+            (lifetime_seconds - 2..=lifetime_seconds).contains(&renewed_for),
+            "expected roughly {lifetime_seconds}s of fresh lifetime, got {renewed_for}s"
+        );
+    }
+
+    #[test]
+    fn rotation_renews_the_original_lifetime_rather_than_the_remaining_one() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let principal = store.create_user("ada").unwrap();
+        // Issued for an hour, and most of it already spent: the stored row is
+        // written as though it were created 3540 seconds ago.
+        let token = store
+            .issue_token(&principal, TokenLifetime::Until(unix_now() + 60))
+            .unwrap();
+        store
+            .locked_connection()
+            .execute(
+                "UPDATE tokens SET created_at_unix = ?1 WHERE token_hash = ?2",
+                rusqlite::params![unix_now() - 3540, hash_token(&token)],
+            )
+            .unwrap();
+
+        let rotated = store
+            .rotate_token(&token, RotationLifetime::Preserved)
+            .unwrap();
+
+        // A full hour again, not the minute that was left. Carrying the
+        // remainder forward would walk a credential down to nothing across
+        // repeated rotations while appearing to renew it.
+        let renewed_for = stored_expiry(&store, &rotated).unwrap() - unix_now();
+        assert!(
+            (3598..=3600).contains(&renewed_for),
+            "expected the original 3600s lifetime back, got {renewed_for}s"
+        );
+    }
+
+    #[test]
+    fn rotation_preserves_the_absence_of_a_lifetime() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let principal = store.create_user("ada").unwrap();
+        let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
+
+        let rotated = store
+            .rotate_token(&token, RotationLifetime::Preserved)
+            .unwrap();
+
+        // Nothing to inherit means nothing imposed: preserving must not
+        // invent a bound any more than it may drop one.
+        assert_eq!(stored_expiry(&store, &rotated), None);
+    }
+
+    #[test]
+    fn users_can_be_listed_so_a_principal_id_is_recoverable() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        assert!(store.list_users().unwrap().is_empty());
+        let ada = store.create_user("ada").unwrap();
+        let grace = store.create_user("grace").unwrap();
+
+        let users = store.list_users().unwrap();
+
+        // Without this an operator who did not record the id printed by
+        // `create-user` cannot re-issue after a token lapses, and a lapsed
+        // token cannot be rotated -- so the account is stranded.
+        assert_eq!(users.len(), 2);
+        let ada_entry = users
+            .iter()
+            .find(|user| user.principal_id() == &ada)
+            .expect("ada must be listed");
+        assert_eq!(ada_entry.name(), "ada");
+        assert!(users.iter().any(|user| user.principal_id() == &grace));
+        // The id is usable as an id, not merely printable.
+        let reissued = store
+            .issue_token(ada_entry.principal_id(), TokenLifetime::Never)
+            .unwrap();
+        assert_eq!(store.resolve(&reissued).unwrap(), ada);
     }
 
     #[test]
@@ -1598,11 +1813,11 @@ mod tests {
         // second and compare against an instant that was never stored.
         let expired_at = unix_now() - 1;
         let expired = store
-            .issue_token_expiring_at(&principal, Some(expired_at))
+            .issue_token(&principal, TokenLifetime::Until(expired_at))
             .unwrap();
 
         assert!(matches!(
-            store.rotate_token(&expired, None),
+            store.rotate_token(&expired, RotationLifetime::Replaced(TokenLifetime::Never)),
             Err(IdentityError::ExpiredToken)
         ));
         // The refusal issued nothing and consumed nothing.
@@ -1614,10 +1829,13 @@ mod tests {
     fn rotating_an_unknown_token_issues_nothing() {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let principal = store.create_user("ada").unwrap();
-        let live = store.issue_token(&principal).unwrap();
+        let live = store.issue_token(&principal, TokenLifetime::Never).unwrap();
 
         assert!(matches!(
-            store.rotate_token("cme_never_issued", None),
+            store.rotate_token(
+                "cme_never_issued",
+                RotationLifetime::Replaced(TokenLifetime::Never)
+            ),
             Err(IdentityError::InvalidToken)
         ));
         assert_eq!(token_count(&store), 1);
@@ -1637,10 +1855,15 @@ mod tests {
             .add_principal_to_organization(&principal, &second)
             .unwrap();
         let second_token = store
-            .issue_token_for_organization(&principal, &second)
+            .issue_token_for_organization(&principal, &second, TokenLifetime::Never)
             .unwrap();
 
-        let rotated = store.rotate_token(&second_token, None).unwrap();
+        let rotated = store
+            .rotate_token(
+                &second_token,
+                RotationLifetime::Replaced(TokenLifetime::Never),
+            )
+            .unwrap();
 
         // `issue_token` would have refused this principal as ambiguous, so
         // rotation must carry the scope rather than re-derive it.
@@ -1905,7 +2128,7 @@ mod tests {
         };
         let token = {
             let store = SqliteIdentityStore::open(&path).unwrap();
-            store.issue_token(&principal).unwrap()
+            store.issue_token(&principal, TokenLifetime::Never).unwrap()
         };
 
         let stores = assert_all_opened(open_concurrently(&path));
@@ -1927,7 +2150,7 @@ mod tests {
         let tokens: Vec<String> = (0..ROTATORS)
             .map(|_| {
                 store
-                    .issue_token_for_organization(&principal, &organization)
+                    .issue_token_for_organization(&principal, &organization, TokenLifetime::Never)
                     .unwrap()
             })
             .collect();
@@ -1944,7 +2167,7 @@ mod tests {
             let barrier = std::sync::Arc::clone(&barrier);
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
-                store.rotate_token(&token, None)
+                store.rotate_token(&token, RotationLifetime::Replaced(TokenLifetime::Never))
             }));
         }
         let outcomes: Vec<_> = threads
@@ -1978,7 +2201,7 @@ mod tests {
         let path = directory.path().join("identity.sqlite");
         let store = std::sync::Arc::new(SqliteIdentityStore::open(&path).unwrap());
         let principal = store.create_user("ada").unwrap();
-        let token = store.issue_token(&principal).unwrap();
+        let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
 
         // The same credential presented by sixteen racers. Exactly one may
         // win: rotation consumes what it replaces, so a second success would
@@ -1991,7 +2214,7 @@ mod tests {
             let token = token.clone();
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
-                store.rotate_token(&token, None)
+                store.rotate_token(&token, RotationLifetime::Replaced(TokenLifetime::Never))
             }));
         }
         let outcomes: Vec<_> = threads
@@ -2019,9 +2242,12 @@ mod tests {
     #[test]
     fn expires_in_is_a_lifetime_measured_from_now() {
         let before = unix_now();
-        let expires_at = expires_in(NonZeroU64::new(60).unwrap());
+        let lifetime = TokenLifetime::expires_in(NonZeroU64::new(60).unwrap());
         let after = unix_now();
 
+        let TokenLifetime::Until(expires_at) = lifetime else {
+            panic!("a bounded lifetime must resolve to an instant");
+        };
         assert!((before + 60..=after + 60).contains(&expires_at));
     }
 }

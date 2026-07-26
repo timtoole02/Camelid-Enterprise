@@ -3,7 +3,7 @@ use camelid_enterprise_gateway::{
     DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT,
 };
 use clap::{Parser, Subcommand};
-use identity::{OrganizationId, PrincipalId, SqliteIdentityStore};
+use identity::{OrganizationId, PrincipalId, RotationLifetime, SqliteIdentityStore, TokenLifetime};
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -91,6 +91,16 @@ enum Command {
         /// Display label for the user. Never used as a lookup key.
         name: String,
     },
+    /// List every user as `<principal-id>\t<name>`, one per line.
+    ///
+    /// The way back to a principal id that was not written down when
+    /// `create-user` printed it. Without it a lapsed token is a dead end:
+    /// rotation refuses an expired credential, re-issuing needs the id, and
+    /// creating the user again mints a different one.
+    ListUsers {
+        #[arg(long, env = "CAMELID_GATEWAY_IDENTITY_DB")]
+        identity_db: PathBuf,
+    },
     /// Create an organization and print its opaque organization id.
     CreateOrganization {
         #[arg(long, env = "CAMELID_GATEWAY_IDENTITY_DB")]
@@ -146,6 +156,12 @@ enum Command {
     /// which both work, and none in which neither does. Requires the plaintext
     /// of the token being replaced, so this refreshes a credential for whoever
     /// holds it rather than resetting someone else's.
+    ///
+    /// By default the replacement carries the same lifetime the presented
+    /// token was issued with, measured from now -- rotating a credential that
+    /// is nearing expiry gives another full lifetime, not a permanent
+    /// credential. Dropping the bound is available as `--no-expiry`, but it
+    /// has to be asked for.
     RotateToken {
         #[arg(long, env = "CAMELID_GATEWAY_IDENTITY_DB")]
         identity_db: PathBuf,
@@ -154,11 +170,15 @@ enum Command {
         /// it in shell history and briefly visible to other processes via
         /// `ps`; prefer `-` and pipe it in.
         token: String,
-        /// Lifetime of the replacement, in seconds. Omitted issues a
-        /// non-expiring replacement regardless of what the presented token
-        /// carried: the lifetime is chosen here, not inherited.
-        #[arg(long)]
+        /// Give the replacement this lifetime in seconds instead of the one
+        /// the presented token was issued with.
+        #[arg(long, conflicts_with = "no_expiry")]
         expires_in_seconds: Option<NonZeroU64>,
+        /// Give the replacement no expiry at all, discarding whatever bound
+        /// the presented token carried. This converts a time-limited
+        /// credential into a permanent one, so it is never the default.
+        #[arg(long)]
+        no_expiry: bool,
     },
     /// Revoke a bearer token so it no longer resolves.
     RevokeToken {
@@ -208,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         Command::CreateUser { identity_db, name } => create_user(&identity_db, &name),
+        Command::ListUsers { identity_db } => list_users(&identity_db),
         Command::CreateOrganization { identity_db, name } => {
             create_organization(&identity_db, &name)
         }
@@ -240,7 +261,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             identity_db,
             token,
             expires_in_seconds,
-        } => rotate_token(&identity_db, &token, expires_in_seconds),
+            no_expiry,
+        } => rotate_token(&identity_db, &token, expires_in_seconds, no_expiry),
         Command::RevokeToken { identity_db, token } => revoke_token(&identity_db, &token),
     }
 }
@@ -354,6 +376,16 @@ fn create_user(identity_db: &Path, name: &str) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+fn list_users(identity_db: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let store = SqliteIdentityStore::open(identity_db)?;
+    for user in store.list_users()? {
+        // Id first so the line stays usable with `cut -f1` even though names
+        // may contain spaces; a tab keeps them separable when they do.
+        println!("{}\t{}", user.principal_id(), user.name());
+    }
+    Ok(())
+}
+
 fn create_organization(identity_db: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let store = SqliteIdentityStore::open(identity_db)?;
     let organization = store.create_organization(name)?;
@@ -408,14 +440,14 @@ fn issue_token(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = SqliteIdentityStore::open(identity_db)?;
     let principal = PrincipalId::new(principal.to_string());
-    let expires_at = expires_in_seconds.map(identity::expires_in);
+    let lifetime = expires_in_seconds.map_or(TokenLifetime::Never, TokenLifetime::expires_in);
     let token = match organization {
-        Some(organization) => store.issue_token_for_organization_expiring_at(
+        Some(organization) => store.issue_token_for_organization(
             &principal,
             &OrganizationId::new(organization.to_string()),
-            expires_at,
+            lifetime,
         )?,
-        None => store.issue_token_expiring_at(&principal, expires_at)?,
+        None => store.issue_token(&principal, lifetime)?,
     };
     println!("{token}");
     Ok(())
@@ -425,10 +457,20 @@ fn rotate_token(
     identity_db: &Path,
     token: &str,
     expires_in_seconds: Option<NonZeroU64>,
+    no_expiry: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Clap rejects the two flags together, so at most one arm applies. Absent
+    // both, the replacement keeps the lifetime the presented token was issued
+    // with: the default must not quietly convert a bounded credential into a
+    // permanent one.
+    let lifetime = match (expires_in_seconds, no_expiry) {
+        (Some(seconds), _) => RotationLifetime::Replaced(TokenLifetime::expires_in(seconds)),
+        (None, true) => RotationLifetime::Replaced(TokenLifetime::Never),
+        (None, false) => RotationLifetime::Preserved,
+    };
     let token = read_secret_arg(token)?;
     let store = SqliteIdentityStore::open(identity_db)?;
-    let replacement = store.rotate_token(&token, expires_in_seconds.map(identity::expires_in))?;
+    let replacement = store.rotate_token(&token, lifetime)?;
     println!("{replacement}");
     Ok(())
 }

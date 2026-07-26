@@ -14,7 +14,7 @@ use http_body_util::BodyExt;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use identity::SqliteIdentityStore;
+use identity::{SqliteIdentityStore, TokenLifetime};
 use replica_contract::{HttpMethod, PUBLIC_ROUTES};
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -572,7 +572,7 @@ async fn rejects_requests_with_an_expired_bearer_token() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
     let expired = store
-        .issue_token_expiring_at(&principal, Some(identity::unix_now() - 1))
+        .issue_token(&principal, TokenLifetime::Until(identity::unix_now() - 1))
         .unwrap();
     // Deliberately unreachable: were the expired token forwarded, this would
     // answer 502 rather than 401, so the assertion cannot pass by accident.
@@ -599,12 +599,60 @@ async fn rejects_requests_with_an_expired_bearer_token() {
     let response = client().request(request).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(response.headers()["www-authenticate"], "Bearer");
+    // The distinction has to be machine-readable to be worth making. `type` is
+    // the discriminator this API uses everywhere else, and the challenge is
+    // RFC 6750's: `invalid_token` is the registered code covering expiry, so
+    // the specificity rides in the description and in `type`.
+    assert_eq!(
+        response.headers()["www-authenticate"],
+        r#"Bearer error="invalid_token", error_description="expired bearer token""#
+    );
     assert_eq!(
         to_bytes(Body::new(response.into_body()), 1024)
             .await
             .unwrap(),
-        r#"{"error":{"message":"expired bearer token","type":"unauthorized"}}"#
+        r#"{"error":{"message":"expired bearer token","type":"token_expired"}}"#
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_bearer_token_is_not_reported_as_an_expired_one() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let unreachable_upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+
+    let gateway = spawn_gateway_with_auth(
+        unreachable_upstream,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: None,
+        },
+    )
+    .await;
+    let request = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .header("authorization", "Bearer cme_never_issued")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = client().request(request).await.unwrap();
+
+    // The other half of the contract above: an unknown credential keeps the
+    // pre-existing `unauthorized` type, so a client branching on
+    // `token_expired` cannot be told to go refresh a token that never existed.
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers()["www-authenticate"],
+        r#"Bearer error="invalid_token", error_description="invalid bearer token""#
+    );
+    assert_eq!(
+        to_bytes(Body::new(response.into_body()), 1024)
+            .await
+            .unwrap(),
+        r#"{"error":{"message":"invalid bearer token","type":"unauthorized"}}"#
     );
 }
 
@@ -613,9 +661,9 @@ async fn forwards_requests_carrying_a_token_that_has_not_expired_yet() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
     let token = store
-        .issue_token_expiring_at(
+        .issue_token(
             &principal,
-            Some(identity::expires_in(NonZeroU64::new(3600).unwrap())),
+            TokenLifetime::expires_in(NonZeroU64::new(3600).unwrap()),
         )
         .unwrap();
 
@@ -656,7 +704,7 @@ async fn forwards_requests_carrying_a_token_that_has_not_expired_yet() {
 async fn forwards_requests_carrying_a_valid_bearer_token() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
 
     let captured = Arc::new(Mutex::new(None));
     let upstream = spawn_server(
@@ -691,7 +739,7 @@ async fn forwards_requests_carrying_a_valid_bearer_token() {
 async fn quota_rejects_a_request_once_the_organization_exceeds_its_limit() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
 
     let upstream_calls = Arc::new(AtomicUsize::new(0));
     let upstream = spawn_server(Router::new().fallback(any({
@@ -755,9 +803,9 @@ async fn quota_rejects_a_request_once_the_organization_exceeds_its_limit() {
 async fn quota_tracks_organizations_independently() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let ada = store.create_user("ada").unwrap();
-    let ada_token = store.issue_token(&ada).unwrap();
+    let ada_token = store.issue_token(&ada, TokenLifetime::Never).unwrap();
     let grace = store.create_user("grace").unwrap();
-    let grace_token = store.issue_token(&grace).unwrap();
+    let grace_token = store.issue_token(&grace, TokenLifetime::Never).unwrap();
 
     let upstream =
         spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
@@ -802,7 +850,7 @@ async fn quota_tracks_organizations_independently() {
 async fn quota_is_not_charged_by_requests_that_fail_authentication() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
 
     let upstream =
         spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
@@ -843,7 +891,7 @@ async fn quota_is_not_charged_by_requests_that_fail_authentication() {
 async fn quota_charges_a_request_rejected_by_admission_control() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
     let release = Arc::new(Notify::new());
     let upstream = spawn_server(
         Router::new()
@@ -897,7 +945,7 @@ async fn quota_charges_a_request_rejected_by_admission_control() {
 async fn quota_charges_a_request_when_the_upstream_is_unavailable() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let unavailable_upstream = listener.local_addr().unwrap();
     drop(listener);
@@ -1418,7 +1466,7 @@ async fn overwrites_a_client_supplied_request_id() {
 async fn audit_log_records_both_forwarded_and_rejected_requests() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
     let organization = store.organizations_for_principal(&principal).unwrap();
     assert_eq!(organization.len(), 1);
 
@@ -1496,6 +1544,73 @@ async fn audit_log_records_both_forwarded_and_rejected_requests() {
         organization[0].to_string()
     );
     assert_eq!(forwarded_record["request_id"], upstream_request_id);
+    assert!(
+        rejected_record["reason"] == "missing_token",
+        "a refusal names itself: {rejected_record}"
+    );
+    assert!(
+        forwarded_record["reason"].is_null(),
+        "a forwarded request has no gateway refusal to name: {forwarded_record}"
+    );
+}
+
+/// Both refusals are `401` with a null principal, so without a recorded reason
+/// their audit lines are byte-identical and an operator cannot tell a client
+/// using a lapsed credential from one presenting an unknown secret.
+#[tokio::test]
+async fn audit_log_distinguishes_an_expired_token_from_an_invalid_one() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let expired = store
+        .issue_token(&principal, TokenLifetime::Until(identity::unix_now() - 1))
+        .unwrap();
+    let unreachable_upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let gateway = spawn_gateway_with_audit(
+        unreachable_upstream,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: None,
+        },
+        gateway_log(&audit_path),
+    )
+    .await;
+
+    for token in [expired.as_str(), "cme_never_issued"] {
+        let request = Request::get(format!("http://{}/v1/models", gateway.addr))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            client().request(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    let records = read_audit_records(&audit_path, 2).await;
+    let reasons: Vec<&str> = records
+        .iter()
+        .map(|record| {
+            record["reason"]
+                .as_str()
+                .expect("every refusal names itself")
+        })
+        .collect();
+    assert!(
+        reasons.contains(&"expired_token") && reasons.contains(&"invalid_token"),
+        "the two refusals must be distinguishable in the audit log: {reasons:?}"
+    );
+    for record in &records {
+        assert_eq!(record["status"], 401);
+        assert!(record["principal"].is_null());
+    }
 }
 
 /// Under concurrent load the audit writer must produce exactly one complete,
@@ -1571,7 +1686,7 @@ async fn usage_log_records_completed_authenticated_stream_bytes_without_changing
         .organizations_for_principal(&principal)
         .unwrap()
         .remove(0);
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
     let upstream =
         spawn_server(Router::new().route("/v1/chat/completions", post(usage_response))).await;
     let dir = tempfile::tempdir().unwrap();
@@ -1634,7 +1749,7 @@ async fn usage_log_records_completed_authenticated_stream_bytes_without_changing
 async fn usage_log_records_partial_response_when_the_upstream_body_errors() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
     let release = Arc::new(Notify::new());
     let upstream = spawn_server(
         Router::new()
@@ -1684,7 +1799,7 @@ async fn usage_log_records_partial_response_when_the_upstream_body_errors() {
 async fn usage_log_records_an_incomplete_response_stream() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
     let upstream_dropped = Arc::new(Notify::new());
     let upstream = spawn_server(
         Router::new()
@@ -1730,7 +1845,7 @@ async fn usage_log_records_an_incomplete_response_stream() {
 async fn usage_log_records_a_gateway_timeout_separately_from_an_incomplete_stream() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
     let release = Arc::new(Notify::new());
     let upstream = spawn_server(
         Router::new()
@@ -1776,7 +1891,7 @@ async fn usage_log_records_a_gateway_timeout_separately_from_an_incomplete_strea
 async fn usage_log_records_gateway_failures_after_authentication_and_quota() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let unavailable_upstream = listener.local_addr().unwrap();
     drop(listener);
@@ -1820,7 +1935,7 @@ async fn usage_log_records_gateway_failures_after_authentication_and_quota() {
 async fn usage_log_records_an_admission_rejection_after_quota_admission() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
     let release = Arc::new(Notify::new());
     let upstream = spawn_server(
         Router::new()
@@ -1886,7 +2001,7 @@ async fn usage_log_records_an_admission_rejection_after_quota_admission() {
 async fn usage_log_excludes_authentication_and_quota_rejections() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
     let upstream =
         spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
     let dir = tempfile::tempdir().unwrap();
@@ -1941,7 +2056,7 @@ async fn usage_log_is_not_torn_by_concurrent_completed_requests() {
     const REQUESTS: usize = 48;
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
-    let token = store.issue_token(&principal).unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
     let upstream =
         spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
     let dir = tempfile::tempdir().unwrap();
