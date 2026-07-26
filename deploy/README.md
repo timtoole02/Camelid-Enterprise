@@ -26,12 +26,17 @@ an operator supplies an identity deployment and enables authentication.
 With both an identity database and `CAMELID_GATEWAY_USAGE_LOG=<path>`, the
 gateway also writes an append-only JSONL terminal transport record for each
 authenticated, quota-admitted request:
-`{ts, request_id, principal, organization, method, path, response_head_status, request_bytes, response_bytes, outcome}`.
-`outcome` is `completed`, `body_error`, or `client_disconnect`; byte counts are
-opaque payload bytes observed by the gateway, not tokenizer usage or billable
-inference units. The log is best-effort and asynchronous: a process crash or
-SIGTERM can lose queued records, and each pod writes its own file. It is useful
-evidence for later durable aggregation, not a replacement for it.
+`{ts, started_ts, duration_ms, request_id, principal, organization, method, path, response_head_status, request_bytes, response_bytes, stream_outcome}`.
+`stream_outcome` is `completed` when the response reached EOF, `body_error`
+when it returned an error, `gateway_timeout` when the gateway's connection
+deadline closed it, or `incomplete` when the stream was dropped without an
+observable cause. `request_bytes` is `null` unless the gateway forwarded the
+request and observed its body reach EOF; `0` is therefore a known empty body,
+not a default for an unmeasured one. Byte counts are opaque payload bytes
+observed by the gateway, not tokenizer usage or billable inference units.
+The log is best-effort: a process crash or SIGTERM can lose queued records, and
+each pod writes its own file. It is useful evidence for later durable
+aggregation, not a replacement for it.
 Only the OpenAI-compatible `/v1` inference surface is public through the gateway;
 replica `/api`, embedded WebUI, workspace, and model-lifecycle routes return 404.
 The gateway admits at most 256 concurrent request streams by default (including
@@ -140,7 +145,11 @@ Adjust before applying:
   JSONL evidence must survive pod replacement. The stock manifest supplies
   neither identity nor a usage-log volume, so it emits no usage records. These
   raw gateway byte counters and terminal outcomes are not tokenizer usage,
-  billing, or a durable aggregation service.
+  billing, or a durable aggregation service. The gateway opens each configured
+  audit and usage file before it binds its listener, rejects missing parents or
+  unwritable destinations at startup, and rejects audit and usage paths that
+  resolve to the same file. Runtime writes use a bounded dedicated writer queue:
+  a full queue or writer failure loses records but emits rate-limited warnings.
 - **Shutdown drain** — both gateway and replica stop accepting connections on
   SIGTERM and drain active streams. The examples grant 300 seconds before
   kubelet may send SIGKILL; keep the replica window at least as long as the

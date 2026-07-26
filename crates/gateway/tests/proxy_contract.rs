@@ -7,7 +7,7 @@ use axum::Router;
 use bytes::Bytes;
 use camelid_enterprise_gateway::{
     router as gateway_router, router_with_max_in_flight, router_with_options, GatewayAuth,
-    OrgQuota, UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT,
+    GatewayLog, OrgQuota, UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT,
 };
 use futures_util::stream;
 use http_body_util::BodyExt;
@@ -19,7 +19,7 @@ use replica_contract::{HttpMethod, PUBLIC_ROUTES};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -85,7 +85,7 @@ async fn spawn_gateway_with_auth(upstream: SocketAddr, auth: GatewayAuth) -> Tes
 async fn spawn_gateway_with_audit(
     upstream: SocketAddr,
     auth: GatewayAuth,
-    audit: Arc<PathBuf>,
+    audit: Arc<GatewayLog>,
 ) -> TestServer {
     spawn_gateway_with_options(
         upstream,
@@ -102,7 +102,7 @@ async fn spawn_gateway_with_options(
     max_in_flight: NonZeroUsize,
     max_connection_duration: Duration,
     auth: GatewayAuth,
-    audit: Option<Arc<PathBuf>>,
+    audit: Option<Arc<GatewayLog>>,
 ) -> TestServer {
     let upstream = UpstreamOrigin::parse(&format!("http://{upstream}")).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -119,6 +119,10 @@ async fn spawn_gateway_with_options(
         .unwrap();
     });
     TestServer { addr, task }
+}
+
+fn gateway_log(path: &Path) -> Arc<GatewayLog> {
+    GatewayLog::open(path).unwrap()
 }
 
 fn client() -> Client<HttpConnector, Body> {
@@ -186,6 +190,7 @@ async fn capture_request(
 
 async fn usage_response(request: Request) -> Response {
     let _ = to_bytes(request.into_body(), 1024).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(75)).await;
     Response::new(Body::from("generated"))
 }
 
@@ -1349,7 +1354,7 @@ async fn audit_log_records_both_forwarded_and_rejected_requests() {
             quota: None,
             usage: None,
         },
-        Arc::new(audit_path.clone()),
+        gateway_log(&audit_path),
     )
     .await;
 
@@ -1427,7 +1432,7 @@ async fn audit_log_is_not_torn_by_concurrent_requests() {
     let gateway = spawn_gateway_with_audit(
         upstream.addr,
         GatewayAuth::Disabled,
-        Arc::new(audit_path.clone()),
+        gateway_log(&audit_path),
     )
     .await;
 
@@ -1494,9 +1499,9 @@ async fn usage_log_records_completed_authenticated_stream_bytes_without_changing
         GatewayAuth::RequireToken {
             store: Arc::new(store),
             quota: None,
-            usage: Some(Arc::new(usage_path.clone())),
+            usage: Some(gateway_log(&usage_path)),
         },
-        Some(Arc::new(audit_path.clone())),
+        Some(gateway_log(&audit_path)),
     )
     .await;
 
@@ -1526,12 +1531,17 @@ async fn usage_log_records_completed_authenticated_stream_bytes_without_changing
     assert_eq!(record["response_head_status"], 200);
     assert_eq!(record["request_bytes"], 6);
     assert_eq!(record["response_bytes"], 9);
-    assert_eq!(record["outcome"], "completed");
+    assert_eq!(record["stream_outcome"], "completed");
+    assert!(record["started_ts"].as_f64().unwrap() <= record["ts"].as_f64().unwrap());
+    assert!(
+        record["duration_ms"].as_u64().unwrap() >= 50,
+        "duration must include the upstream response-head wait: {record}"
+    );
 
     let audit = read_audit_records(&audit_path, 1).await;
     assert_eq!(audit[0]["request_id"], record["request_id"]);
     assert_eq!(audit[0]["status"], 200);
-    assert!(audit[0].get("outcome").is_none());
+    assert!(audit[0].get("stream_outcome").is_none());
     assert!(audit[0].get("request_bytes").is_none());
 }
 
@@ -1554,7 +1564,7 @@ async fn usage_log_records_partial_response_when_the_upstream_body_errors() {
         GatewayAuth::RequireToken {
             store: Arc::new(store),
             quota: None,
-            usage: Some(Arc::new(usage_path.clone())),
+            usage: Some(gateway_log(&usage_path)),
         },
     )
     .await;
@@ -1582,11 +1592,11 @@ async fn usage_log_records_partial_response_when_the_upstream_body_errors() {
     let usage = read_usage_records(&usage_path, 1).await;
     assert_eq!(usage[0]["request_bytes"], 0);
     assert_eq!(usage[0]["response_bytes"], 7);
-    assert_eq!(usage[0]["outcome"], "body_error");
+    assert_eq!(usage[0]["stream_outcome"], "body_error");
 }
 
 #[tokio::test]
-async fn usage_log_records_a_client_disconnecting_mid_stream() {
+async fn usage_log_records_an_incomplete_response_stream() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
     let token = store.issue_token(&principal).unwrap();
@@ -1604,7 +1614,7 @@ async fn usage_log_records_a_client_disconnecting_mid_stream() {
         GatewayAuth::RequireToken {
             store: Arc::new(store),
             quota: None,
-            usage: Some(Arc::new(usage_path.clone())),
+            usage: Some(gateway_log(&usage_path)),
         },
     )
     .await;
@@ -1628,7 +1638,53 @@ async fn usage_log_records_a_client_disconnecting_mid_stream() {
         .expect("dropping the client stream must cancel the upstream stream");
     let usage = read_usage_records(&usage_path, 1).await;
     assert_eq!(usage[0]["response_bytes"], 13);
-    assert_eq!(usage[0]["outcome"], "client_disconnect");
+    assert_eq!(usage[0]["stream_outcome"], "incomplete");
+}
+
+#[tokio::test]
+async fn usage_log_records_a_gateway_timeout_separately_from_an_incomplete_stream() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+    let release = Arc::new(Notify::new());
+    let upstream = spawn_server(
+        Router::new()
+            .route("/v1/chat/completions", any(delayed_sse))
+            .with_state(Arc::clone(&release)),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let usage_path = dir.path().join("usage.jsonl");
+    let gateway = spawn_gateway_with_options(
+        upstream.addr,
+        NonZeroUsize::new(1).unwrap(),
+        Duration::from_millis(150),
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: Some(gateway_log(&usage_path)),
+        },
+        None,
+    )
+    .await;
+
+    let response = client()
+        .request(
+            Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(first, "data: first\n\n");
+
+    let usage = read_usage_records(&usage_path, 1).await;
+    assert_eq!(usage[0]["stream_outcome"], "gateway_timeout");
+    drop(body);
+    release.notify_waiters();
 }
 
 #[tokio::test]
@@ -1649,7 +1705,7 @@ async fn usage_log_records_gateway_failures_after_authentication_and_quota() {
                 NonZeroU32::new(2).unwrap(),
                 NonZeroU64::new(60).unwrap(),
             ))),
-            usage: Some(Arc::new(usage_path.clone())),
+            usage: Some(gateway_log(&usage_path)),
         },
     )
     .await;
@@ -1672,7 +1728,7 @@ async fn usage_log_records_gateway_failures_after_authentication_and_quota() {
     assert_eq!(usage[0]["response_head_status"], 502);
     assert_eq!(usage[0]["request_bytes"], 0);
     assert!(usage[0]["response_bytes"].as_u64().unwrap() > 0);
-    assert_eq!(usage[0]["outcome"], "completed");
+    assert_eq!(usage[0]["stream_outcome"], "completed");
 }
 
 #[tokio::test]
@@ -1699,7 +1755,7 @@ async fn usage_log_records_an_admission_rejection_after_quota_admission() {
                 NonZeroU32::new(2).unwrap(),
                 NonZeroU64::new(60).unwrap(),
             ))),
-            usage: Some(Arc::new(usage_path.clone())),
+            usage: Some(gateway_log(&usage_path)),
         },
         None,
     )
@@ -1712,7 +1768,15 @@ async fn usage_log_records_an_admission_rejection_after_quota_admission() {
             .unwrap()
     };
     let active = client().request(request()).await.unwrap();
-    let rejected = client().request(request()).await.unwrap();
+    let rejected = client()
+        .request(
+            Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from("this body was not forwarded"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
     let _ = to_bytes(Body::new(rejected.into_body()), 1024)
         .await
@@ -1725,9 +1789,66 @@ async fn usage_log_records_an_admission_rejection_after_quota_admission() {
         .iter()
         .find(|record| record["response_head_status"] == 503)
         .expect("the quota-admitted admission rejection must be recorded");
-    assert_eq!(rejected["request_bytes"], 0);
+    assert!(
+        rejected["request_bytes"].is_null(),
+        "an admission rejection must not claim it measured an unforwarded body"
+    );
     assert!(rejected["response_bytes"].as_u64().unwrap() > 0);
-    assert_eq!(rejected["outcome"], "completed");
+    assert_eq!(rejected["stream_outcome"], "completed");
+}
+
+#[tokio::test]
+async fn usage_log_excludes_authentication_and_quota_rejections() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+    let upstream =
+        spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
+    let dir = tempfile::tempdir().unwrap();
+    let usage_path = dir.path().join("usage.jsonl");
+    let gateway = spawn_gateway_with_auth(
+        upstream.addr,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: Some(Arc::new(OrgQuota::new(
+                NonZeroU32::new(1).unwrap(),
+                NonZeroU64::new(60).unwrap(),
+            ))),
+            usage: Some(gateway_log(&usage_path)),
+        },
+    )
+    .await;
+
+    let unauthenticated = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .body(Body::from("unattributed body"))
+        .unwrap();
+    assert_eq!(
+        client().request(unauthenticated).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let accepted = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        client().request(accepted).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let over_quota = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from("over quota body"))
+        .unwrap();
+    assert_eq!(
+        client().request(over_quota).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    let usage = read_usage_records(&usage_path, 1).await;
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0]["response_head_status"], 204);
+    assert_eq!(usage[0]["stream_outcome"], "completed");
 }
 
 #[tokio::test]
@@ -1745,7 +1866,7 @@ async fn usage_log_is_not_torn_by_concurrent_completed_requests() {
         GatewayAuth::RequireToken {
             store: Arc::new(store),
             quota: None,
-            usage: Some(Arc::new(usage_path.clone())),
+            usage: Some(gateway_log(&usage_path)),
         },
     )
     .await;
@@ -1785,7 +1906,7 @@ async fn usage_log_is_not_torn_by_concurrent_completed_requests() {
         assert_eq!(record["response_head_status"], 204);
         assert_eq!(record["request_bytes"], 0);
         assert_eq!(record["response_bytes"], 0);
-        assert_eq!(record["outcome"], "completed");
+        assert_eq!(record["stream_outcome"], "completed");
     }
 }
 

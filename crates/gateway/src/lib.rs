@@ -11,7 +11,7 @@ use axum::http::uri::{Authority, Scheme};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, MethodRouter};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use bytes::Buf;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -22,12 +22,13 @@ use pin_project_lite::pin_project;
 use replica_contract::HttpMethod;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::Write;
+use std::io::{self, Write};
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::time::Instant;
@@ -37,6 +38,7 @@ use tower_http::cors::CorsLayer;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IDLE_PER_HOST: usize = 32;
+const MAX_PENDING_LOG_RECORDS: usize = 1_024;
 /// Retry-After is jittered across this inclusive range (seconds) so that
 /// clients rejected at the same instant do not retry in lockstep and
 /// re-create the exact saturation spike that rejected them.
@@ -59,6 +61,116 @@ pub const DEFAULT_MAX_CONNECTION_DURATION: Duration = Duration::from_secs(300);
 /// The id is opaque: it carries no identity, so the replica stays
 /// identity-blind.
 const REQUEST_ID_HEADER: &str = "x-camelid-request-id";
+const CONNECTION_ACTIVE: u8 = 0;
+const CONNECTION_TIMED_OUT: u8 = 1;
+
+/// Shared by every request on one HTTP connection. It is set before the
+/// server's wall-clock timeout drops the connection future, so a response-body
+/// wrapper can distinguish that gateway policy from an otherwise unexplained
+/// incomplete stream.
+struct ConnectionTermination {
+    reason: AtomicU8,
+}
+
+impl ConnectionTermination {
+    fn gateway_timeout(&self) {
+        self.reason.store(CONNECTION_TIMED_OUT, Ordering::Release);
+    }
+
+    fn incomplete_outcome(&self) -> &'static str {
+        match self.reason.load(Ordering::Acquire) {
+            CONNECTION_TIMED_OUT => "gateway_timeout",
+            CONNECTION_ACTIVE => "incomplete",
+            _ => "incomplete",
+        }
+    }
+}
+
+impl Default for ConnectionTermination {
+    fn default() -> Self {
+        Self {
+            reason: AtomicU8::new(CONNECTION_ACTIVE),
+        }
+    }
+}
+
+/// A bounded, single-writer append-only JSONL sink. Opening the destination is
+/// part of startup, so a missing parent or unwritable path fails closed before
+/// the gateway accepts traffic. Runtime writes never block a request task: a
+/// full queue drops the record and reports a rate-limited warning instead of
+/// growing an unbounded backlog on Tokio's blocking pool.
+pub struct GatewayLog {
+    destination: PathBuf,
+    sender: SyncSender<String>,
+    dropped_records: AtomicU64,
+}
+
+impl GatewayLog {
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Arc<Self>> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())?;
+        let destination = std::fs::canonicalize(path.as_ref())?;
+        let (sender, receiver) = sync_channel(MAX_PENDING_LOG_RECORDS);
+        let writer_destination = destination.clone();
+        std::thread::Builder::new()
+            .name("camelid-gateway-jsonl".into())
+            .spawn(move || write_jsonl_records(file, receiver, writer_destination))?;
+        Ok(Arc::new(Self {
+            destination,
+            sender,
+            dropped_records: AtomicU64::new(0),
+        }))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.destination
+    }
+
+    pub fn has_same_destination(&self, other: &Self) -> bool {
+        self.destination == other.destination
+    }
+
+    fn write(&self, line: String) {
+        match self.sender.try_send(line) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => self.record_drop("writer queue is full"),
+            Err(TrySendError::Disconnected(_)) => self.record_drop("writer thread stopped"),
+        }
+    }
+
+    fn record_drop(&self, reason: &'static str) {
+        let dropped = self.dropped_records.fetch_add(1, Ordering::Relaxed) + 1;
+        if dropped == 1 || dropped.is_power_of_two() {
+            tracing::warn!(
+                path = %self.destination.display(),
+                dropped_records = dropped,
+                reason,
+                "gateway JSONL record dropped"
+            );
+        }
+    }
+}
+
+fn write_jsonl_records(mut file: std::fs::File, records: Receiver<String>, destination: PathBuf) {
+    let mut failed_writes = 0_u64;
+    for line in records {
+        if let Err(error) = file.write_all(line.as_bytes()) {
+            failed_writes += 1;
+            if failed_writes == 1 || failed_writes.is_power_of_two() {
+                tracing::warn!(
+                    path = %destination.display(),
+                    failed_writes,
+                    %error,
+                    "gateway JSONL writer could not append a record"
+                );
+            }
+        } else {
+            failed_writes = 0;
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct UpstreamOrigin {
@@ -123,7 +235,7 @@ struct GatewayState {
     /// method, path, status}` — including requests it rejects for authentication or
     /// admission. `None` disables auditing entirely. CORS preflight and
     /// `/healthz` are answered before this path and are never audited.
-    audit: Option<Arc<PathBuf>>,
+    audit: Option<Arc<GatewayLog>>,
 }
 
 /// Per-organization request-rate quota, independent of admission control.
@@ -240,7 +352,7 @@ pub enum GatewayAuth {
         /// belongs to the authenticated mode so every usage record carries a
         /// resolved principal and organization; it cannot be configured for
         /// anonymous traffic that a later aggregator could not attribute.
-        usage: Option<Arc<PathBuf>>,
+        usage: Option<Arc<GatewayLog>>,
     },
 }
 
@@ -263,7 +375,7 @@ pub fn router_with_options(
     upstream: UpstreamOrigin,
     max_in_flight: NonZeroUsize,
     auth: GatewayAuth,
-    audit: Option<Arc<PathBuf>>,
+    audit: Option<Arc<GatewayLog>>,
 ) -> Router {
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
@@ -320,7 +432,14 @@ fn proxy_methods(methods: &[HttpMethod]) -> MethodRouter<GatewayState> {
     method_router
 }
 
-async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Response {
+async fn proxy(
+    State(state): State<GatewayState>,
+    connection_termination: Option<Extension<Arc<ConnectionTermination>>>,
+    mut request: Request,
+) -> Response {
+    let connection_termination = connection_termination.map(|Extension(marker)| marker);
+    let started_ts = unix_timestamp();
+    let started_at = Instant::now();
     // Minted before anything can reject the request, so every audited outcome
     // (including authentication and admission rejections) carries a correlation
     // id. This is gateway-authoritative: any inbound
@@ -353,7 +472,10 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
                             method: &method,
                             path: &path,
                             usage: None,
-                            request_bytes: None,
+                            request_metrics: None,
+                            connection_termination: connection_termination.clone(),
+                            started_ts,
+                            started_at,
                         },
                         response,
                     )
@@ -375,7 +497,10 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
                             method: &method,
                             path: &path,
                             usage: None,
-                            request_bytes: None,
+                            request_metrics: None,
+                            connection_termination: connection_termination.clone(),
+                            started_ts,
+                            started_at,
                         },
                         response,
                     );
@@ -385,18 +510,6 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
         }
         GatewayAuth::Disabled => (None, None),
     };
-
-    // Count exactly the request payload bytes this gateway observes. The
-    // wrapper is installed only after successful auth and quota admission, so
-    // anonymous and over-quota traffic cannot create ambiguous usage records.
-    let request_bytes = usage.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
-    if let Some(request_bytes) = &request_bytes {
-        let (parts, body) = request.into_parts();
-        request = Request::from_parts(
-            parts,
-            Body::new(CountingBody::new(body, Arc::clone(request_bytes))),
-        );
-    }
 
     let permit = match Arc::clone(&state.admission).try_acquire_owned() {
         Ok(permit) => permit,
@@ -420,7 +533,10 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
                     method: &method,
                     path: &path,
                     usage: usage.clone(),
-                    request_bytes,
+                    request_metrics: None,
+                    connection_termination: connection_termination.clone(),
+                    started_ts,
+                    started_at,
                 },
                 response,
             );
@@ -438,7 +554,10 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
                     method: &method,
                     path: &path,
                     usage: usage.clone(),
-                    request_bytes,
+                    request_metrics: None,
+                    connection_termination: connection_termination.clone(),
+                    started_ts,
+                    started_at,
                 },
                 gateway_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -462,6 +581,21 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
         HeaderValue::from_str(&request_id).expect("a req_ hex id is a valid header value"),
     );
 
+    // A byte count is meaningful only when the gateway actually attempts to
+    // forward the request and observes its body reach EOF. Admission and URI
+    // rejections intentionally leave this `None`: draining a rejected body
+    // would consume unbounded work solely to manufacture an accounting value.
+    let request_metrics = usage
+        .as_ref()
+        .map(|_| Arc::new(RequestBodyMetrics::default()));
+    if let Some(metrics) = &request_metrics {
+        let (parts, body) = request.into_parts();
+        request = Request::from_parts(
+            parts,
+            Body::new(CountingBody::new(body, Arc::clone(metrics))),
+        );
+    }
+
     let response = match state.client.request(request).await {
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
@@ -481,7 +615,10 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
             method: &method,
             path: &path,
             usage,
-            request_bytes,
+            request_metrics,
+            connection_termination,
+            started_ts,
+            started_at,
         },
         response,
     )
@@ -504,8 +641,11 @@ struct AuditedRequest<'a> {
     identity: Option<&'a AuthenticatedContext>,
     method: &'a str,
     path: &'a str,
-    usage: Option<Arc<PathBuf>>,
-    request_bytes: Option<Arc<AtomicU64>>,
+    usage: Option<Arc<GatewayLog>>,
+    request_metrics: Option<Arc<RequestBodyMetrics>>,
+    connection_termination: Option<Arc<ConnectionTermination>>,
+    started_ts: f64,
+    started_at: Instant,
 }
 
 fn audited(state: &GatewayState, request: AuditedRequest<'_>, response: Response) -> Response {
@@ -519,12 +659,7 @@ fn audited(state: &GatewayState, request: AuditedRequest<'_>, response: Response
             response.status(),
         );
     }
-    let Some((log, request_bytes, identity)) = request
-        .usage
-        .zip(request.request_bytes)
-        .zip(request.identity)
-        .map(|((log, request_bytes), identity)| (log, request_bytes, identity))
-    else {
+    let Some((log, identity)) = request.usage.zip(request.identity) else {
         return response;
     };
     let (parts, body) = response.into_parts();
@@ -536,34 +671,13 @@ fn audited(state: &GatewayState, request: AuditedRequest<'_>, response: Response
         method: request.method.to_string(),
         path: request.path.to_string(),
         response_head_status: parts.status.as_u16(),
-        request_bytes,
+        request_metrics: request.request_metrics,
         response_bytes: 0,
+        started_ts: request.started_ts,
+        started_at: request.started_at,
+        connection_termination: request.connection_termination,
     });
     Response::from_parts(parts, Body::new(UsageBody::new(body, tracker)))
-}
-
-/// Serializes whole-record appends to the audit log within this process,
-/// mirroring the replica's receipt writer so both append-only JSONL logs share
-/// one safety model. `O_APPEND` makes a single `write` atomic, but `write_all`
-/// can issue more than one `write` on a short write, and the audit line and the
-/// receipt line are meant to be joined: a torn line loses the join at exactly
-/// the concurrency burst where auditing matters most. Taking the whole-record
-/// append under this lock removes that risk.
-///
-/// The gateway and the replica are separate processes writing separate files,
-/// so this lock is deliberately per-process and independent of the replica's
-/// receipt lock; there is no cross-process contention to coordinate.
-fn audit_write_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-/// Serializes complete append-only usage records within this process. This is
-/// independent of the audit lock because the files are independent and a slow
-/// usage filesystem must not serialize audit initiation records behind it.
-fn usage_write_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 /// Appends one JSONL audit line: `{ts, request_id, principal, organization,
@@ -573,14 +687,12 @@ fn usage_write_lock() -> &'static Mutex<()> {
 /// replica. `request_id` is the only correlation value sent upstream.
 ///
 /// Best-effort and off the request's async context: a failed write must never
-/// fail the request. The write is not awaited, so audit lines still queued in
-/// `spawn_blocking` when the process exits (for example on SIGTERM) are
-/// dropped, matching the best-effort, no-durability contract the receipt writer
-/// carries. The whole record (JSON plus newline) is written under
-/// `audit_write_lock` in a single `write_all` so concurrent appends cannot
-/// interleave into a corrupt line.
+/// fail the request. The dedicated bounded writer queue can lose records on
+/// process exit, when full, or after a write failure; [`GatewayLog`] emits
+/// rate-limited warnings for each condition. Its single writer serializes
+/// complete JSONL records so concurrent requests cannot interleave lines.
 fn write_audit_record(
-    log: &Arc<PathBuf>,
+    log: &GatewayLog,
     request_id: &str,
     identity: Option<&AuthenticatedContext>,
     method: &str,
@@ -588,10 +700,7 @@ fn write_audit_record(
     status: StatusCode,
 ) {
     let line = serde_json::json!({
-        "ts": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0),
+        "ts": unix_timestamp(),
         "request_id": request_id,
         "principal": identity.map(|context| context.principal_id().as_str()),
         "organization": identity.map(|context| context.organization_id().as_str()),
@@ -599,45 +708,29 @@ fn write_audit_record(
         "path": path,
         "status": status.as_u16(),
     });
-    let log = Arc::clone(log);
-    tokio::task::spawn_blocking(move || {
-        // Recover a poisoned lock instead of dropping every later audit line
-        // for the rest of the process's life. Each holder appends exactly one
-        // complete, newline-terminated record, so a panic while holding the
-        // lock cannot leave a partial line behind; treating a poisoned guard as
-        // usable is safe and keeps the audit trail alive after an unrelated
-        // one-off failure.
-        let _guard = audit_write_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&*log)
-        {
-            let mut record = line.to_string();
-            record.push('\n');
-            let _ = file.write_all(record.as_bytes());
-        }
-    });
+    log.write(jsonl_line(line));
 }
 
 struct UsageRecord {
-    log: Arc<PathBuf>,
+    log: Arc<GatewayLog>,
     request_id: String,
     principal: String,
     organization: String,
     method: String,
     path: String,
     response_head_status: u16,
-    request_bytes: Arc<AtomicU64>,
+    request_metrics: Option<Arc<RequestBodyMetrics>>,
     response_bytes: u64,
+    started_ts: f64,
+    started_at: Instant,
+    connection_termination: Option<Arc<ConnectionTermination>>,
 }
 
-/// Owns one terminal usage record until a response body finishes, errors, or
-/// is dropped because the client disconnected. Its `Drop` implementation makes
-/// an incomplete response observable rather than silently mistaking it for a
-/// completed generation.
+/// Owns one terminal usage record until a response body finishes, errors, or is
+/// dropped before its terminal frame. A dropped body has no single observable
+/// cause: it can be a client disconnect, the gateway connection deadline, or a
+/// transport cancellation. Its `Drop` implementation therefore records the
+/// fact as `incomplete` rather than attributing fault to a peer.
 struct UsageTracker {
     record: Option<UsageRecord>,
 }
@@ -664,46 +757,54 @@ impl UsageTracker {
 
 impl Drop for UsageTracker {
     fn drop(&mut self) {
-        self.finish("client_disconnect");
+        let outcome = self
+            .record
+            .as_ref()
+            .and_then(|record| record.connection_termination.as_ref())
+            .map_or("incomplete", |marker| marker.incomplete_outcome());
+        self.finish(outcome);
     }
 }
 
 /// Appends one terminal JSONL usage record:
-/// `{ts, request_id, principal, organization, method, path, response_head_status,
-/// request_bytes, response_bytes, outcome}`. Byte counts are raw payload bytes
-/// the gateway read or forwarded, never tokenizer counts, so this record must
-/// not be used as an inference token-billing source.
+/// `{ts, started_ts, duration_ms, request_id, principal, organization, method,
+/// path, response_head_status, request_bytes, response_bytes, stream_outcome}`.
+/// `request_bytes` is `null` unless the gateway observed the forwarded request
+/// body reach EOF. Byte counts are raw payload bytes the gateway read or
+/// forwarded, never tokenizer counts, so this record must not be used as an
+/// inference token-billing source.
 fn write_usage_record(record: UsageRecord, outcome: &'static str) {
     let line = serde_json::json!({
-        "ts": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs_f64())
-            .unwrap_or(0.0),
+        "ts": unix_timestamp(),
+        "started_ts": record.started_ts,
+        "duration_ms": record.started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         "request_id": record.request_id,
         "principal": record.principal,
         "organization": record.organization,
         "method": record.method,
         "path": record.path,
         "response_head_status": record.response_head_status,
-        "request_bytes": record.request_bytes.load(Ordering::Relaxed),
+        "request_bytes": record
+            .request_metrics
+            .as_deref()
+            .and_then(RequestBodyMetrics::completed_bytes),
         "response_bytes": record.response_bytes,
-        "outcome": outcome,
+        "stream_outcome": outcome,
     });
-    let log = record.log;
-    tokio::task::spawn_blocking(move || {
-        let _guard = usage_write_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&*log)
-        {
-            let mut line = line.to_string();
-            line.push('\n');
-            let _ = file.write_all(line.as_bytes());
-        }
-    });
+    record.log.write(jsonl_line(line));
+}
+
+fn unix_timestamp() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn jsonl_line(value: serde_json::Value) -> String {
+    let mut line = value.to_string();
+    line.push('\n');
+    line
 }
 
 /// Mints an opaque, gateway-authoritative request correlation id. 128 bits of
@@ -721,13 +822,37 @@ pin_project! {
     struct CountingBody<B> {
         #[pin]
         inner: B,
-        bytes: Arc<AtomicU64>,
+        metrics: Arc<RequestBodyMetrics>,
     }
 }
 
-impl<B> CountingBody<B> {
-    fn new(inner: B, bytes: Arc<AtomicU64>) -> Self {
-        Self { inner, bytes }
+#[derive(Default)]
+struct RequestBodyMetrics {
+    bytes: AtomicU64,
+    completed: AtomicBool,
+}
+
+impl RequestBodyMetrics {
+    fn completed_bytes(&self) -> Option<u64> {
+        self.completed
+            .load(Ordering::Acquire)
+            .then(|| self.bytes.load(Ordering::Acquire))
+    }
+
+    fn complete(&self) {
+        self.completed.store(true, Ordering::Release);
+    }
+}
+
+impl<B> CountingBody<B>
+where
+    B: HttpBody,
+{
+    fn new(inner: B, metrics: Arc<RequestBodyMetrics>) -> Self {
+        if inner.is_end_stream() {
+            metrics.complete();
+        }
+        Self { inner, metrics }
     }
 }
 
@@ -747,9 +872,13 @@ where
         let poll = this.inner.as_mut().poll_frame(context);
         if let Poll::Ready(Some(Ok(frame))) = &poll {
             if let Some(data) = frame.data_ref() {
-                this.bytes
+                this.metrics
+                    .bytes
                     .fetch_add(data.remaining() as u64, Ordering::Relaxed);
             }
+        }
+        if matches!(&poll, Poll::Ready(None)) || this.inner.as_ref().is_end_stream() {
+            this.metrics.complete();
         }
         poll
     }
@@ -1059,18 +1188,27 @@ pub async fn serve(
                     }
                 };
                 let io = hyper_util::rt::TokioIo::new(stream);
-                let service = hyper_util::service::TowerToHyperService::new(router.clone());
+                let termination = Arc::new(ConnectionTermination::default());
+                let service = hyper_util::service::TowerToHyperService::new(
+                    router
+                        .clone()
+                        .layer(Extension(Arc::clone(&termination))),
+                );
                 let connection = hyper::server::conn::http1::Builder::new().serve_connection(io, service);
                 let watched = graceful.watch(connection);
                 tokio::spawn(async move {
-                    if tokio::time::timeout(max_connection_duration, watched)
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!(
-                            seconds = max_connection_duration.as_secs(),
-                            "gateway connection exceeded the maximum duration and was closed",
-                        );
+                    tokio::pin!(watched);
+                    tokio::select! {
+                        _ = &mut watched => {}
+                        _ = tokio::time::sleep(max_connection_duration) => {
+                            // Set the cause before dropping `watched`; its cancellation
+                            // drops active response wrappers synchronously.
+                            termination.gateway_timeout();
+                            tracing::warn!(
+                                seconds = max_connection_duration.as_secs(),
+                                "gateway connection exceeded the maximum duration and was closed",
+                            );
+                        }
                     }
                 });
             }
