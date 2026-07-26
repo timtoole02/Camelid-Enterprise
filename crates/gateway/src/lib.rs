@@ -16,7 +16,7 @@ use http_body::{Body as HttpBody, Frame, SizeHint};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
-use identity::{IdentityError, PrincipalId, SqliteIdentityStore, TokenStore};
+use identity::{AuthenticatedContext, IdentityError, SqliteIdentityStore};
 use pin_project_lite::pin_project;
 use replica_contract::HttpMethod;
 use std::fmt;
@@ -115,8 +115,8 @@ struct GatewayState {
     admission: Arc<Semaphore>,
     auth: GatewayAuth,
     /// Optional append-only JSONL audit sink. When set, the gateway records one
-    /// line per request it handles — `{ts, request_id, principal, method, path,
-    /// status}` — including requests it rejects for authentication or
+    /// line per request it handles — `{ts, request_id, principal, organization,
+    /// method, path, status}` — including requests it rejects for authentication or
     /// admission. `None` disables auditing entirely. CORS preflight and
     /// `/healthz` are answered before this path and are never audited.
     audit: Option<Arc<PathBuf>>,
@@ -227,9 +227,9 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
     // lookup time behind each one) meant for legitimate authenticated
     // traffic before ever being rejected; a request that fails auth must
     // never take a permit at all.
-    let principal = match &state.auth {
+    let identity = match &state.auth {
         GatewayAuth::RequireToken(store) => match authenticate(store, request.headers()).await {
-            Ok(principal) => Some(principal),
+            Ok(context) => Some(context),
             Err(response) => return audited(&state, &request_id, None, &method, &path, response),
         },
         GatewayAuth::Disabled => None,
@@ -249,7 +249,14 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
                 HeaderValue::from_str(&retry_after.to_string())
                     .expect("a small decimal integer is a valid header value"),
             );
-            return audited(&state, &request_id, principal.as_ref(), &method, &path, response);
+            return audited(
+                &state,
+                &request_id,
+                identity.as_ref(),
+                &method,
+                &path,
+                response,
+            );
         }
     };
     let upstream_uri = match state.upstream.request_uri(request.uri()) {
@@ -259,7 +266,7 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
             return audited(
                 &state,
                 &request_id,
-                principal.as_ref(),
+                identity.as_ref(),
                 &method,
                 &path,
                 gateway_error(
@@ -295,7 +302,14 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
             gateway_error(StatusCode::BAD_GATEWAY, "upstream replica is unavailable")
         }
     };
-    audited(&state, &request_id, principal.as_ref(), &method, &path, response)
+    audited(
+        &state,
+        &request_id,
+        identity.as_ref(),
+        &method,
+        &path,
+        response,
+    )
 }
 
 /// Records the audit line for a handled request, when auditing is enabled, and
@@ -314,13 +328,13 @@ async fn proxy(State(state): State<GatewayState>, mut request: Request) -> Respo
 fn audited(
     state: &GatewayState,
     request_id: &str,
-    principal: Option<&PrincipalId>,
+    identity: Option<&AuthenticatedContext>,
     method: &str,
     path: &str,
     response: Response,
 ) -> Response {
     if let Some(log) = &state.audit {
-        write_audit_record(log, request_id, principal, method, path, response.status());
+        write_audit_record(log, request_id, identity, method, path, response.status());
     }
     response
 }
@@ -341,11 +355,11 @@ fn audit_write_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Appends one JSONL audit line: `{ts, request_id, principal, method, path,
-/// status}`. `principal` is the resolved principal's opaque id, or JSON `null`
-/// when the request was unauthenticated (auth disabled) or rejected before a
-/// principal was established. `request_id` is the same id stamped on the
-/// forwarded request, so this line joins to the replica's serving receipt.
+/// Appends one JSONL audit line: `{ts, request_id, principal, organization,
+/// method, path, status}`. `principal` and `organization` are opaque gateway-
+/// local identity fields, or JSON `null` when authentication is disabled or
+/// rejected before identity was established. They are never forwarded to a
+/// replica. `request_id` is the only correlation value sent upstream.
 ///
 /// Best-effort and off the request's async context: a failed write must never
 /// fail the request. The write is not awaited, so audit lines still queued in
@@ -357,7 +371,7 @@ fn audit_write_lock() -> &'static Mutex<()> {
 fn write_audit_record(
     log: &Arc<PathBuf>,
     request_id: &str,
-    principal: Option<&PrincipalId>,
+    identity: Option<&AuthenticatedContext>,
     method: &str,
     path: &str,
     status: StatusCode,
@@ -368,7 +382,8 @@ fn write_audit_record(
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0),
         "request_id": request_id,
-        "principal": principal.map(PrincipalId::as_str),
+        "principal": identity.map(|context| context.principal_id().as_str()),
+        "organization": identity.map(|context| context.organization_id().as_str()),
         "method": method,
         "path": path,
         "status": status.as_u16(),
@@ -472,25 +487,25 @@ fn gateway_error(status: StatusCode, message: &'static str) -> Response {
     response
 }
 
-/// Resolves the request's bearer token to a principal, or returns the exact
-/// response the gateway should send back without forwarding anything upstream.
+/// Resolves the request's bearer token to its principal and organization, or
+/// returns the exact response the gateway should send without forwarding.
 async fn authenticate(
     store: &Arc<SqliteIdentityStore>,
     headers: &HeaderMap,
-) -> Result<PrincipalId, Response> {
+) -> Result<AuthenticatedContext, Response> {
     let Some(token) = bearer_token(headers) else {
         return Err(unauthorized("missing bearer token"));
     };
     let store = Arc::clone(store);
     let token = token.to_string();
-    let resolved = tokio::task::spawn_blocking(move || store.resolve(&token))
+    let resolved = tokio::task::spawn_blocking(move || store.resolve_context(&token))
         .await
         .expect("identity resolution task panicked");
 
     resolved.map_err(|error| match error {
         IdentityError::InvalidToken => unauthorized("invalid bearer token"),
-        IdentityError::Storage(message) => {
-            tracing::error!(%message, "identity store error while authenticating request");
+        error => {
+            tracing::error!(%error, "identity store error while authenticating request");
             gateway_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "gateway could not verify the bearer token",
