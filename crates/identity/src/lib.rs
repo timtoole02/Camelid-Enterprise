@@ -14,10 +14,16 @@
 //! enforcement point (nothing today, the gateway later) all change
 //! independently. [`TokenStore`] retains its principal-only compatibility
 //! contract for callers that have not yet adopted organization-aware policy.
+//!
+//! A token may carry an expiry, and any token can be exchanged for a fresh
+//! secret in one transaction. Both are opt-in and neither changes what an
+//! existing credential does: a token issued without an expiry never expires,
+//! which is exactly what every token issued before this existed already did.
 
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -103,6 +109,19 @@ pub enum IdentityError {
     /// revoked). Deliberately does not distinguish the two: a caller must not
     /// be able to tell "never existed" from "revoked".
     InvalidToken,
+    /// The token was issued and its membership is intact, but its expiry has
+    /// passed.
+    ///
+    /// Deliberately distinct from [`Self::InvalidToken`], which the variant
+    /// above is careful not to be. The reasoning differs because the audience
+    /// does: a legitimate client cannot act on "unauthorized" but can act on
+    /// "expired" by obtaining a new credential, and that is the entire point
+    /// of issuing credentials with a lifetime. What it discloses is bounded to
+    /// the bearer of one specific token: that the token they already hold was
+    /// once real. Separating the two is only an oracle to a caller who can put
+    /// a *guessed* token into it, and a guess must first land on one of 2^256
+    /// values before the distinction says anything at all.
+    ExpiredToken,
     UnknownPrincipal,
     UnknownOrganization,
     NoOrganizationMembership,
@@ -120,6 +139,7 @@ impl fmt::Display for IdentityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidToken => write!(f, "token does not resolve to any principal"),
+            Self::ExpiredToken => write!(f, "token has expired"),
             Self::UnknownPrincipal => write!(f, "principal does not exist"),
             Self::UnknownOrganization => write!(f, "organization does not exist"),
             Self::NoOrganizationMembership => write!(f, "principal belongs to no organizations"),
@@ -152,7 +172,9 @@ impl From<rusqlite::Error> for IdentityError {
 
 /// Resolves an opaque bearer token to the [`PrincipalId`] it belongs to.
 ///
-/// The only contract: token in, principal out, or [`IdentityError::InvalidToken`].
+/// The only contract: token in, principal out, or a refusal. A token that is
+/// unknown or revoked is [`IdentityError::InvalidToken`]; one that was issued
+/// with a lifetime that has since passed is [`IdentityError::ExpiredToken`].
 /// Implementations must never expose the storage row backing a token.
 pub trait TokenStore: Send + Sync {
     fn resolve(&self, token: &str) -> Result<PrincipalId, IdentityError>;
@@ -162,7 +184,24 @@ const TOKEN_BYTES: usize = 32; // 256-bit bearer token
 const PRINCIPAL_BYTES: usize = 16; // 128-bit opaque principal id
 const ORGANIZATION_BYTES: usize = 16; // 128-bit opaque organization id
 const TOKEN_PREFIX: &str = "cme_"; // Camelid Enterprise token marker
-const IDENTITY_SCHEMA_VERSION: i64 = 2;
+const IDENTITY_SCHEMA_VERSION: i64 = 3;
+
+/// The absolute expiry instant `seconds` from now, for callers that think in
+/// lifetimes rather than in instants.
+///
+/// Expiry is stored absolute rather than as a duration so that a token's
+/// validity does not depend on when it is next read. The lifetime is nonzero
+/// because a zero-second lifetime issues a credential that is already dead:
+/// that is a misconfiguration, and it is better refused where it is written
+/// than honored at the point of use.
+///
+/// Both this and expiry checking read the system clock, so a backwards clock
+/// jump extends the validity of every outstanding token by the size of the
+/// jump. Revocation, which does not consult the clock, remains the control
+/// that does not depend on it.
+pub fn expires_in(seconds: NonZeroU64) -> i64 {
+    unix_now().saturating_add(i64::try_from(seconds.get()).unwrap_or(i64::MAX))
+}
 
 /// SQLite-backed identity store: users and their hashed tokens.
 ///
@@ -380,10 +419,21 @@ impl SqliteIdentityStore {
         Ok(())
     }
 
-    /// Issues a token for a principal that belongs to exactly one organization.
-    /// Multi-organization principals must use [`Self::issue_token_for_organization`]
-    /// so the selected tenant is unambiguous.
+    /// Issues a non-expiring token for a principal that belongs to exactly one
+    /// organization. Multi-organization principals must use
+    /// [`Self::issue_token_for_organization`] so the selected tenant is
+    /// unambiguous.
     pub fn issue_token(&self, principal: &PrincipalId) -> Result<String, IdentityError> {
+        self.issue_token_expiring_at(principal, None)
+    }
+
+    /// Issues a token for a principal that belongs to exactly one organization,
+    /// valid until `expires_at_unix`. `None` issues a token that never expires.
+    pub fn issue_token_expiring_at(
+        &self,
+        principal: &PrincipalId,
+        expires_at_unix: Option<i64>,
+    ) -> Result<String, IdentityError> {
         let mut conn = self.locked_connection();
         let transaction = conn.transaction()?;
         let organizations: Vec<String> = {
@@ -403,47 +453,85 @@ impl SqliteIdentityStore {
             [] => return Err(IdentityError::UnknownPrincipal),
             _ => return Err(IdentityError::AmbiguousOrganization),
         };
-        let token = issue_token_in_transaction(&transaction, principal, &organization)?;
+        let token =
+            issue_token_in_transaction(&transaction, principal, &organization, expires_at_unix)?;
         transaction.commit()?;
         Ok(token)
     }
 
-    /// Issues a bearer token for one principal in one organization. Both the
-    /// principal and organization must exist, and their membership is required.
+    /// Issues a non-expiring bearer token for one principal in one
+    /// organization. Both the principal and organization must exist, and their
+    /// membership is required.
     pub fn issue_token_for_organization(
         &self,
         principal: &PrincipalId,
         organization: &OrganizationId,
     ) -> Result<String, IdentityError> {
+        self.issue_token_for_organization_expiring_at(principal, organization, None)
+    }
+
+    /// Issues a bearer token for one principal in one organization, valid until
+    /// `expires_at_unix`. `None` issues a token that never expires.
+    pub fn issue_token_for_organization_expiring_at(
+        &self,
+        principal: &PrincipalId,
+        organization: &OrganizationId,
+        expires_at_unix: Option<i64>,
+    ) -> Result<String, IdentityError> {
         let mut conn = self.locked_connection();
         let transaction = conn.transaction()?;
-        let token = issue_token_in_transaction(&transaction, principal, organization)?;
+        let token =
+            issue_token_in_transaction(&transaction, principal, organization, expires_at_unix)?;
         transaction.commit()?;
         Ok(token)
+    }
+
+    /// Exchanges a valid token for a fresh secret with the same principal and
+    /// organization, and invalidates the presented one. `expires_at_unix`
+    /// applies to the replacement only; `None` makes the replacement
+    /// non-expiring regardless of what the presented token carried.
+    ///
+    /// Issue and revoke happen in one transaction, so there is no instant at
+    /// which both secrets are live and none at which neither is: a caller that
+    /// receives an error still holds a working token, and a caller that
+    /// receives a token holds the only working one. That is what makes this
+    /// safe to run against a credential currently in use.
+    ///
+    /// Rotation requires the plaintext of the token being replaced, exactly as
+    /// [`Self::revoke_token`] does. It is a credential refresh for whoever
+    /// holds the credential, not an administrative reset of someone else's.
+    pub fn rotate_token(
+        &self,
+        token: &str,
+        expires_at_unix: Option<i64>,
+    ) -> Result<String, IdentityError> {
+        let mut conn = self.locked_connection();
+        let transaction = conn.transaction()?;
+        // An expired token cannot buy a live one. Otherwise expiry would bound
+        // only the credential rather than the access it grants, and any lapsed
+        // token would remain a permanent key to a new one.
+        let credential = lookup_credential(&transaction, token)?.still_valid(unix_now())?;
+        let principal = PrincipalId(credential.principal_id);
+        let organization = OrganizationId(credential.organization_id);
+        let replacement =
+            issue_token_in_transaction(&transaction, &principal, &organization, expires_at_unix)?;
+        transaction.execute(
+            "DELETE FROM tokens WHERE token_hash = ?1",
+            rusqlite::params![hash_token(token)],
+        )?;
+        transaction.commit()?;
+        Ok(replacement)
     }
 
     /// Resolves a bearer token to both the authenticated principal and its
     /// explicitly selected organization.
     pub fn resolve_context(&self, token: &str) -> Result<AuthenticatedContext, IdentityError> {
         let conn = self.locked_connection();
-        let context: Option<(String, String)> = conn
-            .query_row(
-                "SELECT token.principal_id, token.organization_id
-                 FROM tokens AS token
-                 INNER JOIN organization_memberships AS membership
-                   ON membership.principal_id = token.principal_id
-                  AND membership.organization_id = token.organization_id
-                 WHERE token.token_hash = ?1",
-                rusqlite::params![hash_token(token)],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        context
-            .map(|(principal_id, organization_id)| AuthenticatedContext {
-                principal_id: PrincipalId(principal_id),
-                organization_id: OrganizationId(organization_id),
-            })
-            .ok_or(IdentityError::InvalidToken)
+        let credential = lookup_credential(&conn, token)?.still_valid(unix_now())?;
+        Ok(AuthenticatedContext {
+            principal_id: PrincipalId(credential.principal_id),
+            organization_id: OrganizationId(credential.organization_id),
+        })
     }
 
     /// Revokes a token. A no-op if the token was already invalid.
@@ -489,10 +577,63 @@ fn principal_exists(
         .is_some())
 }
 
+/// A token row that exists and whose membership is still intact.
+///
+/// Existence and validity are separated on purpose. The lookup answers "is
+/// this a real credential for a current member", which is a question about
+/// stored state; expiry answers "is it usable now", which is a question about
+/// the clock. Rotation needs both answers and needs them to be different
+/// answers, so the split is in the type rather than buried in one SQL
+/// predicate.
+struct Credential {
+    principal_id: String,
+    organization_id: String,
+    expires_at_unix: Option<i64>,
+}
+
+impl Credential {
+    /// Consumes the credential if it has not expired at `now`.
+    ///
+    /// The expiry instant is exclusive: a token that expires at `T` is already
+    /// refused at `T`. Between two defensible boundaries, this picks the one
+    /// that never leaves a credential usable past the instant it was issued
+    /// to be usable until.
+    fn still_valid(self, now: i64) -> Result<Self, IdentityError> {
+        match self.expires_at_unix {
+            Some(expires_at) if now >= expires_at => Err(IdentityError::ExpiredToken),
+            _ => Ok(self),
+        }
+    }
+}
+
+/// Looks a token up by hash, requiring the membership it was scoped to still
+/// exist. Says nothing about expiry; see [`Credential::still_valid`].
+fn lookup_credential(conn: &Connection, token: &str) -> Result<Credential, IdentityError> {
+    conn.query_row(
+        "SELECT token.principal_id, token.organization_id, token.expires_at_unix
+         FROM tokens AS token
+         INNER JOIN organization_memberships AS membership
+           ON membership.principal_id = token.principal_id
+          AND membership.organization_id = token.organization_id
+         WHERE token.token_hash = ?1",
+        rusqlite::params![hash_token(token)],
+        |row| {
+            Ok(Credential {
+                principal_id: row.get(0)?,
+                organization_id: row.get(1)?,
+                expires_at_unix: row.get(2)?,
+            })
+        },
+    )
+    .optional()?
+    .ok_or(IdentityError::InvalidToken)
+}
+
 fn issue_token_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     principal: &PrincipalId,
     organization: &OrganizationId,
+    expires_at_unix: Option<i64>,
 ) -> Result<String, IdentityError> {
     if !principal_exists(transaction, principal)? {
         return Err(IdentityError::UnknownPrincipal);
@@ -511,8 +652,15 @@ fn issue_token_in_transaction(
 
     let token = format!("{TOKEN_PREFIX}{}", random_hex(TOKEN_BYTES));
     transaction.execute(
-        "INSERT INTO tokens (token_hash, principal_id, organization_id, created_at_unix) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![hash_token(&token), principal.0, organization.0, unix_now()],
+        "INSERT INTO tokens (token_hash, principal_id, organization_id, created_at_unix, expires_at_unix)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            hash_token(&token),
+            principal.0,
+            organization.0,
+            unix_now(),
+            expires_at_unix
+        ],
     )?;
     Ok(token)
 }
@@ -521,8 +669,16 @@ fn initialize_schema(conn: &mut Connection) -> Result<(), IdentityError> {
     let schema_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match schema_version {
         0 => initialize_unversioned_database(conn),
-        1 => migrate_v1_to_v2(conn),
-        2 => validate_v2_schema(conn),
+        // Each step is applied in its own transaction and commits its own
+        // version stamp, so a database that fails partway through the chain is
+        // left at the last version that fully applied rather than at one that
+        // half did.
+        1 => {
+            migrate_v1_to_v2(conn)?;
+            migrate_v2_to_v3(conn)
+        }
+        2 => migrate_v2_to_v3(conn),
+        3 => validate_v3_schema(conn),
         _ => Err(IdentityError::UnsupportedSchemaVersion {
             found: schema_version,
             supported: IDENTITY_SCHEMA_VERSION,
@@ -542,18 +698,21 @@ fn initialize_unversioned_database(conn: &mut Connection) -> Result<(), Identity
         memberships_exist,
     ) {
         (false, false, false, false) => {
-            create_schema_v2(conn)?;
+            create_schema_v3(conn)?;
             conn.pragma_update(None, "user_version", IDENTITY_SCHEMA_VERSION)?;
             Ok(())
         }
-        (true, true, false, false) => migrate_v1_to_v2(conn),
+        (true, true, false, false) => {
+            migrate_v1_to_v2(conn)?;
+            migrate_v2_to_v3(conn)
+        }
         _ => Err(IdentityError::MigrationIntegrity(
             "unversioned database does not match the supported legacy identity schema".into(),
         )),
     }
 }
 
-fn create_schema_v2(conn: &Connection) -> Result<(), IdentityError> {
+fn create_schema_v3(conn: &Connection) -> Result<(), IdentityError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS users (
             principal_id TEXT PRIMARY KEY,
@@ -576,6 +735,10 @@ fn create_schema_v2(conn: &Connection) -> Result<(), IdentityError> {
             principal_id TEXT NOT NULL,
             organization_id TEXT NOT NULL,
             created_at_unix INTEGER NOT NULL,
+            -- NULL means the token never expires. Nullable rather than a
+            -- sentinel far-future instant so that having no expiry is a state
+            -- the schema can express, not a date that eventually arrives.
+            expires_at_unix INTEGER,
             FOREIGN KEY (organization_id, principal_id)
                 REFERENCES organization_memberships(organization_id, principal_id)
                 ON DELETE CASCADE
@@ -583,6 +746,31 @@ fn create_schema_v2(conn: &Connection) -> Result<(), IdentityError> {
         CREATE INDEX IF NOT EXISTS idx_tokens_principal ON tokens(principal_id);
         CREATE INDEX IF NOT EXISTS idx_memberships_principal ON organization_memberships(principal_id);",
     )?;
+    Ok(())
+}
+
+/// Adds the token expiry column. Every existing row keeps `NULL`, which is
+/// "never expires" — the behavior those tokens were issued under. A migration
+/// must not silently start expiring credentials that are in use.
+///
+/// Takes the write lock at `BEGIN` and re-reads the schema version inside it.
+/// This crate is explicitly built for a long-lived `serve` process and a
+/// short-lived CLI process sharing one database, so two of them can reach an
+/// unmigrated file at the same moment. Without the recheck both would read
+/// version 2 outside any transaction and the loser would fail on a duplicate
+/// column, turning a supported concurrency into a startup error.
+fn migrate_v2_to_v3(conn: &mut Connection) -> Result<(), IdentityError> {
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let schema_version: i64 =
+        transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema_version >= IDENTITY_SCHEMA_VERSION {
+        return Ok(());
+    }
+    transaction.execute_batch(
+        "ALTER TABLE tokens ADD COLUMN expires_at_unix INTEGER;
+         PRAGMA user_version = 3;",
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -676,12 +864,12 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool, IdentityError> {
         .is_some())
 }
 
-fn validate_v2_schema(conn: &Connection) -> Result<(), IdentityError> {
+fn validate_v3_schema(conn: &Connection) -> Result<(), IdentityError> {
     for query in [
         "SELECT principal_id, name, created_at_unix FROM users LIMIT 0",
         "SELECT organization_id, name, created_at_unix FROM organizations LIMIT 0",
         "SELECT organization_id, principal_id, created_at_unix FROM organization_memberships LIMIT 0",
-        "SELECT token_hash, principal_id, organization_id, created_at_unix FROM tokens LIMIT 0",
+        "SELECT token_hash, principal_id, organization_id, created_at_unix, expires_at_unix FROM tokens LIMIT 0",
     ] {
         conn.prepare(query)?;
     }
@@ -727,7 +915,15 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn unix_now() -> i64 {
+/// The current time on the clock every expiry in this crate is measured
+/// against.
+///
+/// Exposed because [`SqliteIdentityStore::issue_token_expiring_at`] takes an
+/// absolute instant: a caller that computes one from some other source is
+/// asserting that its clock and this one agree, and that assertion is better
+/// made explicit than assumed. [`expires_in`] covers the ordinary case of a
+/// lifetime starting now.
+pub fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock is before the Unix epoch")
@@ -1160,5 +1356,374 @@ mod tests {
                 &organization
             );
         }
+    }
+
+    /// Reads a token's stored expiry directly, so the tests assert what was
+    /// persisted rather than what an accessor chose to report.
+    fn stored_expiry(store: &SqliteIdentityStore, token: &str) -> Option<i64> {
+        store
+            .locked_connection()
+            .query_row(
+                "SELECT expires_at_unix FROM tokens WHERE token_hash = ?1",
+                rusqlite::params![hash_token(token)],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn token_count(store: &SqliteIdentityStore) -> i64 {
+        store
+            .locked_connection()
+            .query_row("SELECT COUNT(*) FROM tokens", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_token_issued_with_a_future_expiry_still_resolves() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let principal = store.create_user("ada").unwrap();
+        let expires_at = expires_in(NonZeroU64::new(3600).unwrap());
+        let token = store
+            .issue_token_expiring_at(&principal, Some(expires_at))
+            .unwrap();
+
+        assert_eq!(
+            store.resolve_context(&token).unwrap().principal_id(),
+            &principal
+        );
+        assert_eq!(stored_expiry(&store, &token), Some(expires_at));
+    }
+
+    #[test]
+    fn a_token_issued_without_an_expiry_stays_non_expiring() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let principal = store.create_user("ada").unwrap();
+        let token = store.issue_token(&principal).unwrap();
+
+        assert_eq!(stored_expiry(&store, &token), None);
+        assert_eq!(store.resolve(&token).unwrap(), principal);
+    }
+
+    #[test]
+    fn an_expired_token_is_refused_by_every_resolution_path() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let principal = store.create_user("ada").unwrap();
+        let token = store
+            .issue_token_expiring_at(&principal, Some(unix_now() - 1))
+            .unwrap();
+
+        assert!(matches!(
+            store.resolve_context(&token),
+            Err(IdentityError::ExpiredToken)
+        ));
+        // The principal-only compatibility contract must not be a way around
+        // the expiry the organization-aware path enforces.
+        assert!(matches!(
+            store.resolve(&token),
+            Err(IdentityError::ExpiredToken)
+        ));
+    }
+
+    #[test]
+    fn a_token_is_refused_at_the_exact_instant_it_expires() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let principal = store.create_user("ada").unwrap();
+        let token = store
+            .issue_token_expiring_at(&principal, Some(unix_now()))
+            .unwrap();
+
+        assert!(matches!(
+            store.resolve_context(&token),
+            Err(IdentityError::ExpiredToken)
+        ));
+    }
+
+    #[test]
+    fn expiry_is_refused_without_disclosing_it_to_an_unissued_token() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let principal = store.create_user("ada").unwrap();
+        store
+            .issue_token_expiring_at(&principal, Some(unix_now() - 1))
+            .unwrap();
+
+        // A token that was never issued is still indistinguishable from a
+        // revoked one. Expiry is reported only to whoever holds a real token.
+        assert!(matches!(
+            store.resolve_context("cme_never_issued"),
+            Err(IdentityError::InvalidToken)
+        ));
+    }
+
+    #[test]
+    fn rotation_issues_a_working_token_and_retires_the_presented_one() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let organization = store.create_organization("Acme").unwrap();
+        let principal = store
+            .create_user_in_organization("ada", &organization)
+            .unwrap();
+        let original = store
+            .issue_token_for_organization(&principal, &organization)
+            .unwrap();
+
+        let rotated = store.rotate_token(&original, None).unwrap();
+
+        assert_ne!(rotated, original);
+        let context = store.resolve_context(&rotated).unwrap();
+        assert_eq!(context.principal_id(), &principal);
+        assert_eq!(context.organization_id(), &organization);
+        assert!(matches!(
+            store.resolve_context(&original),
+            Err(IdentityError::InvalidToken)
+        ));
+        // Exactly one live credential: rotation is a replacement, not an
+        // additional issuance that happens to invalidate something.
+        assert_eq!(token_count(&store), 1);
+    }
+
+    #[test]
+    fn rotation_sets_the_replacement_lifetime_independently_of_the_old_one() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let principal = store.create_user("ada").unwrap();
+        let expires_at = expires_in(NonZeroU64::new(600).unwrap());
+
+        let non_expiring = store.issue_token(&principal).unwrap();
+        let now_expiring = store.rotate_token(&non_expiring, Some(expires_at)).unwrap();
+        assert_eq!(stored_expiry(&store, &now_expiring), Some(expires_at));
+
+        let back_to_permanent = store.rotate_token(&now_expiring, None).unwrap();
+        assert_eq!(stored_expiry(&store, &back_to_permanent), None);
+    }
+
+    #[test]
+    fn an_expired_token_cannot_buy_a_live_one() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let principal = store.create_user("ada").unwrap();
+        // Captured once: reading the clock again below could land in the next
+        // second and compare against an instant that was never stored.
+        let expired_at = unix_now() - 1;
+        let expired = store
+            .issue_token_expiring_at(&principal, Some(expired_at))
+            .unwrap();
+
+        assert!(matches!(
+            store.rotate_token(&expired, None),
+            Err(IdentityError::ExpiredToken)
+        ));
+        // The refusal issued nothing and consumed nothing.
+        assert_eq!(token_count(&store), 1);
+        assert_eq!(stored_expiry(&store, &expired), Some(expired_at));
+    }
+
+    #[test]
+    fn rotating_an_unknown_token_issues_nothing() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let principal = store.create_user("ada").unwrap();
+        let live = store.issue_token(&principal).unwrap();
+
+        assert!(matches!(
+            store.rotate_token("cme_never_issued", None),
+            Err(IdentityError::InvalidToken)
+        ));
+        assert_eq!(token_count(&store), 1);
+        assert_eq!(
+            store.resolve_context(&live).unwrap().principal_id(),
+            &principal
+        );
+    }
+
+    #[test]
+    fn rotation_keeps_a_multi_organization_principal_in_the_same_organization() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let first = store.create_organization("Acme").unwrap();
+        let second = store.create_organization("Example").unwrap();
+        let principal = store.create_user_in_organization("ada", &first).unwrap();
+        store
+            .add_principal_to_organization(&principal, &second)
+            .unwrap();
+        let second_token = store
+            .issue_token_for_organization(&principal, &second)
+            .unwrap();
+
+        let rotated = store.rotate_token(&second_token, None).unwrap();
+
+        // `issue_token` would have refused this principal as ambiguous, so
+        // rotation must carry the scope rather than re-derive it.
+        assert_eq!(
+            store.resolve_context(&rotated).unwrap().organization_id(),
+            &second
+        );
+    }
+
+    /// Writes a schema-v2 identity database holding one user, one
+    /// organization, its membership, and one token.
+    ///
+    /// Left in WAL mode, because that is the state a real one is in: the
+    /// shipped `open` switches every database it touches to WAL, so any v2
+    /// file an upgrade encounters has already been through it. Building the
+    /// fixture in rollback-journal mode would make `open`'s journal-mode
+    /// switch take an exclusive lock and quietly serialize concurrent openers,
+    /// hiding the very contention these tests exist to exercise.
+    fn write_v2_database(
+        path: &std::path::Path,
+        principal: &PrincipalId,
+        organization: &OrganizationId,
+        token: &str,
+    ) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE users (
+                    principal_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    created_at_unix INTEGER NOT NULL
+                 );
+                 CREATE TABLE organizations (
+                    organization_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    created_at_unix INTEGER NOT NULL
+                 );
+                 CREATE TABLE organization_memberships (
+                    organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+                    principal_id TEXT NOT NULL REFERENCES users(principal_id),
+                    created_at_unix INTEGER NOT NULL,
+                    PRIMARY KEY (organization_id, principal_id)
+                 );
+                 CREATE TABLE tokens (
+                    token_hash TEXT PRIMARY KEY,
+                    principal_id TEXT NOT NULL,
+                    organization_id TEXT NOT NULL,
+                    created_at_unix INTEGER NOT NULL,
+                    FOREIGN KEY (organization_id, principal_id)
+                        REFERENCES organization_memberships(organization_id, principal_id)
+                        ON DELETE CASCADE
+                 );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO users (principal_id, name, created_at_unix) VALUES (?1, 'ada', 1)",
+                rusqlite::params![principal.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO organizations (organization_id, name, created_at_unix) VALUES (?1, 'Acme', 1)",
+                rusqlite::params![organization.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO organization_memberships (organization_id, principal_id, created_at_unix) VALUES (?1, ?2, 1)",
+                rusqlite::params![organization.as_str(), principal.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tokens (token_hash, principal_id, organization_id, created_at_unix) VALUES (?1, ?2, ?3, 1)",
+                rusqlite::params![hash_token(token), principal.as_str(), organization.as_str()],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", 2_i64)
+            .unwrap();
+    }
+
+    #[test]
+    fn migrating_a_v2_database_leaves_its_tokens_non_expiring() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.sqlite");
+        let principal = PrincipalId::new("usr_v2_ada".to_string());
+        let organization = OrganizationId::new("org_v2_acme".to_string());
+        let token = "cme_v2_ada";
+        write_v2_database(&path, &principal, &organization, token);
+
+        let store = SqliteIdentityStore::open(&path).unwrap();
+
+        // A migration must not start expiring credentials that are in use.
+        assert_eq!(stored_expiry(&store, token), None);
+        let context = store.resolve_context(token).unwrap();
+        assert_eq!(context.principal_id(), &principal);
+        assert_eq!(context.organization_id(), &organization);
+        assert_eq!(
+            store
+                .locked_connection()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            IDENTITY_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn concurrent_openers_never_observe_a_half_migrated_database() {
+        const OPENERS: usize = 16;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.sqlite");
+        let principal = PrincipalId::new("usr_v2_ada".to_string());
+        let organization = OrganizationId::new("org_v2_acme".to_string());
+        let token = "cme_v2_ada";
+        write_v2_database(&path, &principal, &organization, token);
+
+        // A `serve` process and a CLI process are expected to share one
+        // database file, so both can reach an unmigrated one at the same
+        // moment.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+        let mut threads = Vec::new();
+        for _ in 0..OPENERS {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                SqliteIdentityStore::open(&path)
+            }));
+        }
+
+        let mut opened = 0;
+        for thread in threads {
+            match thread.join().unwrap() {
+                Ok(store) => {
+                    opened += 1;
+                    // Whoever gets in sees the whole migration or none of it,
+                    // never a table with the column and a version without it.
+                    assert_eq!(stored_expiry(&store, token), None);
+                    assert_eq!(
+                        store.resolve_context(token).unwrap().organization_id(),
+                        &organization
+                    );
+                    assert_eq!(
+                        store
+                            .locked_connection()
+                            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                            .unwrap(),
+                        IDENTITY_SCHEMA_VERSION
+                    );
+                }
+                // Losing first-open contention is allowed and is not what this
+                // test is about: SQLite refuses to switch a database to WAL
+                // while another connection holds it, so a simultaneous first
+                // open can be turned away. Matching the message is deliberate
+                // and confined to this assertion -- SQLite reports contention
+                // and a duplicate column through the same variant, and the
+                // whole point here is that the second one must never happen.
+                Err(IdentityError::Storage(message)) => {
+                    let contention = message.contains("locked") || message.contains("busy");
+                    assert!(contention, "expected lock contention, got: {message}");
+                }
+                Err(other) => panic!("migration must not fail this way: {other}"),
+            }
+        }
+        assert!(opened > 0, "no opener completed the migration");
+    }
+
+    #[test]
+    fn expires_in_is_a_lifetime_measured_from_now() {
+        let before = unix_now();
+        let expires_at = expires_in(NonZeroU64::new(60).unwrap());
+        let after = unix_now();
+
+        assert!((before + 60..=after + 60).contains(&expires_at));
     }
 }

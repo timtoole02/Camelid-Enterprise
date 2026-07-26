@@ -227,19 +227,33 @@ tokens for one model"; everything multi-user is layered on top.
   typed `401` before it reaches a replica; omitting the flag keeps the
   gateway's original unauthenticated pass-through unchanged. `create-user`,
   `create-organization`, `list-organizations`, `add-principal-to-organization`,
-  `remove-principal-from-organization`, `issue-token [--organization <id>]`,
+  `remove-principal-from-organization`,
+  `issue-token [--organization <id>] [--expires-in-seconds <n>]`,
+  `rotate-token [--expires-in-seconds <n>]`,
   and `revoke-token` subcommands manage the local database. The gateway audit
   record includes the resolved opaque organization, but replicas still receive
   only the opaque request id. The identity schema migration is forward-only:
-  take a backup before upgrading, and do not roll an older gateway binary back
-  against the migrated database because it cannot mint new organization-scoped
-  tokens.
+  take a backup before upgrading. A gateway binary older than the database it
+  is pointed at refuses to open it at all rather than operating on a schema it
+  does not understand, so a rollback after an upgrade fails closed at startup
+  instead of silently losing the columns it cannot see.
   **Bearer tokens are only as safe as the transport they travel over:** this
-  gateway does not terminate TLS, tokens do not expire, and a plaintext HTTP
-  hop lets any on-path observer capture and replay one indefinitely. Enabling
+  gateway does not terminate TLS, and a plaintext HTTP hop lets any on-path
+  observer capture and replay one. Enabling
   `--identity-db` without a TLS-terminating ingress/reverse proxy (or mTLS, or
   a genuinely trusted private network) in front of it is not a secure
-  deployment; the gateway logs a warning to this effect at startup. Per-request
+  deployment; the gateway logs a warning to this effect at startup. A token now
+  *may* carry an expiry, which bounds how long a captured one is worth
+  replaying, and `rotate-token` exchanges a live token for a fresh secret in a
+  single transaction — no window in which both work, none in which neither
+  does. Both are opt-in and neither is a substitute for transport security:
+  a token issued without `--expires-in-seconds` never expires (the behavior of
+  every token issued before this existed, and therefore of every token an
+  upgrade migrates), expiry is evaluated against the local system clock so a
+  backwards clock jump extends every outstanding token, and an expired token is
+  still valid for the whole window before it lapses. Revocation remains the
+  only control that takes effect immediately and does not consult a clock.
+  Per-request
   identity now reaches an audit trail without the replica learning identity:
   the gateway stamps an opaque `x-camelid-request-id` on each forwarded
   request, records `{ts, request_id, principal, organization, method, path, status}` to its
@@ -252,8 +266,9 @@ tokens for one model"; everything multi-user is layered on top.
   truncated mid-stream. And the replica echoes the correlation id verbatim, so
   join integrity rests on replica network isolation (a client able to reach the
   replica directly can forge one), not on anything cryptographic.
-  Still missing: no way to require auth by default, no token expiry/rotation,
-  no routing or quotas.
+  Still missing: no way to require auth by default, no automatic or
+  policy-enforced rotation (an operator or client must run `rotate-token`),
+  no minimum or default token lifetime, no routing or quotas.
 
    **Rebase hazard:** this work is cut from `main` before admission control
    (a bounded in-flight semaphore) lands in the separate gateway-hardening

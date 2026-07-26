@@ -568,6 +568,87 @@ async fn rejects_requests_with_an_invalid_bearer_token() {
 }
 
 #[tokio::test]
+async fn rejects_requests_with_an_expired_bearer_token() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let expired = store
+        .issue_token_expiring_at(&principal, Some(identity::unix_now() - 1))
+        .unwrap();
+    // Deliberately unreachable: were the expired token forwarded, this would
+    // answer 502 rather than 401, so the assertion cannot pass by accident.
+    let unreachable_upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+
+    let gateway = spawn_gateway_with_auth(
+        unreachable_upstream,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: None,
+        },
+    )
+    .await;
+    let request = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .header("authorization", format!("Bearer {expired}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = client().request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()["www-authenticate"], "Bearer");
+    assert_eq!(
+        to_bytes(Body::new(response.into_body()), 1024)
+            .await
+            .unwrap(),
+        r#"{"error":{"message":"expired bearer token","type":"unauthorized"}}"#
+    );
+}
+
+#[tokio::test]
+async fn forwards_requests_carrying_a_token_that_has_not_expired_yet() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store
+        .issue_token_expiring_at(
+            &principal,
+            Some(identity::expires_in(NonZeroU64::new(3600).unwrap())),
+        )
+        .unwrap();
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_server(
+        Router::new()
+            .fallback(any(capture_request))
+            .with_state(Arc::clone(&captured)),
+    )
+    .await;
+    let gateway = spawn_gateway_with_auth(
+        upstream.addr,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: None,
+        },
+    )
+    .await;
+    let request = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .header("host", "public-gateway.example")
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-client-test", "unexpired")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = client().request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(captured.lock().unwrap().is_some());
+}
+
+#[tokio::test]
 async fn forwards_requests_carrying_a_valid_bearer_token() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();

@@ -1033,6 +1033,11 @@ async fn authenticate(
 
     resolved.map_err(|error| match error {
         IdentityError::InvalidToken => unauthorized("invalid bearer token"),
+        // Distinct from the above so a client that is behaving correctly can
+        // tell "present a new credential" from "your credential is wrong".
+        // Both are 401: an expired token confers nothing, and the difference
+        // is a reason, not a policy.
+        IdentityError::ExpiredToken => unauthorized("expired bearer token"),
         error => {
             tracing::error!(%error, "identity store error while authenticating request");
             gateway_error(

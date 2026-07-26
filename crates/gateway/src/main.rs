@@ -132,6 +132,33 @@ enum Command {
         /// belongs to more than one organization.
         #[arg(long)]
         organization: Option<String>,
+        /// How long the token stays valid, in seconds. Omitted by default,
+        /// which issues a token that never expires -- the behavior of every
+        /// token issued before this option existed. A token that has expired
+        /// is refused by the gateway exactly as an unknown one is.
+        #[arg(long)]
+        expires_in_seconds: Option<NonZeroU64>,
+    },
+    /// Exchange a valid token for a fresh one and print the replacement once.
+    ///
+    /// The presented token stops working the moment this succeeds, and the
+    /// replacement is issued in the same transaction: there is no window in
+    /// which both work, and none in which neither does. Requires the plaintext
+    /// of the token being replaced, so this refreshes a credential for whoever
+    /// holds it rather than resetting someone else's.
+    RotateToken {
+        #[arg(long, env = "CAMELID_GATEWAY_IDENTITY_DB")]
+        identity_db: PathBuf,
+        /// The token to replace, or `-` to read it from stdin instead.
+        /// Passing the plaintext token directly on the command line leaves
+        /// it in shell history and briefly visible to other processes via
+        /// `ps`; prefer `-` and pipe it in.
+        token: String,
+        /// Lifetime of the replacement, in seconds. Omitted issues a
+        /// non-expiring replacement regardless of what the presented token
+        /// carried: the lifetime is chosen here, not inherited.
+        #[arg(long)]
+        expires_in_seconds: Option<NonZeroU64>,
     },
     /// Revoke a bearer token so it no longer resolves.
     RevokeToken {
@@ -202,7 +229,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             identity_db,
             principal,
             organization,
-        } => issue_token(&identity_db, &principal, organization.as_deref()),
+            expires_in_seconds,
+        } => issue_token(
+            &identity_db,
+            &principal,
+            organization.as_deref(),
+            expires_in_seconds,
+        ),
+        Command::RotateToken {
+            identity_db,
+            token,
+            expires_in_seconds,
+        } => rotate_token(&identity_db, &token, expires_in_seconds),
         Command::RevokeToken { identity_db, token } => revoke_token(&identity_db, &token),
     }
 }
@@ -267,7 +305,8 @@ async fn serve(
                 "bearer tokens are sent as plain HTTP headers; this gateway does not \
                  terminate TLS. Put a TLS-terminating ingress/reverse proxy (or mTLS) in \
                  front of it, or restrict --addr to a trusted network, or a captured \
-                 token can be replayed indefinitely (tokens do not expire yet)."
+                 token can be replayed until it is revoked or, if it was issued with \
+                 --expires-in-seconds, until it expires."
             );
             let quota = org_request_quota.limit.map(|limit| {
                 tracing::info!(
@@ -365,17 +404,32 @@ fn issue_token(
     identity_db: &Path,
     principal: &str,
     organization: Option<&str>,
+    expires_in_seconds: Option<NonZeroU64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = SqliteIdentityStore::open(identity_db)?;
     let principal = PrincipalId::new(principal.to_string());
+    let expires_at = expires_in_seconds.map(identity::expires_in);
     let token = match organization {
-        Some(organization) => store.issue_token_for_organization(
+        Some(organization) => store.issue_token_for_organization_expiring_at(
             &principal,
             &OrganizationId::new(organization.to_string()),
+            expires_at,
         )?,
-        None => store.issue_token(&principal)?,
+        None => store.issue_token_expiring_at(&principal, expires_at)?,
     };
     println!("{token}");
+    Ok(())
+}
+
+fn rotate_token(
+    identity_db: &Path,
+    token: &str,
+    expires_in_seconds: Option<NonZeroU64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let token = read_secret_arg(token)?;
+    let store = SqliteIdentityStore::open(identity_db)?;
+    let replacement = store.rotate_token(&token, expires_in_seconds.map(identity::expires_in))?;
+    println!("{replacement}");
     Ok(())
 }
 
