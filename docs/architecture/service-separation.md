@@ -60,11 +60,11 @@ deploy/
 | **Serving replica** | `crates/server` (`camelid-enterprise` bin) | CLI (`serve`), binds an HTTP listener, applies the deterministic lane, stamps attribution, loads one model at startup. |
 | **Lane / config freeze** | `crates/server/src/lane.rs` | Applies a canonical env-var configuration vector, fails closed on any override, publishes its SHA-256. Engine pinned by revision (`ENGINE_PIN`). |
 | **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-host` on every response, injects fields into completion bodies, writes optional JSONL serving receipts (each carrying the gateway-stamped `request_id` when present, or `null` for direct-to-replica traffic). |
-| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin forwarding for the `/v1` inference allowlist it derives from `replica_contract::PUBLIC_ROUTES` (so the allowlist cannot silently drift from the replica's public contract), with opaque streaming bodies, hop-by-hop header filtering, no retries, bounded concurrency (admission-controlled), and no response rewriting. Replica control routes are not exposed. Optionally enforces bearer-token auth (see below), checked before the admission permit is taken; unauthenticated pass-through remains the default. Stamps a gateway-authoritative `x-camelid-request-id` on every forwarded request (overwriting any client value) and, with `serve --audit-log <path>`, writes one JSONL audit line per handled request — including auth/admission rejections — as `{ts, request_id, principal, method, path, status}`. |
+| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin forwarding for the `/v1` inference allowlist it derives from `replica_contract::PUBLIC_ROUTES` (so the allowlist cannot silently drift from the replica's public contract), with opaque streaming bodies, hop-by-hop header filtering, no retries, bounded concurrency (admission-controlled), and no response rewriting. Replica control routes are not exposed. Optionally enforces bearer-token auth (see below), checked before the admission permit is taken; unauthenticated pass-through remains the default. Stamps a gateway-authoritative `x-camelid-request-id` on every forwarded request (overwriting any client value) and, with `serve --audit-log <path>`, writes one JSONL audit line per handled request — including auth/admission rejections — as `{ts, request_id, principal, organization, method, path, status}`. Principal and organization remain gateway-local; only the opaque request id reaches a replica. |
 | **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | The gateway exposes `/v1/health`, model discovery, completions/chat, and the pinned engine's compatibility endpoints. Replica-local `/api` model management remains private. Provided by the pinned engine crate, **not** by this repo. |
 | **Engine core** | `crates/engine-core` | GGUF container, model config, tensor/forward/tokenizer types. Host-agnostic. |
 | **Platform kernels** | `crates/engine-{macos,linux,windows}` | Runtime CPU feature detection (`probe()`), platform kernels. macOS port landing first; Linux/Windows currently capability-detection only. |
-| **Identity primitive** | `crates/identity` | Resolves an opaque bearer token to an opaque `PrincipalId`, backed by a local SQLite store (hashed tokens only). Wired into the gateway (see below) as opt-in enforcement; still no orgs, RBAC, or SSO. |
+| **Identity primitive** | `crates/identity` | Resolves an opaque bearer token to a principal plus explicitly token-scoped organization, backed by a local SQLite store (hashed tokens only). Operators can create/list organizations, add/remove memberships, and issue an organization-scoped token; removing a membership revokes its scoped tokens. Wired into the gateway as opt-in enforcement; still no RBAC or SSO. |
 | **Deployment assets** | `deploy/` | Dockerfile (model mounted at runtime, not baked); K8s Deployment (Guaranteed QoS, one model per pool, startup/readiness probes on `/v1/models`) + Service. |
 
 ### 2.3 Properties that exist Today
@@ -220,12 +220,20 @@ tokens for one model"; everything multi-user is layered on top.
   fronts the existing replica pool with no inference behavior change. It ships
   as a Rust binary, separate container, and private Kubernetes Service.
 3. **Identity & auth — in progress.** `crates/identity` provides the
-  token -> opaque `PrincipalId` primitive (SQLite-backed, hashed tokens, no
-  orgs/RBAC/SSO yet). The gateway now enforces it: `serve --identity-db <path>`
+  token -> opaque principal plus token-scoped organization primitive
+  (SQLite-backed, hashed tokens, no RBAC/SSO yet). The gateway now enforces it:
+  `serve --identity-db <path>`
   rejects any request without a valid `Authorization: Bearer <token>` with a
   typed `401` before it reaches a replica; omitting the flag keeps the
   gateway's original unauthenticated pass-through unchanged. `create-user`,
-  `issue-token`, and `revoke-token` subcommands manage the local database.
+  `create-organization`, `list-organizations`, `add-principal-to-organization`,
+  `remove-principal-from-organization`, `issue-token [--organization <id>]`,
+  and `revoke-token` subcommands manage the local database. The gateway audit
+  record includes the resolved opaque organization, but replicas still receive
+  only the opaque request id. The identity schema migration is forward-only:
+  take a backup before upgrading, and do not roll an older gateway binary back
+  against the migrated database because it cannot mint new organization-scoped
+  tokens.
   **Bearer tokens are only as safe as the transport they travel over:** this
   gateway does not terminate TLS, tokens do not expire, and a plaintext HTTP
   hop lets any on-path observer capture and replay one indefinitely. Enabling
@@ -234,7 +242,7 @@ tokens for one model"; everything multi-user is layered on top.
   deployment; the gateway logs a warning to this effect at startup. Per-request
   identity now reaches an audit trail without the replica learning identity:
   the gateway stamps an opaque `x-camelid-request-id` on each forwarded
-  request, records `{ts, request_id, principal, method, path, status}` to its
+  request, records `{ts, request_id, principal, organization, method, path, status}` to its
   own optional `--audit-log`, and the replica echoes that id into its serving
   receipt — so `gateway_audit ⨝ replica_receipt ON request_id` reconstructs
   "which principal's request was served by which deterministic configuration."

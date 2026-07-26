@@ -13,7 +13,7 @@
 //! backend, the identity model (users today, orgs/RBAC/SSO later), and the
 //! enforcement point (nothing today, the gateway later) all change
 //! independently. [`TokenStore`] retains its principal-only compatibility
-//! contract while gateway integration is introduced separately.
+//! contract for callers that have not yet adopted organization-aware policy.
 
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -97,11 +97,22 @@ impl AuthenticatedContext {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum IdentityError {
     /// The token does not resolve to any principal (never issued, or
     /// revoked). Deliberately does not distinguish the two: a caller must not
     /// be able to tell "never existed" from "revoked".
     InvalidToken,
+    UnknownPrincipal,
+    UnknownOrganization,
+    NoOrganizationMembership,
+    AmbiguousOrganization,
+    NotOrganizationMember,
+    UnsupportedSchemaVersion {
+        found: i64,
+        supported: i64,
+    },
+    MigrationIntegrity(String),
     Storage(String),
 }
 
@@ -109,6 +120,23 @@ impl fmt::Display for IdentityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidToken => write!(f, "token does not resolve to any principal"),
+            Self::UnknownPrincipal => write!(f, "principal does not exist"),
+            Self::UnknownOrganization => write!(f, "organization does not exist"),
+            Self::NoOrganizationMembership => write!(f, "principal belongs to no organizations"),
+            Self::AmbiguousOrganization => write!(
+                f,
+                "principal belongs to multiple organizations; select an organization explicitly"
+            ),
+            Self::NotOrganizationMember => {
+                write!(f, "principal is not a member of the organization")
+            }
+            Self::UnsupportedSchemaVersion { found, supported } => write!(
+                f,
+                "identity database schema version {found} is newer than this binary supports ({supported})"
+            ),
+            Self::MigrationIntegrity(message) => {
+                write!(f, "identity database cannot be migrated safely: {message}")
+            }
             Self::Storage(msg) => write!(f, "identity storage error: {msg}"),
         }
     }
@@ -151,6 +179,10 @@ impl SqliteIdentityStore {
     /// its schema exists.
     pub fn open(path: &Path) -> Result<Self, IdentityError> {
         let conn = Connection::open(path)?;
+        // Do this read-only compatibility check before the WAL pragma. A
+        // binary must not alter the journal mode of a database it cannot
+        // understand or migrate.
+        ensure_supported_schema_version(&conn)?;
         // WAL lets `serve`'s long-lived auth-lookup connection and a
         // short-lived CLI process (create-user/issue-token/revoke-token)
         // touch the same database file concurrently without one blocking on
@@ -194,18 +226,20 @@ impl SqliteIdentityStore {
     /// panic during any identity operation permanently breaks every later
     /// one for the life of the process — in the gateway, that means every
     /// request fails once this lock is poisoned, until restart. Every
-    /// operation in this file executes one self-contained statement (or a
-    /// `SELECT` immediately followed by one `INSERT`/`DELETE`) and holds no
-    /// transaction state across calls, so reusing a guard recovered from a
-    /// poisoned lock is safe.
+    /// Operations can use SQLite transactions while holding this guard. If a
+    /// panic unwinds through one, `Transaction::drop` rolls it back before the
+    /// mutex guard is released; rollback failures cannot be reported during
+    /// drop, but SQLite will not leave that uncommitted transaction active on
+    /// the reused connection. Reusing a recovered guard is therefore safe for
+    /// this connection-local, self-contained unit of work.
     fn locked_connection(&self) -> MutexGuard<'_, Connection> {
         self.conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Creates a user and returns its opaque [`PrincipalId`]. `name` is a
-    /// display label only; it is never used as a lookup key.
+    /// Creates a user, its personal organization, and their membership in one
+    /// transaction. `name` is a display label only; it is never a lookup key.
     pub fn create_user(&self, name: &str) -> Result<PrincipalId, IdentityError> {
         let principal = PrincipalId(random_id("usr"));
         let organization = OrganizationId(random_organization_id());
@@ -263,7 +297,8 @@ impl SqliteIdentityStore {
         Ok(principal)
     }
 
-    /// Adds an existing principal to an existing organization.
+    /// Adds an existing principal to an existing organization. Repeating the
+    /// same addition is idempotent.
     pub fn add_principal_to_organization(
         &self,
         principal: &PrincipalId,
@@ -280,10 +315,7 @@ impl SqliteIdentityStore {
             )
             .optional()?;
         if principal_exists.is_none() {
-            return Err(IdentityError::Storage(format!(
-                "no such principal: {}",
-                principal.0
-            )));
+            return Err(IdentityError::UnknownPrincipal);
         }
         transaction.execute(
             "INSERT OR IGNORE INTO organization_memberships (organization_id, principal_id, created_at_unix)
@@ -294,14 +326,68 @@ impl SqliteIdentityStore {
         Ok(())
     }
 
-    /// Issues a new bearer token for `principal` and returns its plaintext
-    /// value. This is the only moment the plaintext is ever available: only
-    /// its SHA-256 hash is persisted, so a stolen database backup cannot be
-    /// used to authenticate.
+    /// Returns every organization the principal belongs to, in stable id order.
+    pub fn organizations_for_principal(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<Vec<OrganizationId>, IdentityError> {
+        let conn = self.locked_connection();
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM users WHERE principal_id = ?1",
+                rusqlite::params![principal.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(IdentityError::UnknownPrincipal);
+        }
+        let mut statement = conn.prepare(
+            "SELECT organization_id FROM organization_memberships
+             WHERE principal_id = ?1 ORDER BY organization_id",
+        )?;
+        let organizations = statement
+            .query_map(rusqlite::params![principal.0], |row| {
+                Ok(OrganizationId(row.get(0)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(organizations)
+    }
+
+    /// Removes a principal from an organization and revokes every token scoped
+    /// to that membership. Repeating a removal is reported as a typed caller
+    /// error rather than silently leaving uncertain access state.
+    pub fn remove_principal_from_organization(
+        &self,
+        principal: &PrincipalId,
+        organization: &OrganizationId,
+    ) -> Result<(), IdentityError> {
+        let mut conn = self.locked_connection();
+        let transaction = conn.transaction()?;
+        if !principal_exists(&transaction, principal)? {
+            return Err(IdentityError::UnknownPrincipal);
+        }
+        require_organization(&transaction, organization)?;
+        let removed = transaction.execute(
+            "DELETE FROM organization_memberships
+             WHERE principal_id = ?1 AND organization_id = ?2",
+            rusqlite::params![principal.0, organization.0],
+        )?;
+        if removed == 0 {
+            return Err(IdentityError::NotOrganizationMember);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Issues a token for a principal that belongs to exactly one organization.
+    /// Multi-organization principals must use [`Self::issue_token_for_organization`]
+    /// so the selected tenant is unambiguous.
     pub fn issue_token(&self, principal: &PrincipalId) -> Result<String, IdentityError> {
+        let mut conn = self.locked_connection();
+        let transaction = conn.transaction()?;
         let organizations: Vec<String> = {
-            let conn = self.locked_connection();
-            let mut statement = conn.prepare(
+            let mut statement = transaction.prepare(
                 "SELECT organization_id FROM organization_memberships WHERE principal_id = ?1 ORDER BY organization_id",
             )?;
             let organizations = statement
@@ -309,20 +395,17 @@ impl SqliteIdentityStore {
                 .collect::<Result<Vec<_>, _>>()?;
             organizations
         };
-        match organizations.as_slice() {
-            [organization_id] => self.issue_token_for_organization(
-                principal,
-                &OrganizationId(organization_id.clone()),
-            ),
-            [] => Err(IdentityError::Storage(format!(
-                "no such principal: {}",
-                principal.0
-            ))),
-            _ => Err(IdentityError::Storage(format!(
-                "principal {} belongs to multiple organizations; issue an organization-scoped token",
-                principal.0
-            ))),
-        }
+        let organization = match organizations.as_slice() {
+            [organization_id] => OrganizationId(organization_id.clone()),
+            [] if principal_exists(&transaction, principal)? => {
+                return Err(IdentityError::NoOrganizationMembership);
+            }
+            [] => return Err(IdentityError::UnknownPrincipal),
+            _ => return Err(IdentityError::AmbiguousOrganization),
+        };
+        let token = issue_token_in_transaction(&transaction, principal, &organization)?;
+        transaction.commit()?;
+        Ok(token)
     }
 
     /// Issues a bearer token for one principal in one organization. Both the
@@ -332,26 +415,10 @@ impl SqliteIdentityStore {
         principal: &PrincipalId,
         organization: &OrganizationId,
     ) -> Result<String, IdentityError> {
-        let conn = self.locked_connection();
-        let is_member: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM organization_memberships WHERE principal_id = ?1 AND organization_id = ?2",
-                rusqlite::params![principal.0, organization.0],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if is_member.is_none() {
-            return Err(IdentityError::Storage(format!(
-                "principal {} is not a member of organization {}",
-                principal.0, organization.0
-            )));
-        }
-
-        let token = format!("{TOKEN_PREFIX}{}", random_hex(TOKEN_BYTES));
-        conn.execute(
-            "INSERT INTO tokens (token_hash, principal_id, organization_id, created_at_unix) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![hash_token(&token), principal.0, organization.0, unix_now()],
-        )?;
+        let mut conn = self.locked_connection();
+        let transaction = conn.transaction()?;
+        let token = issue_token_in_transaction(&transaction, principal, organization)?;
+        transaction.commit()?;
         Ok(token)
     }
 
@@ -397,22 +464,93 @@ impl TokenStore for SqliteIdentityStore {
     }
 }
 
-fn initialize_schema(conn: &mut Connection) -> Result<(), IdentityError> {
+fn ensure_supported_schema_version(conn: &Connection) -> Result<(), IdentityError> {
     let schema_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if schema_version > IDENTITY_SCHEMA_VERSION {
-        return Err(IdentityError::Storage(format!(
-            "identity database schema version {schema_version} is newer than this binary supports ({IDENTITY_SCHEMA_VERSION})"
-        )));
+        return Err(IdentityError::UnsupportedSchemaVersion {
+            found: schema_version,
+            supported: IDENTITY_SCHEMA_VERSION,
+        });
     }
-    if !table_exists(conn, "tokens")? {
-        create_schema_v2(conn)?;
-    } else if !table_has_column(conn, "tokens", "organization_id")? {
-        migrate_v1_to_v2(conn)?;
-    } else {
-        create_schema_v2(conn)?;
+    Ok(())
+}
+
+fn principal_exists(
+    transaction: &rusqlite::Transaction<'_>,
+    principal: &PrincipalId,
+) -> Result<bool, IdentityError> {
+    Ok(transaction
+        .query_row(
+            "SELECT 1 FROM users WHERE principal_id = ?1",
+            rusqlite::params![principal.0],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn issue_token_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    principal: &PrincipalId,
+    organization: &OrganizationId,
+) -> Result<String, IdentityError> {
+    if !principal_exists(transaction, principal)? {
+        return Err(IdentityError::UnknownPrincipal);
     }
-    conn.pragma_update(None, "user_version", IDENTITY_SCHEMA_VERSION)?;
-    verify_foreign_keys(conn)
+    require_organization(transaction, organization)?;
+    let is_member: Option<i64> = transaction
+        .query_row(
+            "SELECT 1 FROM organization_memberships WHERE principal_id = ?1 AND organization_id = ?2",
+            rusqlite::params![principal.0, organization.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if is_member.is_none() {
+        return Err(IdentityError::NotOrganizationMember);
+    }
+
+    let token = format!("{TOKEN_PREFIX}{}", random_hex(TOKEN_BYTES));
+    transaction.execute(
+        "INSERT INTO tokens (token_hash, principal_id, organization_id, created_at_unix) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![hash_token(&token), principal.0, organization.0, unix_now()],
+    )?;
+    Ok(token)
+}
+
+fn initialize_schema(conn: &mut Connection) -> Result<(), IdentityError> {
+    let schema_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match schema_version {
+        0 => initialize_unversioned_database(conn),
+        1 => migrate_v1_to_v2(conn),
+        2 => validate_v2_schema(conn),
+        _ => Err(IdentityError::UnsupportedSchemaVersion {
+            found: schema_version,
+            supported: IDENTITY_SCHEMA_VERSION,
+        }),
+    }
+}
+
+fn initialize_unversioned_database(conn: &mut Connection) -> Result<(), IdentityError> {
+    let users_exists = table_exists(conn, "users")?;
+    let tokens_exists = table_exists(conn, "tokens")?;
+    let organizations_exists = table_exists(conn, "organizations")?;
+    let memberships_exist = table_exists(conn, "organization_memberships")?;
+    match (
+        users_exists,
+        tokens_exists,
+        organizations_exists,
+        memberships_exist,
+    ) {
+        (false, false, false, false) => {
+            create_schema_v2(conn)?;
+            conn.pragma_update(None, "user_version", IDENTITY_SCHEMA_VERSION)?;
+            Ok(())
+        }
+        (true, true, false, false) => migrate_v1_to_v2(conn),
+        _ => Err(IdentityError::MigrationIntegrity(
+            "unversioned database does not match the supported legacy identity schema".into(),
+        )),
+    }
 }
 
 fn create_schema_v2(conn: &Connection) -> Result<(), IdentityError> {
@@ -435,11 +573,12 @@ fn create_schema_v2(conn: &Connection) -> Result<(), IdentityError> {
         );
         CREATE TABLE IF NOT EXISTS tokens (
             token_hash TEXT PRIMARY KEY,
-            principal_id TEXT NOT NULL REFERENCES users(principal_id),
-            organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+            principal_id TEXT NOT NULL,
+            organization_id TEXT NOT NULL,
             created_at_unix INTEGER NOT NULL,
             FOREIGN KEY (organization_id, principal_id)
                 REFERENCES organization_memberships(organization_id, principal_id)
+                ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_tokens_principal ON tokens(principal_id);
         CREATE INDEX IF NOT EXISTS idx_memberships_principal ON organization_memberships(principal_id);",
@@ -449,6 +588,22 @@ fn create_schema_v2(conn: &Connection) -> Result<(), IdentityError> {
 
 fn migrate_v1_to_v2(conn: &mut Connection) -> Result<(), IdentityError> {
     let transaction = conn.transaction()?;
+    let orphaned_principal: Option<String> = transaction
+        .query_row(
+            "SELECT tokens.principal_id
+             FROM tokens
+             LEFT JOIN users ON users.principal_id = tokens.principal_id
+             WHERE users.principal_id IS NULL
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if orphaned_principal.is_some() {
+        return Err(IdentityError::MigrationIntegrity(
+            "a legacy token references a missing principal".into(),
+        ));
+    }
     transaction.execute_batch(
         "ALTER TABLE tokens ADD COLUMN organization_id TEXT;
         CREATE TABLE organizations (
@@ -491,18 +646,20 @@ fn migrate_v1_to_v2(conn: &mut Connection) -> Result<(), IdentityError> {
     transaction.execute_batch(
         "CREATE TABLE tokens_v2 (
             token_hash TEXT PRIMARY KEY,
-            principal_id TEXT NOT NULL REFERENCES users(principal_id),
-            organization_id TEXT NOT NULL REFERENCES organizations(organization_id),
+            principal_id TEXT NOT NULL,
+            organization_id TEXT NOT NULL,
             created_at_unix INTEGER NOT NULL,
             FOREIGN KEY (organization_id, principal_id)
                 REFERENCES organization_memberships(organization_id, principal_id)
+                ON DELETE CASCADE
         );
         INSERT INTO tokens_v2 (token_hash, principal_id, organization_id, created_at_unix)
             SELECT token_hash, principal_id, organization_id, created_at_unix FROM tokens;
         DROP TABLE tokens;
         ALTER TABLE tokens_v2 RENAME TO tokens;
         CREATE INDEX idx_tokens_principal ON tokens(principal_id);
-        CREATE INDEX idx_memberships_principal ON organization_memberships(principal_id);",
+        CREATE INDEX idx_memberships_principal ON organization_memberships(principal_id);
+        PRAGMA user_version = 2;",
     )?;
     transaction.commit()?;
     Ok(())
@@ -519,24 +676,14 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool, IdentityError> {
         .is_some())
 }
 
-fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, IdentityError> {
-    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(columns.iter().any(|candidate| candidate == column))
-}
-
-fn verify_foreign_keys(conn: &Connection) -> Result<(), IdentityError> {
-    let violation: Option<(String, i64, String)> = conn
-        .query_row("PRAGMA foreign_key_check", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .optional()?;
-    if let Some((table, row_id, parent)) = violation {
-        return Err(IdentityError::Storage(format!(
-            "identity database foreign-key violation in {table} row {row_id} referencing {parent}"
-        )));
+fn validate_v2_schema(conn: &Connection) -> Result<(), IdentityError> {
+    for query in [
+        "SELECT principal_id, name, created_at_unix FROM users LIMIT 0",
+        "SELECT organization_id, name, created_at_unix FROM organizations LIMIT 0",
+        "SELECT organization_id, principal_id, created_at_unix FROM organization_memberships LIMIT 0",
+        "SELECT token_hash, principal_id, organization_id, created_at_unix FROM tokens LIMIT 0",
+    ] {
+        conn.prepare(query)?;
     }
     Ok(())
 }
@@ -553,10 +700,7 @@ fn require_organization(
         )
         .optional()?;
     if exists.is_none() {
-        return Err(IdentityError::Storage(format!(
-            "no such organization: {}",
-            organization.0
-        )));
+        return Err(IdentityError::UnknownOrganization);
     }
     Ok(())
 }
@@ -655,7 +799,10 @@ mod tests {
     fn issuing_a_token_for_an_unknown_principal_fails() {
         let store = SqliteIdentityStore::open_in_memory().unwrap();
         let ghost = PrincipalId("usr_does_not_exist".to_string());
-        assert!(store.issue_token(&ghost).is_err());
+        assert!(matches!(
+            store.issue_token(&ghost).unwrap_err(),
+            IdentityError::UnknownPrincipal
+        ));
     }
 
     #[test]
@@ -720,6 +867,11 @@ mod tests {
         let a = store.create_user("ada").unwrap();
         let b = store.create_user("grace").unwrap();
         assert_ne!(a, b);
+        let a_organizations = store.organizations_for_principal(&a).unwrap();
+        let b_organizations = store.organizations_for_principal(&b).unwrap();
+        assert_eq!(a_organizations.len(), 1);
+        assert_eq!(b_organizations.len(), 1);
+        assert_ne!(a_organizations, b_organizations);
     }
 
     #[test]
@@ -752,8 +904,14 @@ mod tests {
             .add_principal_to_organization(&principal, &second)
             .unwrap();
 
-        let error = store.issue_token(&principal).unwrap_err();
-        assert!(error.to_string().contains("multiple organizations"));
+        assert_eq!(
+            store.organizations_for_principal(&principal).unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+        assert!(matches!(
+            store.issue_token(&principal).unwrap_err(),
+            IdentityError::AmbiguousOrganization
+        ));
 
         let first_token = store
             .issue_token_for_organization(&principal, &first)
@@ -784,18 +942,25 @@ mod tests {
         let second = store.create_organization("Example").unwrap();
         let principal = store.create_user_in_organization("ada", &first).unwrap();
 
-        let error = store
-            .issue_token_for_organization(&principal, &second)
-            .unwrap_err();
-        assert!(error.to_string().contains("is not a member"));
+        assert!(matches!(
+            store
+                .issue_token_for_organization(&principal, &second)
+                .unwrap_err(),
+            IdentityError::NotOrganizationMember
+        ));
     }
 
     #[test]
-    fn legacy_database_migration_preserves_existing_token_authentication() {
+    fn legacy_database_migration_preserves_every_users_tokens() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("identity.sqlite");
-        let principal = PrincipalId::new("usr_legacy".to_string());
-        let token = "cme_legacy_token";
+        let ada = PrincipalId::new("usr_legacy_ada".to_string());
+        let grace = PrincipalId::new("usr_legacy_grace".to_string());
+        let tokens = [
+            ("cme_legacy_ada_one", &ada),
+            ("cme_legacy_ada_two", &ada),
+            ("cme_legacy_grace", &grace),
+        ];
         {
             let connection = Connection::open(&path).unwrap();
             connection
@@ -814,27 +979,35 @@ mod tests {
                      CREATE INDEX idx_tokens_principal ON tokens(principal_id);",
                 )
                 .unwrap();
-            connection
-                .execute(
-                    "INSERT INTO users (principal_id, name, created_at_unix) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![principal.as_str(), "ada", 1_i64],
-                )
-                .unwrap();
-            connection
-                .execute(
-                    "INSERT INTO tokens (token_hash, principal_id, created_at_unix) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![hash_token(token), principal.as_str(), 1_i64],
-                )
-                .unwrap();
+            for (principal, name) in [(&ada, "ada"), (&grace, "grace")] {
+                connection
+                    .execute(
+                        "INSERT INTO users (principal_id, name, created_at_unix) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![principal.as_str(), name, 1_i64],
+                    )
+                    .unwrap();
+            }
+            for &(token, principal) in &tokens {
+                connection
+                    .execute(
+                        "INSERT INTO tokens (token_hash, principal_id, created_at_unix) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![hash_token(token), principal.as_str(), 1_i64],
+                    )
+                    .unwrap();
+            }
         }
 
         let store = SqliteIdentityStore::open(&path).unwrap();
-        let context = store.resolve_context(token).unwrap();
-
-        assert_eq!(context.principal_id(), &principal);
-        assert!(context.organization_id().as_str().starts_with("org_"));
-        assert_eq!(store.resolve(token).unwrap(), principal);
-        assert!(store.issue_token(context.principal_id()).is_ok());
+        let ada_organization = store.organizations_for_principal(&ada).unwrap();
+        let grace_organization = store.organizations_for_principal(&grace).unwrap();
+        assert_eq!(ada_organization.len(), 1);
+        assert_eq!(grace_organization.len(), 1);
+        assert_ne!(ada_organization, grace_organization);
+        for &(token, principal) in &tokens {
+            let context = store.resolve_context(token).unwrap();
+            assert_eq!(context.principal_id(), principal);
+            assert_eq!(store.resolve(token).unwrap(), *principal);
+        }
     }
 
     #[test]
@@ -843,16 +1016,147 @@ mod tests {
         let path = directory.path().join("identity.sqlite");
         let connection = Connection::open(&path).unwrap();
         connection
+            .execute_batch(
+                "CREATE TABLE sentinel (value TEXT); INSERT INTO sentinel VALUES ('unchanged');",
+            )
+            .unwrap();
+        connection
             .pragma_update(None, "user_version", IDENTITY_SCHEMA_VERSION + 1)
             .unwrap();
         drop(connection);
+        let before = std::fs::read(&path).unwrap();
+        assert!(!path.with_extension("sqlite-wal").exists());
+        assert!(!path.with_extension("sqlite-shm").exists());
 
         let error = match SqliteIdentityStore::open(&path) {
             Ok(_) => panic!("a newer identity schema must be rejected"),
             Err(error) => error,
         };
-        assert!(error
-            .to_string()
-            .contains("newer than this binary supports"));
+        assert!(matches!(
+            error,
+            IdentityError::UnsupportedSchemaVersion {
+                found,
+                supported: IDENTITY_SCHEMA_VERSION
+            } if found == IDENTITY_SCHEMA_VERSION + 1
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            IDENTITY_SCHEMA_VERSION + 1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM sentinel", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "unchanged"
+        );
+    }
+
+    #[test]
+    fn removing_membership_revokes_only_that_organizations_tokens() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let first = store.create_organization("Acme").unwrap();
+        let second = store.create_organization("Example").unwrap();
+        let principal = store.create_user_in_organization("ada", &first).unwrap();
+        store
+            .add_principal_to_organization(&principal, &second)
+            .unwrap();
+        let first_token = store
+            .issue_token_for_organization(&principal, &first)
+            .unwrap();
+        let second_token = store
+            .issue_token_for_organization(&principal, &second)
+            .unwrap();
+
+        store
+            .remove_principal_from_organization(&principal, &first)
+            .unwrap();
+
+        assert!(matches!(
+            store.resolve_context(&first_token),
+            Err(IdentityError::InvalidToken)
+        ));
+        assert_eq!(
+            store
+                .resolve_context(&second_token)
+                .unwrap()
+                .organization_id(),
+            &second
+        );
+        assert!(matches!(
+            store
+                .remove_principal_from_organization(&principal, &first)
+                .unwrap_err(),
+            IdentityError::NotOrganizationMember
+        ));
+    }
+
+    #[test]
+    fn context_resolution_rejects_a_corrupt_token_without_membership() {
+        let store = SqliteIdentityStore::open_in_memory().unwrap();
+        let principal = store.create_user("ada").unwrap();
+        let token = store.issue_token(&principal).unwrap();
+        let organization = store
+            .organizations_for_principal(&principal)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let conn = store.locked_connection();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute(
+            "DELETE FROM organization_memberships WHERE principal_id = ?1 AND organization_id = ?2",
+            rusqlite::params![principal.as_str(), organization.as_str()],
+        )
+        .unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        drop(conn);
+
+        assert!(matches!(
+            store.resolve_context(&token),
+            Err(IdentityError::InvalidToken)
+        ));
+    }
+
+    #[test]
+    fn concurrent_scoped_token_issuance_remains_consistent() {
+        const ISSUERS: usize = 48;
+        let store = std::sync::Arc::new(SqliteIdentityStore::open_in_memory().unwrap());
+        let organization = store.create_organization("Acme").unwrap();
+        let principal = store
+            .create_user_in_organization("ada", &organization)
+            .unwrap();
+        let mut threads = Vec::new();
+        for _ in 0..ISSUERS {
+            let store = std::sync::Arc::clone(&store);
+            let principal = principal.clone();
+            let organization = organization.clone();
+            threads.push(std::thread::spawn(move || {
+                store
+                    .issue_token_for_organization(&principal, &organization)
+                    .unwrap()
+            }));
+        }
+        let tokens: Vec<String> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(tokens.len(), ISSUERS);
+        assert_eq!(
+            tokens
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            ISSUERS
+        );
+        for token in tokens {
+            assert_eq!(
+                store.resolve_context(&token).unwrap().organization_id(),
+                &organization
+            );
+        }
     }
 }

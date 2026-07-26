@@ -1036,6 +1036,8 @@ async fn audit_log_records_both_forwarded_and_rejected_requests() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();
     let principal = store.create_user("ada").unwrap();
     let token = store.issue_token(&principal).unwrap();
+    let organization = store.organizations_for_principal(&principal).unwrap();
+    assert_eq!(organization.len(), 1);
 
     let seen = Arc::new(Mutex::new(None));
     let upstream = spawn_server(
@@ -1086,6 +1088,10 @@ async fn audit_log_records_both_forwarded_and_rejected_requests() {
         rejected_record["principal"].is_null(),
         "a rejected request has no resolved principal: {rejected_record}"
     );
+    assert!(
+        rejected_record["organization"].is_null(),
+        "a rejected request has no resolved organization: {rejected_record}"
+    );
     assert_eq!(rejected_record["method"], "GET");
     assert_eq!(rejected_record["path"], "/v1/models");
     assert!(rejected_record["request_id"]
@@ -1098,6 +1104,10 @@ async fn audit_log_records_both_forwarded_and_rejected_requests() {
         .find(|record| record["status"] == 204)
         .expect("the forwarded request must be audited");
     assert_eq!(forwarded_record["principal"], principal.to_string());
+    assert_eq!(
+        forwarded_record["organization"],
+        organization[0].to_string()
+    );
     assert_eq!(forwarded_record["request_id"], upstream_request_id);
 }
 
@@ -1169,7 +1179,10 @@ async fn audit_log_is_not_torn_by_concurrent_requests() {
 async fn read_audit_records(path: &std::path::Path, expected: usize) -> Vec<serde_json::Value> {
     for _ in 0..200 {
         if let Ok(contents) = std::fs::read_to_string(path) {
-            let lines: Vec<&str> = contents.lines().filter(|line| !line.trim().is_empty()).collect();
+            let lines: Vec<&str> = contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
             if lines.len() >= expected {
                 return lines
                     .iter()

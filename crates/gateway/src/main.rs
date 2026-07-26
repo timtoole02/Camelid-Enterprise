@@ -3,7 +3,7 @@ use camelid_enterprise_gateway::{
     DEFAULT_MAX_IN_FLIGHT,
 };
 use clap::{Parser, Subcommand};
-use identity::{PrincipalId, SqliteIdentityStore};
+use identity::{OrganizationId, PrincipalId, SqliteIdentityStore};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -61,12 +61,40 @@ enum Command {
         #[arg(long, env = "CAMELID_GATEWAY_AUDIT_LOG")]
         audit_log: Option<PathBuf>,
     },
-    /// Create a user in the identity database and print its opaque principal id.
+    /// Create a user and its personal organization, then print the principal id.
     CreateUser {
         #[arg(long, env = "CAMELID_GATEWAY_IDENTITY_DB")]
         identity_db: PathBuf,
         /// Display label for the user. Never used as a lookup key.
         name: String,
+    },
+    /// Create an organization and print its opaque organization id.
+    CreateOrganization {
+        #[arg(long, env = "CAMELID_GATEWAY_IDENTITY_DB")]
+        identity_db: PathBuf,
+        /// Display label for the organization. Never used as a lookup key.
+        name: String,
+    },
+    /// List the opaque organization ids a principal belongs to, one per line.
+    ListOrganizations {
+        #[arg(long, env = "CAMELID_GATEWAY_IDENTITY_DB")]
+        identity_db: PathBuf,
+        /// A principal id printed by `create-user`.
+        principal: String,
+    },
+    /// Add an existing principal to an existing organization.
+    AddPrincipalToOrganization {
+        #[arg(long, env = "CAMELID_GATEWAY_IDENTITY_DB")]
+        identity_db: PathBuf,
+        principal: String,
+        organization: String,
+    },
+    /// Remove a principal from an organization and revoke that membership's tokens.
+    RemovePrincipalFromOrganization {
+        #[arg(long, env = "CAMELID_GATEWAY_IDENTITY_DB")]
+        identity_db: PathBuf,
+        principal: String,
+        organization: String,
     },
     /// Issue a new bearer token for a principal and print it once.
     ///
@@ -77,6 +105,10 @@ enum Command {
         identity_db: PathBuf,
         /// A principal id printed by `create-user`.
         principal: String,
+        /// Organization id to bind into the token. Required when the principal
+        /// belongs to more than one organization.
+        #[arg(long)]
+        organization: Option<String>,
     },
     /// Revoke a bearer token so it no longer resolves.
     RevokeToken {
@@ -116,10 +148,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         Command::CreateUser { identity_db, name } => create_user(&identity_db, &name),
+        Command::CreateOrganization { identity_db, name } => {
+            create_organization(&identity_db, &name)
+        }
+        Command::ListOrganizations {
+            identity_db,
+            principal,
+        } => list_organizations(&identity_db, &principal),
+        Command::AddPrincipalToOrganization {
+            identity_db,
+            principal,
+            organization,
+        } => add_principal_to_organization(&identity_db, &principal, &organization),
+        Command::RemovePrincipalFromOrganization {
+            identity_db,
+            principal,
+            organization,
+        } => remove_principal_from_organization(&identity_db, &principal, &organization),
         Command::IssueToken {
             identity_db,
             principal,
-        } => issue_token(&identity_db, &principal),
+            organization,
+        } => issue_token(&identity_db, &principal, organization.as_deref()),
         Command::RevokeToken { identity_db, token } => revoke_token(&identity_db, &token),
     }
 }
@@ -183,9 +233,66 @@ fn create_user(identity_db: &Path, name: &str) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-fn issue_token(identity_db: &Path, principal: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn create_organization(identity_db: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let store = SqliteIdentityStore::open(identity_db)?;
-    let token = store.issue_token(&PrincipalId::new(principal.to_string()))?;
+    let organization = store.create_organization(name)?;
+    println!("{organization}");
+    Ok(())
+}
+
+fn list_organizations(
+    identity_db: &Path,
+    principal: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = SqliteIdentityStore::open(identity_db)?;
+    for organization in
+        store.organizations_for_principal(&PrincipalId::new(principal.to_string()))?
+    {
+        println!("{organization}");
+    }
+    Ok(())
+}
+
+fn add_principal_to_organization(
+    identity_db: &Path,
+    principal: &str,
+    organization: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = SqliteIdentityStore::open(identity_db)?;
+    store.add_principal_to_organization(
+        &PrincipalId::new(principal.to_string()),
+        &OrganizationId::new(organization.to_string()),
+    )?;
+    Ok(())
+}
+
+fn remove_principal_from_organization(
+    identity_db: &Path,
+    principal: &str,
+    organization: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = SqliteIdentityStore::open(identity_db)?;
+    store.remove_principal_from_organization(
+        &PrincipalId::new(principal.to_string()),
+        &OrganizationId::new(organization.to_string()),
+    )?;
+    Ok(())
+}
+
+fn issue_token(
+    identity_db: &Path,
+    principal: &str,
+    organization: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = SqliteIdentityStore::open(identity_db)?;
+    let principal = PrincipalId::new(principal.to_string());
+    let token = match organization {
+        Some(organization) => store.issue_token_for_organization(
+            &principal,
+            &OrganizationId::new(organization.to_string()),
+        )?,
+        None => store.issue_token(&principal)?,
+    };
     println!("{token}");
     Ok(())
 }
@@ -264,5 +371,52 @@ mod tests {
             panic!("expected the parsed command to be Serve");
         };
         assert_eq!(max_in_flight, DEFAULT_MAX_IN_FLIGHT);
+    }
+
+    #[test]
+    fn issue_token_accepts_an_explicit_organization() {
+        let cli = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "issue-token",
+            "--identity-db",
+            "identity.sqlite",
+            "usr_ada",
+            "--organization",
+            "org_acme",
+        ])
+        .unwrap();
+        let Command::IssueToken {
+            principal,
+            organization,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the parsed command to be IssueToken");
+        };
+        assert_eq!(principal, "usr_ada");
+        assert_eq!(organization.as_deref(), Some("org_acme"));
+    }
+
+    #[test]
+    fn organization_membership_commands_require_both_ids() {
+        let cli = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "add-principal-to-organization",
+            "--identity-db",
+            "identity.sqlite",
+            "usr_ada",
+            "org_acme",
+        ])
+        .unwrap();
+        let Command::AddPrincipalToOrganization {
+            principal,
+            organization,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the parsed command to be AddPrincipalToOrganization");
+        };
+        assert_eq!(principal, "usr_ada");
+        assert_eq!(organization, "org_acme");
     }
 }
