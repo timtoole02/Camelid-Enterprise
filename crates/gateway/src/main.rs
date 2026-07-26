@@ -1,11 +1,11 @@
 use camelid_enterprise_gateway::{
-    router_with_options, GatewayAuth, UpstreamOrigin, DEFAULT_MAX_CONNECTION_DURATION,
+    router_with_options, GatewayAuth, OrgQuota, UpstreamOrigin, DEFAULT_MAX_CONNECTION_DURATION,
     DEFAULT_MAX_IN_FLIGHT,
 };
 use clap::{Parser, Subcommand};
 use identity::{OrganizationId, PrincipalId, SqliteIdentityStore};
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,6 +60,20 @@ enum Command {
         /// see which deterministic configuration served each caller's request.
         #[arg(long, env = "CAMELID_GATEWAY_AUDIT_LOG")]
         audit_log: Option<PathBuf>,
+        /// Maximum requests one organization may send per quota window.
+        /// Requires `--identity-db`, since a request needs a resolved
+        /// organization to be charged against a quota. Omitted by default:
+        /// no organization is rate-limited unless this is set.
+        #[arg(long, env = "CAMELID_GATEWAY_ORG_REQUEST_QUOTA")]
+        org_request_quota: Option<NonZeroU32>,
+        /// Length, in seconds, of the rolling window `--org-request-quota`
+        /// counts requests over. Ignored unless `--org-request-quota` is set.
+        #[arg(
+            long,
+            default_value_t = 60,
+            env = "CAMELID_GATEWAY_ORG_REQUEST_QUOTA_WINDOW_SECONDS"
+        )]
+        org_request_quota_window_seconds: u64,
     },
     /// Create a user and its personal organization, then print the principal id.
     CreateUser {
@@ -136,6 +150,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_connection_seconds,
             identity_db,
             audit_log,
+            org_request_quota,
+            org_request_quota_window_seconds,
         } => {
             serve(
                 &upstream,
@@ -144,6 +160,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_connection_seconds,
                 identity_db,
                 audit_log,
+                OrgQuotaArgs {
+                    limit: org_request_quota,
+                    window_seconds: org_request_quota_window_seconds,
+                },
             )
             .await
         }
@@ -174,6 +194,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// The `--org-request-quota` / `--org-request-quota-window-seconds` pair,
+/// grouped so [`serve`] takes one argument for them instead of two that must
+/// always travel together.
+struct OrgQuotaArgs {
+    limit: Option<NonZeroU32>,
+    window_seconds: u64,
+}
+
 async fn serve(
     upstream: &str,
     addr: SocketAddr,
@@ -181,7 +209,13 @@ async fn serve(
     max_connection_seconds: u64,
     identity_db: Option<PathBuf>,
     audit_log: Option<PathBuf>,
+    org_request_quota: OrgQuotaArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if org_request_quota.limit.is_some() && identity_db.is_none() {
+        return Err("--org-request-quota requires --identity-db: a request needs a \
+                     resolved organization before it can be charged against a quota"
+            .into());
+    }
     let upstream = UpstreamOrigin::parse(upstream)?;
     let auth = match identity_db {
         Some(path) => {
@@ -208,6 +242,15 @@ async fn serve(
         }
         None => None,
     };
+    let quota = org_request_quota.limit.map(|limit| {
+        let window = Duration::from_secs(org_request_quota.window_seconds);
+        tracing::info!(
+            limit = limit.get(),
+            window_seconds = org_request_quota.window_seconds,
+            "gateway per-organization request quota enabled"
+        );
+        Arc::new(OrgQuota::new(limit, window))
+    });
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let max_connection_duration = Duration::from_secs(max_connection_seconds);
     tracing::info!(
@@ -218,7 +261,7 @@ async fn serve(
     );
     camelid_enterprise_gateway::serve(
         listener,
-        router_with_options(upstream, max_in_flight, auth, audit),
+        router_with_options(upstream, max_in_flight, auth, audit, quota),
         max_connection_duration,
         shutdown_signal(),
     )
@@ -418,5 +461,58 @@ mod tests {
         };
         assert_eq!(principal, "usr_ada");
         assert_eq!(organization, "org_acme");
+    }
+
+    #[test]
+    fn org_request_quota_window_defaults_to_sixty_seconds() {
+        let cli = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+        ])
+        .unwrap();
+        let Command::Serve {
+            org_request_quota,
+            org_request_quota_window_seconds,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the parsed command to be Serve");
+        };
+        assert_eq!(org_request_quota, None);
+        assert_eq!(org_request_quota_window_seconds, 60);
+    }
+
+    #[test]
+    fn org_request_quota_must_be_nonzero() {
+        let result = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+            "--org-request-quota",
+            "0",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_org_request_quota_without_identity_db() {
+        let error = serve(
+            "http://127.0.0.1:8181",
+            "127.0.0.1:0".parse().unwrap(),
+            DEFAULT_MAX_IN_FLIGHT,
+            30,
+            None,
+            None,
+            OrgQuotaArgs {
+                limit: Some(NonZeroU32::new(10).unwrap()),
+                window_seconds: 60,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("--org-request-quota requires --identity-db"));
     }
 }

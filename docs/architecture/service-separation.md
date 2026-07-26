@@ -263,9 +263,18 @@ tokens for one model"; everything multi-user is layered on top.
    rejected, starving legitimate authenticated traffic — and any local
    health-check route that work introduces must stay exempt from auth the
    way it stays exempt from admission.
-4. **Multi-user routing & quotas — not started.** Gateway routes by model and
-  enforces per-user/per-org limits; usage metering begins. Still no state in
-  replicas.
+4. **Multi-user routing & quotas — in progress.** The gateway enforces an
+  optional per-organization request-rate quota (`--org-request-quota` /
+  `--org-request-quota-window-seconds`, requiring `--identity-db`): a
+  fixed-window counter, keyed by the organization resolved during
+  authentication, rejects a request over budget with a typed `429` and a
+  `Retry-After` header before it consumes an admission permit or reaches a
+  replica, without charging requests that fail authentication. The counter is
+  in-memory and per-process — it resets on restart and is not shared across
+  gateway replicas behind the same Service, which is an explicit trade-off
+  (a coarse per-tenant cap, not a durable metering/billing substrate). Still
+  missing: routing by model (there is exactly one upstream today), and usage
+  metering. Still no state in replicas.
 5. **Model/catalog service — not started.** Promote model management out of
   ad-hoc `--model` + `/api/models/load` into a catalog that maps model → pool.
 6. **Platform data + observability — not started.** Introduce the durable store
