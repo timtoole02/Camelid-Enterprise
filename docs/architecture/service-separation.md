@@ -282,8 +282,19 @@ tokens for one model"; everything multi-user is layered on top.
   has two replicas: each process can admit under `2 × limit` in a short burst
   across a fixed-window boundary, so the two-pod deployment can admit under
   `4 × limit` for one organization in that span, distributed nondeterministically
-  by Kubernetes. Still missing: routing by model (there is exactly one upstream
-  today), and usage metering. Still no state in replicas.
+  by Kubernetes. With `--usage-log` plus `--identity-db`, each authenticated,
+  quota-admitted request also produces a separate best-effort terminal JSONL
+  record with `started_ts`, `duration_ms`, `response_head_status`, opaque
+  request/response byte counts, and a `stream_outcome`: `completed`,
+  `body_error`, `gateway_timeout`, or cause-agnostic `incomplete`. A request
+  byte count is `null` unless the forwarded body reached EOF; zero means the
+  gateway observed a complete empty body. It is intentionally not token
+  billing: bytes are not tokens, records are queued asynchronously and can be
+  lost on process exit, and files remain per-pod until Phase 6 aggregates them
+  durably. Startup preflights log destinations and rejects audit/usage aliases;
+  runtime logging has a bounded dedicated writer queue with rate-limited loss
+  warnings. Still missing: routing by model (there is exactly one upstream
+  today). Still no state in replicas.
 5. **Model/catalog service — not started.** Promote model management out of
   ad-hoc `--model` + `/api/models/load` into a catalog that maps model → pool.
 6. **Platform data + observability — not started.** Introduce the durable store
@@ -323,8 +334,10 @@ before the corresponding phase starts.
   isolation (the id is echoed verbatim and forgeable by a direct client), not
   on cryptography. Open follow-on: the audit log records the response *head*
   status only, so a durable **metering** substrate (Phase 6) still needs
-  stream-completion accounting and request/response byte counts the current log
-  does not capture; and durable aggregation of the two append-only logs.
+  stream-completion accounting and request/response byte counts the audit log
+  itself does not capture. An identity-bound optional gateway usage log now
+  supplies those raw transport fields and terminal outcomes, but durable
+  aggregation, loss handling, and model-token accounting remain Phase 6 work.
 
 ---
 

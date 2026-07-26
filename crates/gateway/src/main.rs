@@ -1,6 +1,6 @@
 use camelid_enterprise_gateway::{
-    router_with_options, GatewayAuth, OrgQuota, UpstreamOrigin, DEFAULT_MAX_CONNECTION_DURATION,
-    DEFAULT_MAX_IN_FLIGHT,
+    router_with_options, GatewayAuth, GatewayLog, OrgQuota, UpstreamOrigin,
+    DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT,
 };
 use clap::{Parser, Subcommand};
 use identity::{OrganizationId, PrincipalId, SqliteIdentityStore};
@@ -60,6 +60,11 @@ enum Command {
         /// see which deterministic configuration served each caller's request.
         #[arg(long, env = "CAMELID_GATEWAY_AUDIT_LOG")]
         audit_log: Option<PathBuf>,
+        /// Path to an append-only JSONL transport-usage log. Each handled
+        /// request records its terminal stream outcome and raw payload bytes
+        /// observed by the gateway. This is not tokenizer usage or billing.
+        #[arg(long, env = "CAMELID_GATEWAY_USAGE_LOG", requires = "identity_db")]
+        usage_log: Option<PathBuf>,
         /// Maximum requests one organization may send per fixed quota window.
         /// Requires `--identity-db`, since a request needs a resolved
         /// organization to be charged against a quota. Omitted by default:
@@ -154,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_connection_seconds,
             identity_db,
             audit_log,
+            usage_log,
             org_request_quota,
             org_request_quota_window_seconds,
         } => {
@@ -163,7 +169,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_in_flight,
                 max_connection_seconds,
                 identity_db,
-                audit_log,
+                GatewayLogArgs {
+                    audit_log,
+                    usage_log,
+                },
                 OrgQuotaArgs {
                     limit: org_request_quota,
                     window_seconds: org_request_quota_window_seconds,
@@ -206,16 +215,51 @@ struct OrgQuotaArgs {
     window_seconds: NonZeroU64,
 }
 
+/// Append-only gateway telemetry sinks. Audit remains a response-head and
+/// identity-correlation record; usage is a terminal raw-payload record.
+struct GatewayLogArgs {
+    audit_log: Option<PathBuf>,
+    usage_log: Option<PathBuf>,
+}
+
+type GatewayLogs = (Option<Arc<GatewayLog>>, Option<Arc<GatewayLog>>);
+
+fn open_gateway_logs(logs: &GatewayLogArgs) -> Result<GatewayLogs, Box<dyn std::error::Error>> {
+    let audit = logs
+        .audit_log
+        .as_deref()
+        .map(GatewayLog::open)
+        .transpose()?;
+    let usage = logs
+        .usage_log
+        .as_deref()
+        .map(GatewayLog::open)
+        .transpose()?;
+    if let (Some(audit), Some(usage)) = (&audit, &usage) {
+        if audit.has_same_destination(usage) {
+            return Err("--audit-log and --usage-log must name different files".into());
+        }
+    }
+    Ok((audit, usage))
+}
+
 async fn serve(
     upstream: &str,
     addr: SocketAddr,
     max_in_flight: NonZeroUsize,
     max_connection_seconds: u64,
     identity_db: Option<PathBuf>,
-    audit_log: Option<PathBuf>,
+    logs: GatewayLogArgs,
     org_request_quota: OrgQuotaArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream = UpstreamOrigin::parse(upstream)?;
+    let (audit, usage) = open_gateway_logs(&logs)?;
+    if let Some(audit) = &audit {
+        tracing::info!(path = %audit.path().display(), "gateway request audit log enabled");
+    }
+    if let Some(usage) = &usage {
+        tracing::info!(path = %usage.path().display(), "gateway transport usage log enabled");
+    }
     let auth = match identity_db {
         Some(path) => {
             tracing::info!(path = %path.display(), "gateway auth enforcement enabled");
@@ -236,6 +280,7 @@ async fn serve(
             GatewayAuth::RequireToken {
                 store: Arc::new(SqliteIdentityStore::open(&path)?),
                 quota,
+                usage,
             }
         }
         None => {
@@ -244,13 +289,6 @@ async fn serve(
             );
             GatewayAuth::Disabled
         }
-    };
-    let audit = match audit_log {
-        Some(path) => {
-            tracing::info!(path = %path.display(), "gateway request audit log enabled");
-            Some(Arc::new(path))
-        }
-        None => None,
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let max_connection_duration = Duration::from_secs(max_connection_seconds);
@@ -482,7 +520,10 @@ mod tests {
             panic!("expected the parsed command to be Serve");
         };
         assert_eq!(org_request_quota, None);
-        assert_eq!(org_request_quota_window_seconds, NonZeroU64::new(60).unwrap());
+        assert_eq!(
+            org_request_quota_window_seconds,
+            NonZeroU64::new(60).unwrap()
+        );
     }
 
     #[test]
@@ -522,5 +563,54 @@ mod tests {
             "10",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn usage_log_requires_identity_db() {
+        let result = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+            "--usage-log",
+            "usage.jsonl",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gateway_logs_must_use_distinct_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gateway.jsonl");
+        let error = match open_gateway_logs(&GatewayLogArgs {
+            audit_log: Some(path.clone()),
+            usage_log: Some(path),
+        }) {
+            Ok(_) => panic!("matching audit and usage logs must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "--audit-log and --usage-log must name different files"
+        );
+    }
+
+    #[test]
+    fn gateway_logs_fail_before_startup_when_the_parent_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = match open_gateway_logs(&GatewayLogArgs {
+            audit_log: None,
+            usage_log: Some(dir.path().join("missing").join("usage.jsonl")),
+        }) {
+            Ok(_) => panic!("an unwritable log path must be rejected before binding"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("The system cannot find the path specified")
+                || error.to_string().contains("No such file or directory"),
+            "unexpected log-open error: {error}"
+        );
     }
 }

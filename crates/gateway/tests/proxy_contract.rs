@@ -7,7 +7,7 @@ use axum::Router;
 use bytes::Bytes;
 use camelid_enterprise_gateway::{
     router as gateway_router, router_with_max_in_flight, router_with_options, GatewayAuth,
-    OrgQuota, UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT,
+    GatewayLog, OrgQuota, UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT,
 };
 use futures_util::stream;
 use http_body_util::BodyExt;
@@ -19,7 +19,7 @@ use replica_contract::{HttpMethod, PUBLIC_ROUTES};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -85,7 +85,7 @@ async fn spawn_gateway_with_auth(upstream: SocketAddr, auth: GatewayAuth) -> Tes
 async fn spawn_gateway_with_audit(
     upstream: SocketAddr,
     auth: GatewayAuth,
-    audit: Arc<PathBuf>,
+    audit: Arc<GatewayLog>,
 ) -> TestServer {
     spawn_gateway_with_options(
         upstream,
@@ -102,7 +102,7 @@ async fn spawn_gateway_with_options(
     max_in_flight: NonZeroUsize,
     max_connection_duration: Duration,
     auth: GatewayAuth,
-    audit: Option<Arc<PathBuf>>,
+    audit: Option<Arc<GatewayLog>>,
 ) -> TestServer {
     let upstream = UpstreamOrigin::parse(&format!("http://{upstream}")).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -119,6 +119,10 @@ async fn spawn_gateway_with_options(
         .unwrap();
     });
     TestServer { addr, task }
+}
+
+fn gateway_log(path: &Path) -> Arc<GatewayLog> {
+    GatewayLog::open(path).unwrap()
 }
 
 fn client() -> Client<HttpConnector, Body> {
@@ -182,6 +186,35 @@ async fn capture_request(
         .headers_mut()
         .append("set-cookie", "csrf=two".parse().unwrap());
     response
+}
+
+async fn usage_response(request: Request) -> Response {
+    let _ = to_bytes(request.into_body(), 1024).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    Response::new(Body::from("generated"))
+}
+
+async fn delayed_failing_usage_response(State(release): State<Arc<Notify>>) -> Response {
+    let chunks = stream::unfold((0, release), |(step, release)| async move {
+        match step {
+            0 => Some((
+                Ok::<_, std::io::Error>(Bytes::from_static(b"partial")),
+                (1, release),
+            )),
+            1 => {
+                release.notified().await;
+                Some((
+                    Err(std::io::Error::other("replica stream failed")),
+                    (2, release),
+                ))
+            }
+            _ => None,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::from_stream(chunks))
+        .unwrap()
 }
 
 #[tokio::test]
@@ -481,12 +514,15 @@ async fn rejects_requests_with_no_bearer_token_when_auth_is_required() {
         .local_addr()
         .unwrap();
 
-    let gateway =
-        spawn_gateway_with_auth(
-            unreachable_upstream,
-            GatewayAuth::RequireToken { store, quota: None },
-        )
-        .await;
+    let gateway = spawn_gateway_with_auth(
+        unreachable_upstream,
+        GatewayAuth::RequireToken {
+            store,
+            quota: None,
+            usage: None,
+        },
+    )
+    .await;
     let request = Request::get(format!("http://{}/v1/models", gateway.addr))
         .body(Body::empty())
         .unwrap();
@@ -512,12 +548,15 @@ async fn rejects_requests_with_an_invalid_bearer_token() {
         .local_addr()
         .unwrap();
 
-    let gateway =
-        spawn_gateway_with_auth(
-            unreachable_upstream,
-            GatewayAuth::RequireToken { store, quota: None },
-        )
-        .await;
+    let gateway = spawn_gateway_with_auth(
+        unreachable_upstream,
+        GatewayAuth::RequireToken {
+            store,
+            quota: None,
+            usage: None,
+        },
+    )
+    .await;
     let request = Request::get(format!("http://{}/v1/models", gateway.addr))
         .header("authorization", "Bearer not-a-real-token")
         .body(Body::empty())
@@ -546,6 +585,7 @@ async fn forwards_requests_carrying_a_valid_bearer_token() {
         GatewayAuth::RequireToken {
             store: Arc::new(store),
             quota: None,
+            usage: None,
         },
     )
     .await;
@@ -588,6 +628,7 @@ async fn quota_rejects_a_request_once_the_organization_exceeds_its_limit() {
                 NonZeroU32::new(2).unwrap(),
                 NonZeroU64::new(60).unwrap(),
             ))),
+            usage: None,
         },
     )
     .await;
@@ -609,10 +650,16 @@ async fn quota_rejects_a_request_once_the_organization_exceeds_its_limit() {
 
     let rejected = send().await;
     assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
-    let retry_after: u64 = rejected.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+    let retry_after: u64 = rejected.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     assert_eq!(retry_after, 60);
     assert_eq!(
-        to_bytes(Body::new(rejected.into_body()), 1024).await.unwrap(),
+        to_bytes(Body::new(rejected.into_body()), 1024)
+            .await
+            .unwrap(),
         r#"{"error":{"message":"organization request quota exceeded","type":"quota_exceeded"}}"#
     );
     // The rejected request never reached the upstream replica.
@@ -627,7 +674,8 @@ async fn quota_tracks_organizations_independently() {
     let grace = store.create_user("grace").unwrap();
     let grace_token = store.issue_token(&grace).unwrap();
 
-    let upstream = spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
+    let upstream =
+        spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
     let gateway = spawn_gateway_with_auth(
         upstream.addr,
         GatewayAuth::RequireToken {
@@ -636,6 +684,7 @@ async fn quota_tracks_organizations_independently() {
                 NonZeroU32::new(1).unwrap(),
                 NonZeroU64::new(60).unwrap(),
             ))),
+            usage: None,
         },
     )
     .await;
@@ -651,9 +700,15 @@ async fn quota_tracks_organizations_independently() {
         }
     };
 
-    assert_eq!(send(ada_token.clone()).await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        send(ada_token.clone()).await.status(),
+        StatusCode::NO_CONTENT
+    );
     // ada's organization has already used its one request for the window.
-    assert_eq!(send(ada_token).await.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        send(ada_token).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
     // grace's organization has its own, unaffected budget.
     assert_eq!(send(grace_token).await.status(), StatusCode::NO_CONTENT);
 }
@@ -664,7 +719,8 @@ async fn quota_is_not_charged_by_requests_that_fail_authentication() {
     let principal = store.create_user("ada").unwrap();
     let token = store.issue_token(&principal).unwrap();
 
-    let upstream = spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
+    let upstream =
+        spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
     let gateway = spawn_gateway_with_auth(
         upstream.addr,
         GatewayAuth::RequireToken {
@@ -673,6 +729,7 @@ async fn quota_is_not_charged_by_requests_that_fail_authentication() {
                 NonZeroU32::new(1).unwrap(),
                 NonZeroU64::new(60).unwrap(),
             ))),
+            usage: None,
         },
     )
     .await;
@@ -719,6 +776,7 @@ async fn quota_charges_a_request_rejected_by_admission_control() {
                 NonZeroU32::new(2).unwrap(),
                 NonZeroU64::new(60).unwrap(),
             ))),
+            usage: None,
         },
         None,
     )
@@ -766,6 +824,7 @@ async fn quota_charges_a_request_when_the_upstream_is_unavailable() {
                 NonZeroU32::new(1).unwrap(),
                 NonZeroU64::new(60).unwrap(),
             ))),
+            usage: None,
         },
     )
     .await;
@@ -1293,8 +1352,9 @@ async fn audit_log_records_both_forwarded_and_rejected_requests() {
         GatewayAuth::RequireToken {
             store: Arc::new(store),
             quota: None,
+            usage: None,
         },
-        Arc::new(audit_path.clone()),
+        gateway_log(&audit_path),
     )
     .await;
 
@@ -1372,7 +1432,7 @@ async fn audit_log_is_not_torn_by_concurrent_requests() {
     let gateway = spawn_gateway_with_audit(
         upstream.addr,
         GatewayAuth::Disabled,
-        Arc::new(audit_path.clone()),
+        gateway_log(&audit_path),
     )
     .await;
 
@@ -1416,6 +1476,460 @@ async fn audit_log_is_not_torn_by_concurrent_requests() {
         assert_eq!(record["status"], 204);
         assert!(record["principal"].is_null());
     }
+}
+
+#[tokio::test]
+async fn usage_log_records_completed_authenticated_stream_bytes_without_changing_audit() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let organization = store
+        .organizations_for_principal(&principal)
+        .unwrap()
+        .remove(0);
+    let token = store.issue_token(&principal).unwrap();
+    let upstream =
+        spawn_server(Router::new().route("/v1/chat/completions", post(usage_response))).await;
+    let dir = tempfile::tempdir().unwrap();
+    let usage_path = dir.path().join("usage.jsonl");
+    let audit_path = dir.path().join("audit.jsonl");
+    let gateway = spawn_gateway_with_options(
+        upstream.addr,
+        DEFAULT_MAX_IN_FLIGHT,
+        Duration::from_secs(30),
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: Some(gateway_log(&usage_path)),
+        },
+        Some(gateway_log(&audit_path)),
+    )
+    .await;
+
+    let response = client()
+        .request(
+            Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from("prompt"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(Body::new(response.into_body()), 1024)
+            .await
+            .unwrap(),
+        "generated"
+    );
+
+    let usage = read_usage_records(&usage_path, 1).await;
+    let record = &usage[0];
+    assert_eq!(record["principal"], principal.to_string());
+    assert_eq!(record["organization"], organization.to_string());
+    assert_eq!(record["method"], "POST");
+    assert_eq!(record["path"], "/v1/chat/completions");
+    assert_eq!(record["response_head_status"], 200);
+    assert_eq!(record["request_bytes"], 6);
+    assert_eq!(record["response_bytes"], 9);
+    assert_eq!(record["stream_outcome"], "completed");
+    assert!(record["started_ts"].as_f64().unwrap() <= record["ts"].as_f64().unwrap());
+    assert!(
+        record["duration_ms"].as_u64().unwrap() >= 50,
+        "duration must include the upstream response-head wait: {record}"
+    );
+
+    let audit = read_audit_records(&audit_path, 1).await;
+    assert_eq!(audit[0]["request_id"], record["request_id"]);
+    assert_eq!(audit[0]["status"], 200);
+    assert!(audit[0].get("stream_outcome").is_none());
+    assert!(audit[0].get("request_bytes").is_none());
+}
+
+#[tokio::test]
+async fn usage_log_records_partial_response_when_the_upstream_body_errors() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+    let release = Arc::new(Notify::new());
+    let upstream = spawn_server(
+        Router::new()
+            .route("/v1/chat/completions", post(delayed_failing_usage_response))
+            .with_state(Arc::clone(&release)),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let usage_path = dir.path().join("usage.jsonl");
+    let gateway = spawn_gateway_with_auth(
+        upstream.addr,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: Some(gateway_log(&usage_path)),
+        },
+    )
+    .await;
+
+    let response = client()
+        .request(
+            Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(first, "partial");
+    release.notify_one();
+    assert!(
+        body.frame().await.unwrap().is_err(),
+        "the client must observe the upstream stream failure"
+    );
+    drop(body);
+
+    let usage = read_usage_records(&usage_path, 1).await;
+    assert_eq!(usage[0]["request_bytes"], 0);
+    assert_eq!(usage[0]["response_bytes"], 7);
+    assert_eq!(usage[0]["stream_outcome"], "body_error");
+}
+
+#[tokio::test]
+async fn usage_log_records_an_incomplete_response_stream() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+    let upstream_dropped = Arc::new(Notify::new());
+    let upstream = spawn_server(
+        Router::new()
+            .route("/v1/chat/completions", any(disconnect_aware_sse))
+            .with_state(Arc::clone(&upstream_dropped)),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let usage_path = dir.path().join("usage.jsonl");
+    let gateway = spawn_gateway_with_auth(
+        upstream.addr,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: Some(gateway_log(&usage_path)),
+        },
+    )
+    .await;
+
+    let response = client()
+        .request(
+            Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(first, "data: first\n\n");
+    drop(body);
+
+    tokio::time::timeout(Duration::from_secs(1), upstream_dropped.notified())
+        .await
+        .expect("dropping the client stream must cancel the upstream stream");
+    let usage = read_usage_records(&usage_path, 1).await;
+    assert_eq!(usage[0]["response_bytes"], 13);
+    assert_eq!(usage[0]["stream_outcome"], "incomplete");
+}
+
+#[tokio::test]
+async fn usage_log_records_a_gateway_timeout_separately_from_an_incomplete_stream() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+    let release = Arc::new(Notify::new());
+    let upstream = spawn_server(
+        Router::new()
+            .route("/v1/chat/completions", any(delayed_sse))
+            .with_state(Arc::clone(&release)),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let usage_path = dir.path().join("usage.jsonl");
+    let gateway = spawn_gateway_with_options(
+        upstream.addr,
+        NonZeroUsize::new(1).unwrap(),
+        Duration::from_millis(150),
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: Some(gateway_log(&usage_path)),
+        },
+        None,
+    )
+    .await;
+
+    let response = client()
+        .request(
+            Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(first, "data: first\n\n");
+
+    let usage = read_usage_records(&usage_path, 1).await;
+    assert_eq!(usage[0]["stream_outcome"], "gateway_timeout");
+    drop(body);
+    release.notify_waiters();
+}
+
+#[tokio::test]
+async fn usage_log_records_gateway_failures_after_authentication_and_quota() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_upstream = listener.local_addr().unwrap();
+    drop(listener);
+    let dir = tempfile::tempdir().unwrap();
+    let usage_path = dir.path().join("usage.jsonl");
+    let gateway = spawn_gateway_with_auth(
+        unavailable_upstream,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: Some(Arc::new(OrgQuota::new(
+                NonZeroU32::new(2).unwrap(),
+                NonZeroU64::new(60).unwrap(),
+            ))),
+            usage: Some(gateway_log(&usage_path)),
+        },
+    )
+    .await;
+
+    let response = client()
+        .request(
+            Request::get(format!("http://{}/v1/models", gateway.addr))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let _ = to_bytes(Body::new(response.into_body()), 1024)
+        .await
+        .unwrap();
+
+    let usage = read_usage_records(&usage_path, 1).await;
+    assert_eq!(usage[0]["response_head_status"], 502);
+    assert_eq!(usage[0]["request_bytes"], 0);
+    assert!(usage[0]["response_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(usage[0]["stream_outcome"], "completed");
+}
+
+#[tokio::test]
+async fn usage_log_records_an_admission_rejection_after_quota_admission() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+    let release = Arc::new(Notify::new());
+    let upstream = spawn_server(
+        Router::new()
+            .route("/v1/chat/completions", any(delayed_sse))
+            .with_state(Arc::clone(&release)),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let usage_path = dir.path().join("usage.jsonl");
+    let gateway = spawn_gateway_with_options(
+        upstream.addr,
+        NonZeroUsize::new(1).unwrap(),
+        Duration::from_secs(30),
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: Some(Arc::new(OrgQuota::new(
+                NonZeroU32::new(2).unwrap(),
+                NonZeroU64::new(60).unwrap(),
+            ))),
+            usage: Some(gateway_log(&usage_path)),
+        },
+        None,
+    )
+    .await;
+
+    let request = || {
+        Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let active = client().request(request()).await.unwrap();
+    let rejected = client()
+        .request(
+            Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from("this body was not forwarded"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = to_bytes(Body::new(rejected.into_body()), 1024)
+        .await
+        .unwrap();
+    drop(active);
+    release.notify_waiters();
+
+    let usage = read_usage_records(&usage_path, 2).await;
+    let rejected = usage
+        .iter()
+        .find(|record| record["response_head_status"] == 503)
+        .expect("the quota-admitted admission rejection must be recorded");
+    assert!(
+        rejected["request_bytes"].is_null(),
+        "an admission rejection must not claim it measured an unforwarded body"
+    );
+    assert!(rejected["response_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(rejected["stream_outcome"], "completed");
+}
+
+#[tokio::test]
+async fn usage_log_excludes_authentication_and_quota_rejections() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+    let upstream =
+        spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
+    let dir = tempfile::tempdir().unwrap();
+    let usage_path = dir.path().join("usage.jsonl");
+    let gateway = spawn_gateway_with_auth(
+        upstream.addr,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: Some(Arc::new(OrgQuota::new(
+                NonZeroU32::new(1).unwrap(),
+                NonZeroU64::new(60).unwrap(),
+            ))),
+            usage: Some(gateway_log(&usage_path)),
+        },
+    )
+    .await;
+
+    let unauthenticated = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .body(Body::from("unattributed body"))
+        .unwrap();
+    assert_eq!(
+        client().request(unauthenticated).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let accepted = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        client().request(accepted).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let over_quota = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from("over quota body"))
+        .unwrap();
+    assert_eq!(
+        client().request(over_quota).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    let usage = read_usage_records(&usage_path, 1).await;
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0]["response_head_status"], 204);
+    assert_eq!(usage[0]["stream_outcome"], "completed");
+}
+
+#[tokio::test]
+async fn usage_log_is_not_torn_by_concurrent_completed_requests() {
+    const REQUESTS: usize = 48;
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal).unwrap();
+    let upstream =
+        spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
+    let dir = tempfile::tempdir().unwrap();
+    let usage_path = dir.path().join("usage.jsonl");
+    let gateway = spawn_gateway_with_auth(
+        upstream.addr,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: Some(gateway_log(&usage_path)),
+        },
+    )
+    .await;
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..REQUESTS {
+        let addr = gateway.addr;
+        let token = token.clone();
+        tasks.spawn(async move {
+            client()
+                .request(
+                    Request::get(format!("http://{addr}/v1/models"))
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        assert_eq!(result.unwrap(), StatusCode::NO_CONTENT);
+    }
+
+    // read_usage_records parses every line; a torn or interleaved append would
+    // panic before these assertions run.
+    let usage = read_usage_records(&usage_path, REQUESTS).await;
+    assert_eq!(usage.len(), REQUESTS);
+    let ids: std::collections::HashSet<&str> = usage
+        .iter()
+        .map(|record| record["request_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), REQUESTS);
+    for record in &usage {
+        assert_eq!(record["principal"], principal.to_string());
+        assert_eq!(record["response_head_status"], 204);
+        assert_eq!(record["request_bytes"], 0);
+        assert_eq!(record["response_bytes"], 0);
+        assert_eq!(record["stream_outcome"], "completed");
+    }
+}
+
+/// Usage records are written after stream completion, so this awaits their
+/// asynchronous best-effort append rather than assuming the file is ready as
+/// soon as the HTTP response is dropped.
+async fn read_usage_records(path: &std::path::Path, expected: usize) -> Vec<serde_json::Value> {
+    for _ in 0..200 {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let lines: Vec<&str> = contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            if lines.len() >= expected {
+                return lines
+                    .iter()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("expected {expected} usage line(s) were not written within the timeout");
 }
 
 async fn read_audit_records(path: &std::path::Path, expected: usize) -> Vec<serde_json::Value> {

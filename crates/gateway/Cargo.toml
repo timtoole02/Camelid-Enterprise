@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.7"
+bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 fastrand = "2"
 http-body = "1"
@@ -27,7 +28,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-bytes = "1"
 futures-util = "0.3"
 http-body-util = "0.1"
 tempfile.workspace = true
