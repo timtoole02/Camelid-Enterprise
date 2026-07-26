@@ -185,7 +185,10 @@ camelid-enterprise-gateway rotate-token --identity-db <db> -   # reads the token
 ```
 
 `rotate-token` gives the replacement the same lifetime the presented token was
-issued with. An *expired* token cannot be rotated — re-issue instead, which is
+issued with, so refreshing a credential that is nearing expiry yields another
+bounded one; `--expires-in-seconds` sets a different lifetime and `--no-expiry`
+removes the bound entirely. An *expired* token cannot be rotated — re-issue
+instead, which is
 why the principal id has to be recoverable. Rotation needs filesystem access to
 the identity database, so a remote client that receives
 `401 {"type": "token_expired"}` cannot refresh itself; that is an operator

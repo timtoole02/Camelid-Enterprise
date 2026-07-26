@@ -1108,10 +1108,10 @@ fn to_hex(bytes: &[u8]) -> String {
 /// The current time on the clock every expiry in this crate is measured
 /// against.
 ///
-/// Exposed because [`SqliteIdentityStore::issue_token_expiring_at`] takes an
-/// absolute instant: a caller that computes one from some other source is
-/// asserting that its clock and this one agree, and that assertion is better
-/// made explicit than assumed. [`expires_in`] covers the ordinary case of a
+/// Exposed because [`TokenLifetime::Until`] takes an absolute instant: a
+/// caller that computes one from some other source is asserting that its clock
+/// and this one agree, and that assertion is better made explicit than
+/// assumed. [`TokenLifetime::expires_in`] covers the ordinary case of a
 /// lifetime starting now.
 ///
 /// Total, deliberately. A clock set before 1970 yields a negative instant,

@@ -46,7 +46,7 @@ const RETRY_AFTER_JITTER_SECONDS: (u8, u8) = (1, 3);
 pub const DEFAULT_MAX_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 /// Every accepted client connection is force-closed after this long,
 /// regardless of activity. Nothing else in this module bounds how long a
-/// single HTTP exchange may run: the admission permit in [`PermitBody`] is
+/// single HTTP exchange may run: the admission permit in `PermitBody` is
 /// held for the full request+response lifetime, so a client that drips a
 /// request body one byte at a time, or opens a response stream and never
 /// reads it, would otherwise pin a permit (and a TCP socket) indefinitely.
