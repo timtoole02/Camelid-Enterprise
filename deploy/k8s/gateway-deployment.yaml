@@ -5,6 +5,14 @@
 # until an operator provisions identity and enables auth. Kubernetes performs
 # replica-pool balancing through the upstream Service, so the gateway itself
 # owns no pool or health state.
+#
+# If you enable auth by mounting a shared identity database and setting
+# CAMELID_GATEWAY_IDENTITY_DB, create that database once before these pods
+# start -- any CLI subcommand does, e.g. `create-user`. Schema migration is
+# serialized under a write lock, but the initial journal_mode=WAL switch on a
+# file that does not yet exist is not, so `replicas: 2` starting against an
+# absent database can collide and crash-loop. An existing database is safe to
+# open concurrently.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

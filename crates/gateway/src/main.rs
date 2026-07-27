@@ -3,7 +3,7 @@ use camelid_enterprise_gateway::{
     DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT,
 };
 use clap::{Parser, Subcommand};
-use identity::{OrganizationId, PrincipalId, SqliteIdentityStore};
+use identity::{OrganizationId, PrincipalId, RotationLifetime, SqliteIdentityStore, TokenLifetime};
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -55,9 +55,11 @@ enum Command {
         /// Path to an append-only JSONL audit log. When set, the gateway
         /// records one line per request it handles — including requests it
         /// rejects for authentication or admission — carrying the request's
-        /// correlation id, the resolved principal (or null), method, path, and
-        /// status. Join it to a replica's serving receipts on `request_id` to
-        /// see which deterministic configuration served each caller's request.
+        /// correlation id, the resolved principal and organization (or null),
+        /// the refusal reason (null for anything it forwarded), method, path,
+        /// and status. Join it to a replica's serving receipts on `request_id`
+        /// to see which deterministic configuration served each caller's
+        /// request.
         #[arg(long, env = "CAMELID_GATEWAY_AUDIT_LOG")]
         audit_log: Option<PathBuf>,
         /// Path to an append-only JSONL transport-usage log. Each handled
@@ -90,6 +92,16 @@ enum Command {
         identity_db: PathBuf,
         /// Display label for the user. Never used as a lookup key.
         name: String,
+    },
+    /// List every user as `<principal-id>\t<name>`, one per line.
+    ///
+    /// The way back to a principal id that was not written down when
+    /// `create-user` printed it. Without it a lapsed token is a dead end:
+    /// rotation refuses an expired credential, re-issuing needs the id, and
+    /// creating the user again mints a different one.
+    ListUsers {
+        #[arg(long, env = "CAMELID_GATEWAY_IDENTITY_DB")]
+        identity_db: PathBuf,
     },
     /// Create an organization and print its opaque organization id.
     CreateOrganization {
@@ -132,6 +144,43 @@ enum Command {
         /// belongs to more than one organization.
         #[arg(long)]
         organization: Option<String>,
+        /// How long the token stays valid, in seconds. Omitted by default,
+        /// which issues a token that never expires -- the behavior of every
+        /// token issued before this option existed. A token that has expired
+        /// is refused by the gateway exactly as an unknown one is.
+        #[arg(long)]
+        expires_in_seconds: Option<NonZeroU64>,
+    },
+    /// Exchange a valid token for a fresh one and print the replacement once.
+    ///
+    /// The presented token stops working the moment this succeeds, and the
+    /// replacement is issued in the same transaction: there is no window in
+    /// which both work, and none in which neither does. Requires the plaintext
+    /// of the token being replaced, so this refreshes a credential for whoever
+    /// holds it rather than resetting someone else's.
+    ///
+    /// By default the replacement carries the same lifetime the presented
+    /// token was issued with, measured from now -- rotating a credential that
+    /// is nearing expiry gives another full lifetime, not a permanent
+    /// credential. Dropping the bound is available as `--no-expiry`, but it
+    /// has to be asked for.
+    RotateToken {
+        #[arg(long, env = "CAMELID_GATEWAY_IDENTITY_DB")]
+        identity_db: PathBuf,
+        /// The token to replace, or `-` to read it from stdin instead.
+        /// Passing the plaintext token directly on the command line leaves
+        /// it in shell history and briefly visible to other processes via
+        /// `ps`; prefer `-` and pipe it in.
+        token: String,
+        /// Give the replacement this lifetime in seconds instead of the one
+        /// the presented token was issued with.
+        #[arg(long, conflicts_with = "no_expiry")]
+        expires_in_seconds: Option<NonZeroU64>,
+        /// Give the replacement no expiry at all, discarding whatever bound
+        /// the presented token carried. This converts a time-limited
+        /// credential into a permanent one, so it is never the default.
+        #[arg(long)]
+        no_expiry: bool,
     },
     /// Revoke a bearer token so it no longer resolves.
     RevokeToken {
@@ -181,6 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         Command::CreateUser { identity_db, name } => create_user(&identity_db, &name),
+        Command::ListUsers { identity_db } => list_users(&identity_db),
         Command::CreateOrganization { identity_db, name } => {
             create_organization(&identity_db, &name)
         }
@@ -202,7 +252,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             identity_db,
             principal,
             organization,
-        } => issue_token(&identity_db, &principal, organization.as_deref()),
+            expires_in_seconds,
+        } => issue_token(
+            &identity_db,
+            &principal,
+            organization.as_deref(),
+            expires_in_seconds,
+        ),
+        Command::RotateToken {
+            identity_db,
+            token,
+            expires_in_seconds,
+            no_expiry,
+        } => rotate_token(&identity_db, &token, expires_in_seconds, no_expiry),
         Command::RevokeToken { identity_db, token } => revoke_token(&identity_db, &token),
     }
 }
@@ -267,7 +329,8 @@ async fn serve(
                 "bearer tokens are sent as plain HTTP headers; this gateway does not \
                  terminate TLS. Put a TLS-terminating ingress/reverse proxy (or mTLS) in \
                  front of it, or restrict --addr to a trusted network, or a captured \
-                 token can be replayed indefinitely (tokens do not expire yet)."
+                 token can be replayed until it is revoked or, if it was issued with \
+                 --expires-in-seconds, until it expires."
             );
             let quota = org_request_quota.limit.map(|limit| {
                 tracing::info!(
@@ -312,6 +375,16 @@ fn create_user(identity_db: &Path, name: &str) -> Result<(), Box<dyn std::error:
     let store = SqliteIdentityStore::open(identity_db)?;
     let principal = store.create_user(name)?;
     println!("{principal}");
+    Ok(())
+}
+
+fn list_users(identity_db: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let store = SqliteIdentityStore::open(identity_db)?;
+    for user in store.list_users()? {
+        // Id first so the line stays usable with `cut -f1` even though names
+        // may contain spaces; a tab keeps them separable when they do.
+        println!("{}\t{}", user.principal_id(), user.name());
+    }
     Ok(())
 }
 
@@ -365,17 +438,47 @@ fn issue_token(
     identity_db: &Path,
     principal: &str,
     organization: Option<&str>,
+    expires_in_seconds: Option<NonZeroU64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = SqliteIdentityStore::open(identity_db)?;
     let principal = PrincipalId::new(principal.to_string());
+    let lifetime = expires_in_seconds.map_or(TokenLifetime::Never, TokenLifetime::expires_in);
     let token = match organization {
         Some(organization) => store.issue_token_for_organization(
             &principal,
             &OrganizationId::new(organization.to_string()),
+            lifetime,
         )?,
-        None => store.issue_token(&principal)?,
+        None => store.issue_token(&principal, lifetime)?,
     };
     println!("{token}");
+    Ok(())
+}
+
+fn rotate_token(
+    identity_db: &Path,
+    token: &str,
+    expires_in_seconds: Option<NonZeroU64>,
+    no_expiry: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let token = read_secret_arg(token)?;
+    let store = SqliteIdentityStore::open(identity_db)?;
+    // Decided after the token is in hand, not before. `-` blocks on stdin,
+    // which for an interactive paste is unbounded, and `expires_in` measures
+    // from the moment it is called: computing the lifetime up front would date
+    // the replacement from process start rather than from the rotation.
+    //
+    // Clap rejects the two flags together, so at most one arm applies. Absent
+    // both, the replacement keeps the lifetime the presented token was issued
+    // with: the default must not quietly convert a bounded credential into a
+    // permanent one.
+    let lifetime = match (expires_in_seconds, no_expiry) {
+        (Some(seconds), _) => RotationLifetime::Replaced(TokenLifetime::expires_in(seconds)),
+        (None, true) => RotationLifetime::Replaced(TokenLifetime::Never),
+        (None, false) => RotationLifetime::Preserved,
+    };
+    let replacement = store.rotate_token(&token, lifetime)?;
+    println!("{replacement}");
     Ok(())
 }
 

@@ -158,6 +158,42 @@ under `4 ×` the configured limit across the two pods. See
 [deploy/README.md](deploy/README.md) for the full quota sizing constraint and
 deployment requirements.
 
+### Enabling authentication
+
+Bearer-token auth is opt-in via `--identity-db <path>`. Two things to get right
+before the first start:
+
+**Create the database before running more than one process against it.** Any
+CLI subcommand creates it. Schema migration is serialized under a write lock,
+but the initial `journal_mode=WAL` switch on a file that does not yet exist is
+not, so several processes opening a brand-new database at once can collide and
+fail to start. This matters directly for the two-replica gateway Deployment
+above sharing one volume.
+
+```bash
+# Once, before starting the gateway:
+camelid-enterprise-gateway create-user --identity-db /var/lib/camelid/identity.sqlite alice
+camelid-enterprise-gateway list-users  --identity-db /var/lib/camelid/identity.sqlite
+```
+
+**Record the principal id.** `list-users` is the only way back to it. Issue a
+credential with a lifetime, and refresh it before it lapses:
+
+```bash
+camelid-enterprise-gateway issue-token  --identity-db <db> <principal> --expires-in-seconds 86400
+camelid-enterprise-gateway rotate-token --identity-db <db> -   # reads the token from stdin
+```
+
+`rotate-token` gives the replacement the same lifetime the presented token was
+issued with, so refreshing a credential that is nearing expiry yields another
+bounded one; `--expires-in-seconds` sets a different lifetime and `--no-expiry`
+removes the bound entirely. An *expired* token cannot be rotated — re-issue
+instead, which is
+why the principal id has to be recoverable. Rotation needs filesystem access to
+the identity database, so a remote client that receives
+`401 {"type": "token_expired"}` cannot refresh itself; that is an operator
+action today.
+
 See [deploy/README.md](deploy/README.md) for the full scaling model, probe configuration, and sizing guidance.
 
 ## Scope

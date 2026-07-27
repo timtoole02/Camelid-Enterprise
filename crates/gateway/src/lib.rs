@@ -46,7 +46,7 @@ const RETRY_AFTER_JITTER_SECONDS: (u8, u8) = (1, 3);
 pub const DEFAULT_MAX_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 /// Every accepted client connection is force-closed after this long,
 /// regardless of activity. Nothing else in this module bounds how long a
-/// single HTTP exchange may run: the admission permit in [`PermitBody`] is
+/// single HTTP exchange may run: the admission permit in `PermitBody` is
 /// held for the full request+response lifetime, so a client that drips a
 /// request body one byte at a time, or opens a response stream and never
 /// reads it, would otherwise pin a permit (and a TCP socket) indefinitely.
@@ -463,12 +463,13 @@ async fn proxy(
         } => {
             let identity = match authenticate(store, request.headers()).await {
                 Ok(context) => context,
-                Err(response) => {
+                Err(refusal) => {
                     return audited(
                         &state,
                         AuditedRequest {
                             request_id: &request_id,
                             identity: None,
+                            reason: Some(refusal.audit_reason()),
                             method: &method,
                             path: &path,
                             usage: None,
@@ -477,7 +478,7 @@ async fn proxy(
                             started_ts,
                             started_at,
                         },
-                        response,
+                        refusal.into_response(),
                     )
                 }
             };
@@ -494,6 +495,7 @@ async fn proxy(
                         AuditedRequest {
                             request_id: &request_id,
                             identity: Some(&identity),
+                            reason: Some("organization_quota_exceeded"),
                             method: &method,
                             path: &path,
                             usage: None,
@@ -530,6 +532,7 @@ async fn proxy(
                 AuditedRequest {
                     request_id: &request_id,
                     identity: identity.as_ref(),
+                    reason: Some("gateway_overloaded"),
                     method: &method,
                     path: &path,
                     usage: usage.clone(),
@@ -551,6 +554,7 @@ async fn proxy(
                 AuditedRequest {
                     request_id: &request_id,
                     identity: identity.as_ref(),
+                    reason: Some("upstream_uri_invalid"),
                     method: &method,
                     path: &path,
                     usage: usage.clone(),
@@ -596,15 +600,23 @@ async fn proxy(
         );
     }
 
-    let response = match state.client.request(request).await {
+    let (response, reason) = match state.client.request(request).await {
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
             remove_hop_by_hop(&mut parts.headers);
-            Response::from_parts(parts, Body::new(PermitBody::new(body, permit)))
+            // Forwarded: the upstream's own status is the record, and the
+            // gateway has no refusal of its own to name.
+            (
+                Response::from_parts(parts, Body::new(PermitBody::new(body, permit))),
+                None,
+            )
         }
         Err(error) => {
             tracing::warn!(%error, "upstream replica request failed");
-            gateway_error(StatusCode::BAD_GATEWAY, "upstream replica is unavailable")
+            (
+                gateway_error(StatusCode::BAD_GATEWAY, "upstream replica is unavailable"),
+                Some("upstream_unavailable"),
+            )
         }
     };
     audited(
@@ -612,6 +624,7 @@ async fn proxy(
         AuditedRequest {
             request_id: &request_id,
             identity: identity.as_ref(),
+            reason,
             method: &method,
             path: &path,
             usage,
@@ -639,6 +652,11 @@ async fn proxy(
 struct AuditedRequest<'a> {
     request_id: &'a str,
     identity: Option<&'a AuthenticatedContext>,
+    /// Why the gateway refused this request, when it refused it itself.
+    /// `None` for anything it forwarded: the upstream's status speaks for
+    /// those. This is what separates two refusals that share a status code and
+    /// a null principal, which authentication failures always do.
+    reason: Option<&'static str>,
     method: &'a str,
     path: &'a str,
     usage: Option<Arc<GatewayLog>>,
@@ -654,6 +672,7 @@ fn audited(state: &GatewayState, request: AuditedRequest<'_>, response: Response
             log,
             request.request_id,
             request.identity,
+            request.reason,
             request.method,
             request.path,
             response.status(),
@@ -681,10 +700,12 @@ fn audited(state: &GatewayState, request: AuditedRequest<'_>, response: Response
 }
 
 /// Appends one JSONL audit line: `{ts, request_id, principal, organization,
-/// method, path, status}`. `principal` and `organization` are opaque gateway-
-/// local identity fields, or JSON `null` when authentication is disabled or
-/// rejected before identity was established. They are never forwarded to a
-/// replica. `request_id` is the only correlation value sent upstream.
+/// reason, method, path, status}`. `principal` and `organization` are opaque
+/// gateway-local identity fields, or JSON `null` when authentication is
+/// disabled or rejected before identity was established. `reason` names the
+/// gateway's own refusal, or is `null` for a request it forwarded. They are
+/// never forwarded to a replica. `request_id` is the only correlation value
+/// sent upstream.
 ///
 /// Best-effort and off the request's async context: a failed write must never
 /// fail the request. The dedicated bounded writer queue can lose records on
@@ -695,6 +716,7 @@ fn write_audit_record(
     log: &GatewayLog,
     request_id: &str,
     identity: Option<&AuthenticatedContext>,
+    reason: Option<&'static str>,
     method: &str,
     path: &str,
     status: StatusCode,
@@ -704,6 +726,7 @@ fn write_audit_record(
         "request_id": request_id,
         "principal": identity.map(|context| context.principal_id().as_str()),
         "organization": identity.map(|context| context.organization_id().as_str()),
+        "reason": reason,
         "method": method,
         "path": path,
         "status": status.as_u16(),
@@ -1017,13 +1040,13 @@ fn gateway_error(status: StatusCode, message: &'static str) -> Response {
 }
 
 /// Resolves the request's bearer token to its principal and organization, or
-/// returns the exact response the gateway should send without forwarding.
+/// returns the refusal the gateway should send without forwarding.
 async fn authenticate(
     store: &Arc<SqliteIdentityStore>,
     headers: &HeaderMap,
-) -> Result<AuthenticatedContext, Response> {
+) -> Result<AuthenticatedContext, AuthRefusal> {
     let Some(token) = bearer_token(headers) else {
-        return Err(unauthorized("missing bearer token"));
+        return Err(AuthRefusal::MissingToken);
     };
     let store = Arc::clone(store);
     let token = token.to_string();
@@ -1032,15 +1055,119 @@ async fn authenticate(
         .expect("identity resolution task panicked");
 
     resolved.map_err(|error| match error {
-        IdentityError::InvalidToken => unauthorized("invalid bearer token"),
+        IdentityError::InvalidToken => AuthRefusal::InvalidToken,
+        IdentityError::ExpiredToken => AuthRefusal::ExpiredToken,
         error => {
             tracing::error!(%error, "identity store error while authenticating request");
-            gateway_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "gateway could not verify the bearer token",
-            )
+            AuthRefusal::StoreUnavailable
         }
     })
+}
+
+/// Why a request was refused before it reached a replica.
+///
+/// A type rather than a prebuilt [`Response`], because the reason has to reach
+/// three places and a formatted body only reaches one: the client's error
+/// `type`, the `WWW-Authenticate` challenge, and the audit record. An earlier
+/// revision distinguished expiry from invalidity in English prose alone, which
+/// meant the distinction existed for nobody -- a client would have had to
+/// string-match a human sentence, and the audit log recorded the two
+/// identically.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthRefusal {
+    MissingToken,
+    InvalidToken,
+    ExpiredToken,
+    StoreUnavailable,
+}
+
+impl AuthRefusal {
+    /// The stable machine discriminator, in the response body's `error.type`
+    /// field -- the same slot `quota_exceeded` and `gateway_error` use, and
+    /// the one a client is entitled to branch on.
+    fn error_type(self) -> &'static str {
+        match self {
+            // Unchanged for the two pre-existing cases: clients already branch
+            // on this value, and "you are not authorized" is still all that can
+            // be said about a request carrying no or an unknown credential.
+            Self::MissingToken | Self::InvalidToken => "unauthorized",
+            // The one case where a correct client has a distinct action
+            // available: stop retrying this credential and obtain another.
+            Self::ExpiredToken => "token_expired",
+            Self::StoreUnavailable => "gateway_error",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::MissingToken => "missing bearer token",
+            Self::InvalidToken => "invalid bearer token",
+            Self::ExpiredToken => "expired bearer token",
+            Self::StoreUnavailable => "gateway could not verify the bearer token",
+        }
+    }
+
+    /// The value recorded in the audit log, so an operator reading it can tell
+    /// a client using a lapsed credential from one presenting an unknown
+    /// secret. Both are `401` with a null principal, so without this the two
+    /// lines are byte-identical.
+    fn audit_reason(self) -> &'static str {
+        match self {
+            Self::MissingToken => "missing_token",
+            Self::InvalidToken => "invalid_token",
+            Self::ExpiredToken => "expired_token",
+            Self::StoreUnavailable => "identity_store_unavailable",
+        }
+    }
+
+    /// The `WWW-Authenticate` challenge, per RFC 6750 section 3.
+    ///
+    /// `invalid_token` is the registered code covering expired, revoked and
+    /// malformed credentials alike -- there is no separate `expired` code, so
+    /// the distinction rides in `error_description` and in the body's `type`.
+    /// A request that carried no credential at all gets a bare challenge:
+    /// section 3 says the server SHOULD NOT emit an error code when none was
+    /// presented, since nothing was wrong with a credential that was never
+    /// sent.
+    fn challenge(self) -> Option<HeaderValue> {
+        match self {
+            Self::MissingToken => Some(HeaderValue::from_static("Bearer")),
+            Self::InvalidToken => Some(HeaderValue::from_static(
+                r#"Bearer error="invalid_token", error_description="invalid bearer token""#,
+            )),
+            Self::ExpiredToken => Some(HeaderValue::from_static(
+                r#"Bearer error="invalid_token", error_description="expired bearer token""#,
+            )),
+            Self::StoreUnavailable => None,
+        }
+    }
+
+    fn status(self) -> StatusCode {
+        match self {
+            Self::StoreUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => StatusCode::UNAUTHORIZED,
+        }
+    }
+
+    fn into_response(self) -> Response {
+        let mut response = (
+            self.status(),
+            Json(serde_json::json!({
+                "error": {
+                    "message": self.message(),
+                    "type": self.error_type()
+                }
+            })),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Some(challenge) = self.challenge() {
+            response.headers_mut().insert(WWW_AUTHENTICATE, challenge);
+        }
+        response
+    }
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -1054,26 +1181,6 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     }
     let token = rest.trim();
     (!token.is_empty()).then_some(token)
-}
-
-fn unauthorized(message: &'static str) -> Response {
-    let mut response = (
-        StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({
-            "error": {
-                "message": message,
-                "type": "unauthorized"
-            }
-        })),
-    )
-        .into_response();
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    response
-        .headers_mut()
-        .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-    response
 }
 
 /// A typed `429` for a request whose organization has exhausted its request

@@ -60,7 +60,7 @@ deploy/
 | **Serving replica** | `crates/server` (`camelid-enterprise` bin) | CLI (`serve`), binds an HTTP listener, applies the deterministic lane, stamps attribution, loads one model at startup. |
 | **Lane / config freeze** | `crates/server/src/lane.rs` | Applies a canonical env-var configuration vector, fails closed on any override, publishes its SHA-256. Engine pinned by revision (`ENGINE_PIN`). |
 | **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-host` on every response, injects fields into completion bodies, writes optional JSONL serving receipts (each carrying the gateway-stamped `request_id` when present, or `null` for direct-to-replica traffic). |
-| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin forwarding for the `/v1` inference allowlist it derives from `replica_contract::PUBLIC_ROUTES` (so the allowlist cannot silently drift from the replica's public contract), with opaque streaming bodies, hop-by-hop header filtering, no retries, bounded concurrency (admission-controlled), and no response rewriting. Replica control routes are not exposed. Optionally enforces bearer-token auth (see below), checked before the admission permit is taken; unauthenticated pass-through remains the default. Stamps a gateway-authoritative `x-camelid-request-id` on every forwarded request (overwriting any client value) and, with `serve --audit-log <path>`, writes one JSONL audit line per handled request — including auth/admission rejections — as `{ts, request_id, principal, organization, method, path, status}`. Principal and organization remain gateway-local; only the opaque request id reaches a replica. |
+| **Transparent gateway** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Fixed-origin forwarding for the `/v1` inference allowlist it derives from `replica_contract::PUBLIC_ROUTES` (so the allowlist cannot silently drift from the replica's public contract), with opaque streaming bodies, hop-by-hop header filtering, no retries, bounded concurrency (admission-controlled), and no response rewriting. Replica control routes are not exposed. Optionally enforces bearer-token auth (see below), checked before the admission permit is taken; unauthenticated pass-through remains the default. Stamps a gateway-authoritative `x-camelid-request-id` on every forwarded request (overwriting any client value) and, with `serve --audit-log <path>`, writes one JSONL audit line per handled request — including auth/admission rejections — as `{ts, request_id, principal, organization, reason, method, path, status}`, where `reason` names the gateway's own refusal (`expired_token`, `invalid_token`, `organization_quota_exceeded`, …) and is null for anything it forwarded. Principal and organization remain gateway-local; only the opaque request id reaches a replica. |
 | **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | The gateway exposes `/v1/health`, model discovery, completions/chat, and the pinned engine's compatibility endpoints. Replica-local `/api` model management remains private. Provided by the pinned engine crate, **not** by this repo. |
 | **Engine core** | `crates/engine-core` | GGUF container, model config, tensor/forward/tokenizer types. Host-agnostic. |
 | **Platform kernels** | `crates/engine-{macos,linux,windows}` | Runtime CPU feature detection (`probe()`), platform kernels. macOS port landing first; Linux/Windows currently capability-detection only. |
@@ -226,23 +226,62 @@ tokens for one model"; everything multi-user is layered on top.
   rejects any request without a valid `Authorization: Bearer <token>` with a
   typed `401` before it reaches a replica; omitting the flag keeps the
   gateway's original unauthenticated pass-through unchanged. `create-user`,
+  `list-users`,
   `create-organization`, `list-organizations`, `add-principal-to-organization`,
-  `remove-principal-from-organization`, `issue-token [--organization <id>]`,
+  `remove-principal-from-organization`,
+  `issue-token [--organization <id>] [--expires-in-seconds <n>]`,
+  `rotate-token [--expires-in-seconds <n> | --no-expiry]`,
   and `revoke-token` subcommands manage the local database. The gateway audit
   record includes the resolved opaque organization, but replicas still receive
   only the opaque request id. The identity schema migration is forward-only:
-  take a backup before upgrading, and do not roll an older gateway binary back
-  against the migrated database because it cannot mint new organization-scoped
-  tokens.
+  take a backup before upgrading. A gateway binary older than the database it
+  is pointed at refuses to open it at all rather than operating on a schema it
+  does not understand, so a rollback after an upgrade fails closed at startup
+  instead of silently losing the columns it cannot see.
   **Bearer tokens are only as safe as the transport they travel over:** this
-  gateway does not terminate TLS, tokens do not expire, and a plaintext HTTP
-  hop lets any on-path observer capture and replay one indefinitely. Enabling
+  gateway does not terminate TLS, and a plaintext HTTP hop lets any on-path
+  observer capture and replay one. Enabling
   `--identity-db` without a TLS-terminating ingress/reverse proxy (or mTLS, or
   a genuinely trusted private network) in front of it is not a secure
-  deployment; the gateway logs a warning to this effect at startup. Per-request
+  deployment; the gateway logs a warning to this effect at startup. A token now
+  *may* carry an expiry, which bounds how long a captured one is worth
+  replaying, and `rotate-token` exchanges a live token for a fresh secret in a
+  single transaction — no window in which both work, none in which neither
+  does. Both are opt-in and neither is a substitute for transport security:
+  a token issued without `--expires-in-seconds` never expires (the behavior of
+  every token issued before this existed, and therefore of every token an
+  upgrade migrates), expiry is evaluated against the local system clock so a
+  backwards clock jump extends every outstanding token, and an expired token is
+  still valid for the whole window before it lapses. Revocation remains the
+  only control that takes effect immediately and does not consult a clock.
+  Four further bounds, stated because they are easy to assume away:
+  **rotation is operator-only** — it requires the plaintext token *and*
+  filesystem access to the identity database, so a remote client told
+  `401 {"type": "token_expired"}` has no shipped way to obtain a replacement;
+  the distinct type and the RFC 6750 `WWW-Authenticate` challenge exist so a
+  client can stop retrying a dead credential and an operator can see which
+  refusal happened (the audit record carries a `reason`), not because a refresh
+  endpoint exists. **Expiry is checked at admission
+  only**, so a stream that began before its token lapsed runs to completion,
+  bounded by `--max-connection-seconds` (300s default) rather than by the
+  token. **Lapsed tokens are not swept** — an expired row survives until it is
+  rotated, revoked, or its membership is removed, because resolution keeps
+  reading it in order to answer "expired" instead of "invalid"; short lifetimes
+  accumulate rows, and pruning is left to a change with a retention policy
+  behind it rather than folded into a read path where replaying a dead token
+  would force a write. **Creating the database concurrently is not supported**:
+  schema migration is serialized under a write lock, but the initial
+  `journal_mode` switch to WAL in a brand-new file is not, so several processes
+  opening a database that does not yet exist can collide. Create it once — any
+  CLI subcommand does — before starting processes that share it.
+  Rotation defaults to reissuing with the lifetime the presented token was
+  *issued* with, measured from now: the commonest reason to rotate is an expiry
+  approaching, and the safe result of that is another bounded credential rather
+  than a permanent one. `--no-expiry` drops the bound and has to be asked for.
+  Per-request
   identity now reaches an audit trail without the replica learning identity:
   the gateway stamps an opaque `x-camelid-request-id` on each forwarded
-  request, records `{ts, request_id, principal, organization, method, path, status}` to its
+  request, records `{ts, request_id, principal, organization, reason, method, path, status}` to its
   own optional `--audit-log`, and the replica echoes that id into its serving
   receipt — so `gateway_audit ⨝ replica_receipt ON request_id` reconstructs
   "which principal's request was served by which deterministic configuration."
@@ -252,8 +291,11 @@ tokens for one model"; everything multi-user is layered on top.
   truncated mid-stream. And the replica echoes the correlation id verbatim, so
   join integrity rests on replica network isolation (a client able to reach the
   replica directly can forge one), not on anything cryptographic.
-  Still missing: no way to require auth by default, no token expiry/rotation,
-  no routing or quotas.
+  Still missing: no way to require auth by default, no automatic or
+  policy-enforced rotation (an operator must run `rotate-token`), no minimum or
+  default token lifetime, no remote credential-refresh endpoint, and no routing
+  by model. Per-organization request quotas landed separately and are
+  described under phase 4.
 
    **Rebase hazard:** this work is cut from `main` before admission control
    (a bounded in-flight semaphore) lands in the separate gateway-hardening
