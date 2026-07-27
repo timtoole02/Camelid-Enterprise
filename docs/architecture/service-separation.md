@@ -335,9 +335,12 @@ tokens for one model"; everything multi-user is layered on top.
   aggregates them durably. Startup preflights log destinations and rejects
   audit/usage aliases; runtime logging has a bounded dedicated writer queue with
   rate-limited loss warnings. A clean shutdown drains that queue before the
-  process exits, bounded by a five-second deadline after which it reports how
-  many accepted records were abandoned — so a rolling update no longer silently
-  truncates the tail of the evidence, though an abrupt crash still loses the
+  process exits, bounded by a five-second deadline per log, after which it
+  reports how many records were still queued — an upper bound on loss, since
+  the writer keeps draining. That drain only happens if the deployment budgets
+  for it: the termination grace period has to exceed the connection cap plus
+  the per-log deadlines, which the shipped manifest now does and the previous
+  300s-against-300s configuration did not. An abrupt crash still loses the
   queue. Still missing: routing by model (there is exactly one upstream
   today). Still no state in replicas.
 5. **Model/catalog service — not started.** Promote model management out of
