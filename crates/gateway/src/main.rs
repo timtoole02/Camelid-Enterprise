@@ -55,9 +55,11 @@ enum Command {
         /// Path to an append-only JSONL audit log. When set, the gateway
         /// records one line per request it handles — including requests it
         /// rejects for authentication or admission — carrying the request's
-        /// correlation id, the resolved principal (or null), method, path, and
-        /// status. Join it to a replica's serving receipts on `request_id` to
-        /// see which deterministic configuration served each caller's request.
+        /// correlation id, the resolved principal and organization (or null),
+        /// the refusal reason (null for anything it forwarded), method, path,
+        /// and status. Join it to a replica's serving receipts on `request_id`
+        /// to see which deterministic configuration served each caller's
+        /// request.
         #[arg(long, env = "CAMELID_GATEWAY_AUDIT_LOG")]
         audit_log: Option<PathBuf>,
         /// Path to an append-only JSONL transport-usage log. Each handled
@@ -459,6 +461,13 @@ fn rotate_token(
     expires_in_seconds: Option<NonZeroU64>,
     no_expiry: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let token = read_secret_arg(token)?;
+    let store = SqliteIdentityStore::open(identity_db)?;
+    // Decided after the token is in hand, not before. `-` blocks on stdin,
+    // which for an interactive paste is unbounded, and `expires_in` measures
+    // from the moment it is called: computing the lifetime up front would date
+    // the replacement from process start rather than from the rotation.
+    //
     // Clap rejects the two flags together, so at most one arm applies. Absent
     // both, the replacement keeps the lifetime the presented token was issued
     // with: the default must not quietly convert a bounded credential into a
@@ -468,8 +477,6 @@ fn rotate_token(
         (None, true) => RotationLifetime::Replaced(TokenLifetime::Never),
         (None, false) => RotationLifetime::Preserved,
     };
-    let token = read_secret_arg(token)?;
-    let store = SqliteIdentityStore::open(identity_db)?;
     let replacement = store.rotate_token(&token, lifetime)?;
     println!("{replacement}");
     Ok(())
