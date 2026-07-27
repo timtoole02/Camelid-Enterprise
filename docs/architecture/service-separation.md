@@ -339,8 +339,13 @@ tokens for one model"; everything multi-user is layered on top.
   today). Still no state in replicas.
 5. **Model/catalog service — not started.** Promote model management out of
   ad-hoc `--model` + `/api/models/load` into a catalog that maps model → pool.
-6. **Platform data + observability — not started.** Introduce the durable store
-  (users, conversations, audit) and aggregate receipts/metrics/logs.
+6. **Platform data + observability — not started, now unblocked.** Introduce the
+  durable store (users, conversations, audit) and aggregate receipts/metrics/logs.
+  The store was blocked on an unanswered §7 question; that is now decided as
+  self-hosted PostgreSQL (`platform-datastore.md`), which also supplies the
+  shared, durable quota state Phase 4 could not provide in-process. Aggregation
+  still inherits the gateway logs' best-effort, lossy-on-exit contract: it reads
+  what survived and cannot retroactively complete it.
 7. **Application tier integration — not started.** Bring the external apps
   (WebUI, desktop, agentic terminal, Kanban) onto the gateway contract —
   reworked for auth and multi-user as the vision requires.
@@ -366,8 +371,30 @@ before the corresponding phase starts.
   the gateway.
 - What is the identity model: local accounts only, or federation (OIDC/SAML) for
   organizations — while still allowing a fully offline single-box mode?
-- What datastore satisfies both "one box under a desk" and "data center scale"
-  without an external managed dependency?
+- **Resolved.** The platform datastore is **PostgreSQL**, self-hosted inside the
+  deployment's trust boundary, as the single backend for both a desk box and a
+  cluster — see `platform-datastore.md`. Rejected: SQLite on a shared volume
+  (its locking is unsafe on the network filesystems most `ReadWriteMany` drivers
+  provide, and two processes on one node already produced three concurrency
+  defects in `crates/identity`), and two backends behind one trait (two
+  migration paths and two isolation models, where the failure modes that matter
+  surface in whichever is exercised least). "No external dependency" constrains
+  who holds the data, not how many processes hold it. Open follow-on: identity
+  is still SQLite, and either migrates too or keeps SQLite by moving CLI
+  operations onto an authenticated gateway admin API, which would restore the
+  single-process file ownership SQLite actually requires.
+- **Resolved (scoped, deliberately not started).** The pinned engine
+  (`camelid` @ `b4e3a905`) stays — see `engine-dependency.md`. `crates/server`
+  imports two symbols from it, but they supply the whole HTTP surface: ten
+  contractual `/v1` routes plus private model-lifecycle, telemetry, tokenize,
+  metrics, embeddings, rerank and agent-workspace routes. `engine-core` is
+  ~9,400 lines of numerics that depends only on `serde` and does no HTTP, so
+  the gap is the entire serving layer, not the maths. Crucially, the risks that
+  matter — availability and air-gapped builds — are fixed by **mirroring or
+  vendoring the pinned revision**, not by un-pinning; integrity is already
+  sound because the revision is a SHA recorded in `Cargo.lock`. If the
+  migration ever starts, `contract.rs` plus `Router::merge` allow it one route
+  at a time with the contract test proving the union stays exact.
 - **Resolved.** Per-request user/tenant context reaches an audit trail without
   the replica learning identity: the gateway mints an opaque, authoritative
   `x-camelid-request-id`, keeps identity in its own append-only audit log, and
