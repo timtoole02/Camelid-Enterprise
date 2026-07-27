@@ -42,3 +42,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p camelid-enterprise-engine-windows --target aarch64-pc-windows-msvc
       - run: cargo check -p camelid-enterprise-engine-linux --target aarch64-unknown-linux-gnu
+
+  # `broken_intra_doc_links` is a rustdoc lint, so neither `cargo test` nor
+  # `cargo clippy` evaluates it: a rename that orphans a doc link still
+  # compiles, still passes every test, and ships pointing at nothing. That
+  # happened during the token-expiry work and was caught by re-reading rather
+  # than by tooling, which is the gap this closes.
+  #
+  # Denied by name rather than through a blanket `-D warnings`: engine-core
+  # carries two pre-existing `private_intra_doc_links` warnings, and denying
+  # everything would fail this job on those instead of on the defect it exists
+  # to catch. Widen the deny list only alongside fixing what it then covers.
+  #
+  # Rustdoc output does not vary by platform, so one runner is enough.
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps
