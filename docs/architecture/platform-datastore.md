@@ -24,9 +24,13 @@ What Phase 6 has to store:
 - durable aggregation of the two append-only JSONL logs (gateway audit,
   gateway usage) joined to replica receipts on `request_id`
 - metering rollups derived from that
-- users, organizations, tokens (today in SQLite)
 - shared quota state — the Phase 4 gap: quota counters are per-process and
-  in-memory, so the shipped two-replica manifest enforces up to `4 x limit`
+  in-memory, so an authenticated deployment running the manifest's two replicas
+  admits up to `4 x limit` for one organization across a window boundary
+
+Identity data — principals, organizations, tokens — is deliberately **not** on
+that list. It has a store already, and §5 explains why moving it is a separate
+decision that Phase 6 does not wait on.
 
 Three of those four are multi-writer by construction.
 

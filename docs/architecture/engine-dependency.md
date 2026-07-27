@@ -173,5 +173,6 @@ reachable until one of the three prerequisites above is in place.
    defect motivating its removal.
 3. **Revisit un-pinning when a route needs to change** — when the contract has
    to gain or alter behavior the pinned engine cannot provide. That is the
-   point at which owning the surface starts paying for itself, and step 7's
-   route-at-a-time path becomes the plan.
+   point at which owning the surface starts paying for itself. Migration still
+   does not begin there: it begins after one of §7's prerequisites has been
+   chosen and built, because until then there is no incremental path to take.
