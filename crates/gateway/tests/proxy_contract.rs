@@ -127,12 +127,16 @@ fn gateway_log(path: &Path) -> Arc<GatewayLog> {
 
 #[tokio::test]
 async fn audit_records_survive_a_graceful_shutdown() {
-    // The gateway accepts audit records onto a bounded queue drained by a
-    // separate thread, so "the request was audited" and "the record is on
-    // disk" are different facts. On Kubernetes every rolling update SIGTERMs
-    // the pod, so the gap between them is ordinary operation rather than an
-    // edge case: without a drain at shutdown the tail of the log is silently
-    // missing, and an aggregator reading it cannot tell.
+    // Covers the wiring and the ordering: real requests over real HTTP, a real
+    // graceful shutdown, and the drain running after `serve` returns so that
+    // records produced while connections were finishing are included.
+    //
+    // It does not prove the loss it guards against. In-process the writer
+    // thread outlives `serve`, so without the drain it would catch up on its
+    // own and this would still pass -- measured, not assumed. The loss only
+    // bites when the *process* exits, and
+    // `flush_and_stop_persists_every_accepted_record` carries that proof
+    // deterministically against a stubbed-out drain.
     const REQUESTS: usize = 200;
     let upstream =
         spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
@@ -158,16 +162,24 @@ async fn audit_records_survive_a_graceful_shutdown() {
         .unwrap();
     });
 
+    // Concurrent rather than sequential, so records genuinely pile up behind
+    // the writer instead of trickling in at a pace it can always match.
+    let mut requests = tokio::task::JoinSet::new();
     for _ in 0..REQUESTS {
-        let response = client()
-            .request(
-                Request::get(format!("http://{addr}/v1/models"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        requests.spawn(async move {
+            client()
+                .request(
+                    Request::get(format!("http://{addr}/v1/models"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        });
+    }
+    while let Some(status) = requests.join_next().await {
+        assert_eq!(status.unwrap(), StatusCode::NO_CONTENT);
     }
 
     // Shut down exactly as the binary does: stop accepting, drain connections,
@@ -179,8 +191,7 @@ async fn audit_records_survive_a_graceful_shutdown() {
         LogFlush::Drained
     );
 
-    // Read once, with no retry loop. Polling until the writer catches up would
-    // pass with or without the drain and would test nothing.
+    // Read once, with no retry loop.
     let contents = std::fs::read_to_string(&audit_path).unwrap();
     let lines: Vec<&str> = contents
         .lines()
