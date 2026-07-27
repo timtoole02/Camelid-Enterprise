@@ -373,16 +373,19 @@ before the corresponding phase starts.
   organizations — while still allowing a fully offline single-box mode?
 - **Resolved.** The platform datastore is **PostgreSQL**, self-hosted inside the
   deployment's trust boundary, as the single backend for both a desk box and a
-  cluster — see `platform-datastore.md`. Rejected: SQLite on a shared volume
-  (its locking is unsafe on the network filesystems most `ReadWriteMany` drivers
-  provide, and two processes on one node already produced three concurrency
-  defects in `crates/identity`), and two backends behind one trait (two
-  migration paths and two isolation models, where the failure modes that matter
-  surface in whichever is exercised least). "No external dependency" constrains
-  who holds the data, not how many processes hold it. Open follow-on: identity
-  is still SQLite, and either migrates too or keeps SQLite by moving CLI
-  operations onto an authenticated gateway admin API, which would restore the
-  single-process file ownership SQLite actually requires.
+  cluster — see `platform-datastore.md`. Rejected: SQLite for this role (not
+  because it is single-process — it is not — but because multi-pod access needs
+  a shared volume, meaning a network filesystem where its locking guarantees do
+  not hold, and because `crates/identity` has already produced three
+  concurrency defects with two processes on one node), and two backends behind
+  one trait (two migration paths and two isolation models, where the failure
+  modes that matter surface in whichever is exercised least). "No external
+  dependency" constrains who holds the data, not how many processes hold it.
+  Phase 6 does not wait on identity: the platform store owns aggregated audit
+  and usage records, metering rollups and shared quota state, while principals,
+  organizations and tokens stay with identity until that separate question is
+  settled — either by migrating it too, or by moving CLI operations onto an
+  authenticated gateway admin API so a single process owns the file.
 - **Resolved (scoped, deliberately not started).** The pinned engine
   (`camelid` @ `b4e3a905`) stays — see `engine-dependency.md`. `crates/server`
   imports two symbols from it, but they supply the whole HTTP surface: ten
@@ -392,9 +395,14 @@ before the corresponding phase starts.
   the gap is the entire serving layer, not the maths. Crucially, the risks that
   matter — availability and air-gapped builds — are fixed by **mirroring or
   vendoring the pinned revision**, not by un-pinning; integrity is already
-  sound because the revision is a SHA recorded in `Cargo.lock`. If the
-  migration ever starts, `contract.rs` plus `Router::merge` allow it one route
-  at a time with the contract test proving the union stays exact.
+  sound because the revision is a SHA recorded in `Cargo.lock`. There is no
+  incremental migration path today: axum's `Router::merge` panics on a
+  duplicate method-and-path pair (`Overlapping method route`, verified against
+  0.7.9), `router_with_state` exposes no way to remove a route, and
+  `contract.rs` states that axum offers no inverse route-tree introspection, so
+  a hybrid router could not be proven exact either. Route-at-a-time needs a
+  prerequisite first — composable route groups from the engine, a proxy
+  fallback, or a wholesale cutover.
 - **Resolved.** Per-request user/tenant context reaches an audit trail without
   the replica learning identity: the gateway mints an opaque, authoritative
   `x-camelid-request-id`, keeps identity in its own append-only audit log, and

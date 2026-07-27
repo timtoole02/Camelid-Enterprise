@@ -50,7 +50,8 @@ surface, and `AppState` is the entire engine runtime behind it.
 `/api/capabilities`, `/api/runtime/gpu`, `/api/telemetry/stream`,
 `/execution-plan`, `/api/execution-plan`, `/api/models/load`,
 `/api/models/inspect`, `/tokenize`, `/models`, `/metrics`, `/infill`,
-`/rerank`, plus six `/api/agent/workspace/...` thread and session routes.
+`/rerank`, plus ten `/api/agent/workspace/...` routes, eight of which are
+thread and session paths.
 
 So the dependency supplies: an OpenAI-compatible API, a model registry and
 load lifecycle, streaming, embeddings, reranking, tokenization, a metrics
@@ -116,29 +117,51 @@ first buys most of the safety at a fraction of the cost.
 
 ## 7. If and when the migration happens
 
-There is a viable incremental path, and the repo already built the safety net
-for it without meaning to.
+There is no incremental path with the API as it stands, and the obvious one
+does not work. This section records why, so the idea is not rediscovered and
+tried.
 
-`crates/server/src/contract.rs` verifies the pinned router against
-`replica_contract::PUBLIC_ROUTES`, and axum's `Router::merge` allows in-tree
-routes and the pinned router to coexist in one service. So the surface can be
-migrated **one route at a time**, with the existing contract test proving at
-every step that the union still satisfies the published contract exactly — no
-route silently lost, none silently added.
+**`Router::merge` cannot layer an in-tree route over a pinned one.** Axum
+rejects a duplicate method-and-path pair by panicking rather than letting the
+later registration win. Verified against the vendored axum 0.7.9 by merging two
+routers that both declare `GET /v1/health`:
 
-A defensible order, easiest and most load-bearing first:
+```
+Overlapping method route. Handler for `GET /v1/health` already exists
+```
 
-1. `/v1/health` — trivial, and proves the hybrid-router harness works.
-2. `/v1/models`, `/v1/models/:model` — needs a real model registry, so this
-   converges with the Phase 5 catalog service rather than duplicating it.
-3. `/v1/completions` — the first route needing `engine-core` end to end.
-   Greedy only, which the deterministic lane already requires.
-4. `/v1/chat/completions` — adds chat templating and SSE streaming.
-5. `/v1/embeddings`, `/v1/rerank`, `/v1/reranking` — different model families.
-   Decide deliberately whether they are re-implemented, left pinned, or
-   removed from the contract; they may not belong in this product's surface.
-6. Private `/api` routes — decide what is genuinely needed. The agent
-   workspace in particular should be justified before it is reimplemented.
+So an in-tree `/v1/health` merged with `router_with_state()` is a panic at
+startup, not a migration step. And `router_with_state` returns one assembled
+`Router` with no hook for removing or replacing a route, so there is nothing to
+subtract the pinned handler with first.
+
+**The contract test cannot prove the union is exact, either.** `contract.rs`
+says so in its own words: *"Axum exposes no inverse route-tree introspection:
+tests prove every declaration exists with these methods."* That direction is
+the useful one — a declared route that disappears fails the test — but it
+cannot detect a route the engine added. Any claim that a hybrid router
+"silently adds nothing" would be unfounded.
+
+A real incremental migration therefore needs a prerequisite that does not exist
+yet. Roughly by how invasive they are:
+
+1. **Change the pinned dependency to expose composable route groups** instead
+   of one assembled router, so routes can be selected rather than overlaid.
+   The only option that makes route-at-a-time genuinely safe, and it requires
+   changing the engine — which is what the pin exists to hold still.
+2. **Put in-tree routes in front and proxy the remainder**, mounting the
+   pinned router as a `fallback` rather than merging it. Avoids the panic
+   without touching the engine, at the cost of a second dispatch layer inside
+   the replica and a fallback surface nobody enumerates.
+3. **Replace the router wholesale** at a single cutover. Forfeits
+   incrementality, but is honest that the surface is one unit.
+
+If a migration ever starts, the least-risky order is still easiest and most
+load-bearing first — `/v1/health`, then `/v1/models`, then `/v1/completions`,
+then `/v1/chat/completions` with templating and SSE, then a deliberate decision
+about `/v1/embeddings` and the rerank pair, which are different model families
+and may not belong in this product's surface at all. None of that sequencing is
+reachable until one of the three prerequisites above is in place.
 
 ## 8. Recommendation
 

@@ -52,15 +52,27 @@ three defects, each still visible in the tree as the fix that answers it:
 (The ablation measurements behind those fixes — failure counts with and without
 the lock — are recorded in PR #17's description rather than in the tree.)
 
-That is two processes on one node. The shipped Kubernetes manifest runs
-`replicas: 2` against a shared volume, which is the same shape with network
-storage underneath — and SQLite's locking is documented-unreliable on network
-filesystems, which is what most `ReadWriteMany` CSI drivers are.
+That is two processes on one node, and it is already enough to have produced
+three defects. The cluster case is worse in kind, not just in degree: the
+gateway manifest ships `replicas: 2`, and the authenticated topology it is
+heading for would put those pods on shared state. That configuration is not
+shipped today — the stock manifest disables identity and its only volume is a
+per-pod `emptyDir` at `/tmp` — so this is a statement about where the
+deployment is going, not a defect in what is running. But it is the
+configuration the identity work exists to enable, and it would put SQLite
+behind a `ReadWriteMany` volume, which in practice means a network filesystem,
+where SQLite's locking is documented as unreliable.
 
-**SQLite is not failing here because it is a bad database.** It is failing
-because it is a library for a single process that owns a file, and it is being
-used as a server. The correct fix for "two processes need consistent concurrent
-access to shared state" is a database server.
+**SQLite is not failing here because it is a bad database, and it is not a
+"single-process" one.** It supports concurrent access from multiple local
+processes through file locking, and on a single node that works. Two things
+rule it out for this role. The first is the deployment target: multi-pod access
+needs a shared volume, which in practice means a network filesystem, where
+those locking guarantees do not hold. The second is demonstrated rather than
+theoretical — the transaction and initialization mistakes above are ones this
+application has already made, and a store whose correctness depends on every
+caller getting `BEGIN IMMEDIATE` and initialization ordering right will keep
+collecting them.
 
 ## 3. Options considered
 
@@ -106,9 +118,14 @@ becomes correct again, including the create-race that is currently unfixed.
 (b) is architecturally cleaner than it first looks, and it is the option that
 preserves the desk-box story. It is also strictly more work, and it adds a new
 authenticated HTTP surface, which is its own review burden. **This document
-does not decide between them**; it records that the choice is now the only
-thing standing between here and Phase 6, and that "keep SQLite because it is
-already there" is not one of the options.
+does not decide between them, and Phase 6 does not wait for that decision.**
+The platform store is a new database for aggregation, metering and platform
+state; identity keeps its own store either way. The ownership boundary is the
+decision that matters: the platform store owns aggregated audit and usage
+records, metering rollups and shared quota state, and it does *not* own
+principals, organizations or tokens until the identity question is settled
+separately. What is not an option is "keep SQLite for the platform store
+because identity already uses it".
 
 ## 6. What this unblocks
 
@@ -119,8 +136,11 @@ already there" is not one of the options.
 ## 7. Bounds
 
 - Nothing here is built. This is a decision, not an implementation.
-- Postgres does not make the gateway's logs durable on its own: the audit and
-  usage writers are still best-effort and lossy on process exit. Aggregation
-  reads what survived; it does not retroactively make it complete.
+- Postgres does not make the gateway's logs durable on its own. Those writers
+  are best-effort by design, and no shutdown behaviour turns a record the
+  gateway dropped while running into one an aggregator can read. Aggregation
+  reads what survived; it does not retroactively make it complete. The precise
+  durability contract lives with the gateway, in `deploy/README.md`, rather
+  than being restated here where it would drift.
 - Choosing Postgres says nothing about *when* identity migrates. Until it does,
   the single-writer constraints documented in `crates/identity` still apply.
