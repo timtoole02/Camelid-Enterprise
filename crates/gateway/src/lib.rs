@@ -146,10 +146,16 @@ struct LogChannel {
 pub enum LogFlush {
     /// The writer drained every accepted record and stopped.
     Drained,
-    /// The deadline expired first. `abandoned` records were accepted by the
-    /// queue but never written, and are lost. Reported rather than inferred so
-    /// an operator reading the log knows it is short and by how much.
-    TimedOut { abandoned: u64 },
+    /// The deadline expired first. `pending_at_deadline` records had been
+    /// accepted but not yet written when the wait gave up.
+    ///
+    /// Deliberately not called "lost". Giving up on the wait does not stop the
+    /// writer: it keeps draining on its own, so some or all of these may still
+    /// reach the file before the process exits. What the count states is how
+    /// far behind the writer was at the deadline, which is an upper bound on
+    /// the loss rather than a measurement of it. An exact figure is not
+    /// available to a caller that has chosen not to keep waiting.
+    TimedOut { pending_at_deadline: u64 },
     /// The log was already stopped. Flushing twice is not an error.
     AlreadyStopped,
 }
@@ -203,7 +209,11 @@ impl GatewayLog {
     /// period, at which point the process is killed anyway and the wait has
     /// bought nothing while delaying every other shutdown step. Losing a
     /// bounded number of evidence records is the better failure, provided the
-    /// loss is reported rather than silent.
+    /// shortfall is reported rather than silent.
+    ///
+    /// Giving up does not stop the writer. It continues draining until the
+    /// process exits, so [`LogFlush::TimedOut`] reports how far behind it was,
+    /// not how much was ultimately lost.
     ///
     /// Safe to call more than once and from any thread; later calls return
     /// [`LogFlush::AlreadyStopped`].
@@ -225,7 +235,7 @@ impl GatewayLog {
         match stopped.recv_timeout(deadline) {
             Ok(()) => LogFlush::Drained,
             Err(_) => LogFlush::TimedOut {
-                abandoned: self
+                pending_at_deadline: self
                     .queued_records
                     .load(Ordering::Relaxed)
                     .saturating_sub(self.written_records.load(Ordering::Relaxed)),
@@ -299,8 +309,8 @@ fn write_jsonl_records(
             failed_writes = 0;
         }
         // Counted whether or not the write succeeded: this tracks records the
-        // writer has finished with, which is what makes the abandoned count at
-        // a flush timeout mean "still queued" rather than "not yet durable".
+        // writer has finished with, which is what makes the pending count at a
+        // flush timeout mean "still queued" rather than "not yet durable".
         written.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -1690,8 +1700,9 @@ mod tests {
     fn flush_outcome_is_self_consistent_under_an_expired_deadline() {
         // A zero deadline races the writer by construction, so this asserts the
         // invariant that holds either way rather than pinning one arm and
-        // becoming flaky: whatever is reported abandoned was accepted and not
-        // written, and the two counters never disagree about the total.
+        // becoming flaky: whatever is reported pending was accepted and not yet
+        // written. It is an upper bound on loss, not a measurement -- the
+        // writer keeps draining after the wait gives up.
         const RECORDS: u64 = 500;
         let dir = tempfile::tempdir().unwrap();
         let log = GatewayLog::open(dir.path().join("audit.jsonl")).unwrap();
@@ -1702,10 +1713,12 @@ mod tests {
         let queued = log.queued_records.load(Ordering::Relaxed);
         match log.flush_and_stop(Duration::ZERO) {
             LogFlush::Drained => {}
-            LogFlush::TimedOut { abandoned } => {
+            LogFlush::TimedOut {
+                pending_at_deadline,
+            } => {
                 assert!(
-                    abandoned <= queued,
-                    "abandoned {abandoned} cannot exceed the {queued} accepted"
+                    pending_at_deadline <= queued,
+                    "pending {pending_at_deadline} cannot exceed the {queued} accepted"
                 );
             }
             LogFlush::AlreadyStopped => panic!("a first flush cannot report AlreadyStopped"),

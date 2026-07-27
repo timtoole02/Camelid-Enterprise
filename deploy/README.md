@@ -35,12 +35,15 @@ request and observed its body reach EOF; `0` is therefore a known empty body,
 not a default for an unmeasured one. Byte counts are opaque payload bytes
 observed by the gateway, not tokenizer usage or billable inference units.
 The log is best-effort while running: a full writer queue or a failing disk
-drops records, with a rate-limited warning for each. A clean shutdown (SIGTERM,
-including a Kubernetes rolling update) now drains whatever the queue already
-accepted before the process exits, so the tail of the log is no longer silently
-missing; if that drain does not finish within five seconds it gives up and logs
-an `error` naming how many records were abandoned. An abrupt crash still loses
-the queue, and each pod writes its own file. It is useful evidence for later
+drops records, with a rate-limited warning for each. On a clean shutdown
+(SIGTERM, including a Kubernetes rolling update) the gateway drains whatever
+the queue already accepted before exiting — **provided the termination grace
+period leaves room for it**; see the shutdown-budget note below, because a
+grace period equal to the connection cap does not. If the drain does not finish
+within five seconds it stops waiting and logs an `error` naming how many
+records were still queued; the writer keeps going, so that count is an upper
+bound on what is lost, not a measurement. An abrupt crash still loses the
+queue, and each pod writes its own file. It is useful evidence for later
 durable aggregation, not a replacement for it.
 Only the OpenAI-compatible `/v1` inference surface is public through the gateway;
 replica `/api`, embedded WebUI, workspace, and model-lifecycle routes return 404.
@@ -156,8 +159,22 @@ Adjust before applying:
   resolve to the same file. Runtime writes use a bounded dedicated writer queue:
   a full queue or writer failure loses records but emits rate-limited warnings.
 - **Shutdown drain** — both gateway and replica stop accepting connections on
-  SIGTERM and drain active streams. The examples grant 300 seconds before
-  kubelet may send SIGKILL; keep the replica window at least as long as the
+  SIGTERM and drain active streams. The gateway then drains its JSONL logs, so
+  the grace period has to cover both stages, not just the first:
+
+  ```
+  terminationGracePeriodSeconds
+    >= CAMELID_GATEWAY_MAX_CONNECTION_SECONDS   # connection drain
+     + 5s per configured JSONL log              # audit and/or usage
+     + margin
+  ```
+
+  The gateway manifest ships 330s against a 300s connection cap and two
+  possible logs. Setting the grace period *equal* to the connection cap leaves
+  no budget for the log drain: a connection accepted just before SIGTERM can
+  consume the whole period, and kubelet then kills the process mid-drain. Raise
+  the grace period whenever you raise the connection cap. The gateway logs the
+  budget it needs at startup. Keep the replica window at least as long as the
   gateway window, and size both above the longest permitted generation.
 - **NetworkPolicy enforcement** — the replica ingress policy permits port 8181
   only from gateway-labeled pods in the same namespace (plus node traffic that

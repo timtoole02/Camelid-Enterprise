@@ -29,9 +29,20 @@ spec:
       labels:
         app: camelid-enterprise-gateway
     spec:
-      # Axum drains active streaming responses on SIGTERM. Give long model
-      # generations time to finish before kubelet sends SIGKILL.
-      terminationGracePeriodSeconds: 300
+      # Shutdown budget. On SIGTERM the gateway stops accepting, drains active
+      # streaming responses, and only then drains its JSONL logs. kubelet sends
+      # SIGKILL when this expires, so it has to cover every stage:
+      #
+      #   terminationGracePeriodSeconds
+      #     >= CAMELID_GATEWAY_MAX_CONNECTION_SECONDS   (300, connection drain)
+      #      + 5s per configured JSONL log              (audit + usage = 10s)
+      #      + margin                                   (20s)
+      #
+      # 300 + 10 + 20 = 330. Setting this equal to the connection cap -- as it
+      # was -- leaves zero budget for the log drain: one connection accepted
+      # just before SIGTERM can consume the whole period, and the logs are then
+      # killed mid-drain. If you raise the connection cap, raise this too.
+      terminationGracePeriodSeconds: 330
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
