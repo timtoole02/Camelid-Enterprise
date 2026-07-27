@@ -34,9 +34,14 @@ observable cause. `request_bytes` is `null` unless the gateway forwarded the
 request and observed its body reach EOF; `0` is therefore a known empty body,
 not a default for an unmeasured one. Byte counts are opaque payload bytes
 observed by the gateway, not tokenizer usage or billable inference units.
-The log is best-effort: a process crash or SIGTERM can lose queued records, and
-each pod writes its own file. It is useful evidence for later durable
-aggregation, not a replacement for it.
+The log is best-effort while running: a full writer queue or a failing disk
+drops records, with a rate-limited warning for each. A clean shutdown (SIGTERM,
+including a Kubernetes rolling update) now drains whatever the queue already
+accepted before the process exits, so the tail of the log is no longer silently
+missing; if that drain does not finish within five seconds it gives up and logs
+an `error` naming how many records were abandoned. An abrupt crash still loses
+the queue, and each pod writes its own file. It is useful evidence for later
+durable aggregation, not a replacement for it.
 Only the OpenAI-compatible `/v1` inference surface is public through the gateway;
 replica `/api`, embedded WebUI, workspace, and model-lifecycle routes return 404.
 The gateway admits at most 256 concurrent request streams by default (including

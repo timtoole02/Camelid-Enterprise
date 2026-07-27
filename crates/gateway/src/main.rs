@@ -1,6 +1,6 @@
 use camelid_enterprise_gateway::{
-    router_with_options, GatewayAuth, GatewayLog, OrgQuota, UpstreamOrigin,
-    DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT,
+    router_with_options, GatewayAuth, GatewayLog, LogFlush, OrgQuota, UpstreamOrigin,
+    DEFAULT_LOG_FLUSH_DEADLINE, DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT,
 };
 use clap::{Parser, Subcommand};
 use identity::{OrganizationId, PrincipalId, RotationLifetime, SqliteIdentityStore, TokenLifetime};
@@ -316,6 +316,11 @@ async fn serve(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream = UpstreamOrigin::parse(upstream)?;
     let (audit, usage) = open_gateway_logs(&logs)?;
+    // Cloned before the sinks are moved into the router and the auth mode:
+    // both must still be reachable after `serve` returns so shutdown can drain
+    // what is still queued.
+    let audit_sink = audit.clone();
+    let usage_sink = usage.clone();
     if let Some(audit) = &audit {
         tracing::info!(path = %audit.path().display(), "gateway request audit log enabled");
     }
@@ -361,14 +366,53 @@ async fn serve(
         max_connection_seconds,
         "gateway listening"
     );
-    camelid_enterprise_gateway::serve(
+    let served = camelid_enterprise_gateway::serve(
         listener,
         router_with_options(upstream, max_in_flight, auth, audit),
         max_connection_duration,
         shutdown_signal(),
     )
-    .await?;
+    .await;
+    // Drained after the connection drain, never before it: records for the
+    // requests that finished during graceful shutdown are queued while `serve`
+    // is still running, and those are exactly the ones an early flush would
+    // miss. Run it even when `serve` failed -- whatever was accepted before
+    // the failure is still evidence.
+    flush_gateway_log("audit", audit_sink);
+    flush_gateway_log("usage", usage_sink);
+    served?;
     Ok(())
+}
+
+/// Drains one JSONL sink at shutdown and reports what happened.
+///
+/// A timeout is logged at `error` rather than `warn`: the log is evidence, and
+/// a short one that nobody was told about is worse than no log at all, because
+/// it still looks complete to whatever aggregates it later.
+fn flush_gateway_log(kind: &'static str, log: Option<Arc<GatewayLog>>) {
+    let Some(log) = log else {
+        return;
+    };
+    match log.flush_and_stop(DEFAULT_LOG_FLUSH_DEADLINE) {
+        LogFlush::Drained => {
+            tracing::info!(
+                kind,
+                path = %log.path().display(),
+                "gateway JSONL log drained at shutdown"
+            );
+        }
+        LogFlush::TimedOut { abandoned } => {
+            tracing::error!(
+                kind,
+                path = %log.path().display(),
+                abandoned,
+                deadline_seconds = DEFAULT_LOG_FLUSH_DEADLINE.as_secs(),
+                "gateway JSONL log did not drain before the flush deadline; \
+                 accepted records were lost"
+            );
+        }
+        LogFlush::AlreadyStopped => {}
+    }
 }
 
 fn create_user(identity_db: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {

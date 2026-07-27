@@ -331,11 +331,14 @@ tokens for one model"; everything multi-user is layered on top.
   `body_error`, `gateway_timeout`, or cause-agnostic `incomplete`. A request
   byte count is `null` unless the forwarded body reached EOF; zero means the
   gateway observed a complete empty body. It is intentionally not token
-  billing: bytes are not tokens, records are queued asynchronously and can be
-  lost on process exit, and files remain per-pod until Phase 6 aggregates them
-  durably. Startup preflights log destinations and rejects audit/usage aliases;
-  runtime logging has a bounded dedicated writer queue with rate-limited loss
-  warnings. Still missing: routing by model (there is exactly one upstream
+  billing: bytes are not tokens, and files remain per-pod until Phase 6
+  aggregates them durably. Startup preflights log destinations and rejects
+  audit/usage aliases; runtime logging has a bounded dedicated writer queue with
+  rate-limited loss warnings. A clean shutdown drains that queue before the
+  process exits, bounded by a five-second deadline after which it reports how
+  many accepted records were abandoned — so a rolling update no longer silently
+  truncates the tail of the evidence, though an abrupt crash still loses the
+  queue. Still missing: routing by model (there is exactly one upstream
   today). Still no state in replicas.
 5. **Model/catalog service — not started.** Promote model management out of
   ad-hoc `--model` + `/api/models/load` into a catalog that maps model → pool.

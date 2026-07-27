@@ -7,7 +7,7 @@ use axum::Router;
 use bytes::Bytes;
 use camelid_enterprise_gateway::{
     router as gateway_router, router_with_max_in_flight, router_with_options, GatewayAuth,
-    GatewayLog, OrgQuota, UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT,
+    GatewayLog, LogFlush, OrgQuota, UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT,
 };
 use futures_util::stream;
 use http_body_util::BodyExt;
@@ -123,6 +123,86 @@ async fn spawn_gateway_with_options(
 
 fn gateway_log(path: &Path) -> Arc<GatewayLog> {
     GatewayLog::open(path).unwrap()
+}
+
+#[tokio::test]
+async fn audit_records_survive_a_graceful_shutdown() {
+    // The gateway accepts audit records onto a bounded queue drained by a
+    // separate thread, so "the request was audited" and "the record is on
+    // disk" are different facts. On Kubernetes every rolling update SIGTERMs
+    // the pod, so the gap between them is ordinary operation rather than an
+    // edge case: without a drain at shutdown the tail of the log is silently
+    // missing, and an aggregator reading it cannot tell.
+    const REQUESTS: usize = 200;
+    let upstream =
+        spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let audit = gateway_log(&audit_path);
+
+    let upstream_origin = UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = router_with_options(
+        upstream_origin,
+        DEFAULT_MAX_IN_FLIGHT,
+        GatewayAuth::Disabled,
+        Some(Arc::clone(&audit)),
+    );
+    let (stop, stopped) = oneshot::channel::<()>();
+    let served = tokio::spawn(async move {
+        camelid_enterprise_gateway::serve(listener, router, Duration::from_secs(30), async {
+            let _ = stopped.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    for _ in 0..REQUESTS {
+        let response = client()
+            .request(
+                Request::get(format!("http://{addr}/v1/models"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    // Shut down exactly as the binary does: stop accepting, drain connections,
+    // and only then drain the log.
+    stop.send(()).unwrap();
+    served.await.unwrap();
+    assert_eq!(
+        audit.flush_and_stop(Duration::from_secs(30)),
+        LogFlush::Drained
+    );
+
+    // Read once, with no retry loop. Polling until the writer catches up would
+    // pass with or without the drain and would test nothing.
+    let contents = std::fs::read_to_string(&audit_path).unwrap();
+    let lines: Vec<&str> = contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        lines.len(),
+        REQUESTS,
+        "every audited request must be on disk after shutdown drains the log"
+    );
+    let ids: std::collections::HashSet<String> = lines
+        .iter()
+        .map(|line| {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            record["request_id"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(
+        ids.len(),
+        REQUESTS,
+        "each record must be a distinct request"
+    );
 }
 
 fn client() -> Client<HttpConnector, Body> {
