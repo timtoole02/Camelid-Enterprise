@@ -367,14 +367,20 @@ async fn serve(
     // it: an operator comparing this line against their manifest can see the
     // mismatch that would otherwise only show up as a quietly truncated log.
     let configured_logs = u64::from(audit_sink.is_some()) + u64::from(usage_sink.is_some());
+    // Computed before the macro, not inside it. `tracing` only evaluates field
+    // expressions when the level is enabled, so arithmetic left in the macro
+    // runs or does not run depending on `RUST_LOG` -- which would make whether
+    // this process starts a function of how it is configured to log. Saturating
+    // because `--max-connection-seconds` is an unbounded `u64` and a caller may
+    // pass one whose budget is not representable.
+    let required_budget = required_shutdown_budget_seconds(max_connection_seconds, configured_logs);
     tracing::info!(
         %addr,
         max_in_flight = max_in_flight.get(),
         max_connection_seconds,
         log_flush_deadline_seconds = DEFAULT_LOG_FLUSH_DEADLINE.as_secs(),
         configured_logs,
-        required_shutdown_budget_seconds =
-            max_connection_seconds + configured_logs * DEFAULT_LOG_FLUSH_DEADLINE.as_secs(),
+        required_shutdown_budget_seconds = required_budget,
         "gateway listening; termination grace period must exceed the required \
          shutdown budget or logs will be killed mid-drain"
     );
@@ -394,6 +400,20 @@ async fn serve(
     flush_gateway_log("usage", usage_sink);
     served?;
     Ok(())
+}
+
+/// Seconds a deployment must allow between SIGTERM and SIGKILL for the gateway
+/// to finish shutting down: the connection drain, then one flush deadline per
+/// configured JSONL log.
+///
+/// Saturating rather than checked. This is a diagnostic an operator compares
+/// against their orchestrator's grace period, and a nonsensical connection cap
+/// should produce a nonsensical-looking budget, not stop the gateway from
+/// starting. `u64::MAX` seconds is already unsatisfiable by any grace period,
+/// which is the message either way.
+fn required_shutdown_budget_seconds(max_connection_seconds: u64, configured_logs: u64) -> u64 {
+    max_connection_seconds
+        .saturating_add(configured_logs.saturating_mul(DEFAULT_LOG_FLUSH_DEADLINE.as_secs()))
 }
 
 /// Drains one JSONL sink at shutdown and reports what happened.
@@ -741,6 +761,23 @@ mod tests {
             "usage.jsonl",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn shutdown_budget_saturates_instead_of_overflowing() {
+        // The connection cap is an unbounded `u64` from the CLI. Computing the
+        // budget with `+` overflowed, and because `tracing` only evaluates
+        // field expressions when the level is enabled, that made startup
+        // succeed or panic depending on `RUST_LOG` -- logging configuration
+        // deciding process correctness.
+        assert_eq!(required_shutdown_budget_seconds(300, 2), 310);
+        assert_eq!(required_shutdown_budget_seconds(300, 0), 300);
+        assert_eq!(required_shutdown_budget_seconds(u64::MAX, 2), u64::MAX);
+        assert_eq!(
+            required_shutdown_budget_seconds(u64::MAX, u64::MAX),
+            u64::MAX
+        );
+        assert_eq!(required_shutdown_budget_seconds(0, u64::MAX), u64::MAX);
     }
 
     #[test]
