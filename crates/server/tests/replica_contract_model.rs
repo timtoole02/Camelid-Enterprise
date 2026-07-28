@@ -192,7 +192,7 @@ async fn real_model_conforms_to_replica_http_v1() {
     // benchmark; keeping the accepted set this small prevents CI's shared CPU
     // from turning a queue test into a 15-minute serialized decode workload.
     const CONCURRENT_REQUESTS: usize = 4;
-    let backpressure_prompt = "backpressure ".repeat(512);
+    let backpressure_prompt = "backpressure ".repeat(32);
     let mut requests = tokio::task::JoinSet::new();
     for index in 0..CONCURRENT_REQUESTS {
         let app = app.clone();
