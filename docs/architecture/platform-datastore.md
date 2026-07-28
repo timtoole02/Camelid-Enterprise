@@ -32,7 +32,7 @@ Identity data — principals, organizations, tokens — is deliberately **not** 
 that list. It has a store already, and §5 explains why moving it is a separate
 decision that Phase 6 does not wait on.
 
-Three of those four are multi-writer by construction.
+These workloads are multi-writer by construction.
 
 ## 2. The evidence already in this repo
 
