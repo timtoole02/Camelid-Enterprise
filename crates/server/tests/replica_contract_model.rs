@@ -1,6 +1,7 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
 use camelid_enterprise::{apply_deterministic, attributed_router};
+use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -185,19 +186,18 @@ async fn real_model_conforms_to_replica_http_v1() {
         serde_json::from_str::<Value>(event).expect("every data event before [DONE] is JSON");
     }
 
-    // The worker is running plus one configured queue slot. Four requests with
-    // a deliberately nontrivial prompt therefore prove both acceptance and
-    // typed queue-full rejection while at most two requests can reach decode.
-    // This is a behavioral test of bounded backpressure, not a throughput
-    // benchmark; keeping the accepted set this small prevents CI's shared CPU
-    // from turning a queue test into a 15-minute serialized decode workload.
+    // The worker is running plus one configured queue slot. Streaming handlers
+    // post their decode job before returning an SSE response, so four concurrent
+    // streaming requests prove both acceptance and typed queue-full rejection
+    // without waiting for completed model generations. Polling each accepted
+    // body's initial role frame activates its cancellation guard; dropping the
+    // bodies then proves queue-depth recovery without turning this admission
+    // test into a hardware-duration benchmark.
     const CONCURRENT_REQUESTS: usize = 4;
-    let backpressure_prompt = "backpressure ".repeat(32);
     let mut requests = tokio::task::JoinSet::new();
     for index in 0..CONCURRENT_REQUESTS {
         let app = app.clone();
         let model_id = model_id.to_string();
-        let backpressure_prompt = backpressure_prompt.clone();
         requests.spawn(async move {
             send(
                 app,
@@ -207,11 +207,14 @@ async fn real_model_conforms_to_replica_http_v1() {
                         "model": model_id,
                         "messages": [{
                             "role": "user",
-                            "content": format!("{backpressure_prompt} {index}")
+                            "content": format!("queue admission probe {index}")
                         }],
                         "temperature": 0,
-                        "max_tokens": 1,
-                        "stream": false
+                        // Long enough to keep the first posted decode active
+                        // while the concurrent handlers submit their jobs, but
+                        // this test never waits for generation completion.
+                        "max_tokens": 128,
+                        "stream": true
                     }),
                 ),
             )
@@ -221,13 +224,31 @@ async fn real_model_conforms_to_replica_http_v1() {
 
     let mut accepted = 0;
     let mut rejected = 0;
+    let mut accepted_bodies = Vec::new();
     while let Some(result) = requests.join_next().await {
         let response = result.unwrap();
         assert_attribution(&response, &expected_sha);
         match response.status() {
             StatusCode::OK => {
                 accepted += 1;
-                body_json(response).await;
+                assert!(response.headers()[CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/event-stream"));
+                let mut body = response.into_body();
+                let role = tokio::time::timeout(STEP_TIMEOUT, body.frame())
+                    .await
+                    .expect("SSE role frame exceeded 600 seconds")
+                    .expect("SSE stream ended before its role frame")
+                    .expect("SSE role frame failed")
+                    .into_data()
+                    .expect("SSE role frame must be data");
+                assert!(
+                    String::from_utf8_lossy(&role).contains("assistant"),
+                    "unexpected initial SSE role frame: {:?}",
+                    role
+                );
+                accepted_bodies.push(body);
             }
             StatusCode::SERVICE_UNAVAILABLE => {
                 rejected += 1;
@@ -246,7 +267,25 @@ async fn real_model_conforms_to_replica_http_v1() {
     assert!(rejected > 0);
     assert_eq!(accepted + rejected, CONCURRENT_REQUESTS);
 
-    let recovered = send(app, Request::get("/v1/health").body(Body::empty()).unwrap()).await;
-    assert_eq!(recovered.status(), StatusCode::OK);
-    assert_eq!(body_json(recovered).await["engine_queue_depth"], 0);
+    // Drops fire the per-stream cancellation guards. The engine observes the
+    // token before its next decode step, then drains cancelled queued jobs.
+    drop(accepted_bodies);
+
+    let deadline = std::time::Instant::now() + STEP_TIMEOUT;
+    loop {
+        let recovered = send(
+            app.clone(),
+            Request::get("/v1/health").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        if body_json(recovered).await["engine_queue_depth"] == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "engine queue depth did not recover after cancelling accepted streams"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
