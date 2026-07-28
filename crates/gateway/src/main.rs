@@ -2,7 +2,8 @@ use camelid_enterprise_gateway::{
     router_with_model_catalog, router_with_options, GatewayAuth, GatewayLog, LogFlush,
     ModelCatalog, ModelSelectionLimits, OrgQuota, UpstreamOrigin, VerifiedModelCatalog,
     DEFAULT_LOG_FLUSH_DEADLINE, DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT,
-    DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES, DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES,
+    DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES, DEFAULT_MAX_ORG_MODEL_SELECTIONS,
+    DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES,
 };
 use clap::{Parser, Subcommand};
 use identity::{OrganizationId, PrincipalId, RotationLifetime, SqliteIdentityStore, TokenLifetime};
@@ -46,7 +47,7 @@ enum Command {
         )]
         max_model_selection_body_bytes: NonZeroUsize,
         /// Total memory reserved for concurrently materialized catalog selector
-        /// bodies. Must be at least --max-model-selection-body-bytes. The
+        /// bodies. Must be at least 2 * --max-model-selection-body-bytes. The
         /// gateway permits `budget / (2 * max-body)` selector bodies at once,
         /// reserving space for a decoded escaped model id.
         #[arg(
@@ -55,6 +56,15 @@ enum Command {
             env = "CAMELID_GATEWAY_MODEL_SELECTION_MEMORY_BUDGET_BYTES"
         )]
         model_selection_memory_budget_bytes: NonZeroUsize,
+        /// Maximum catalog selector bodies one authenticated organization may
+        /// materialize concurrently. Omitted defaults to one, so one tenant's
+        /// stalled body cannot monopolize the global selector memory budget.
+        #[arg(
+            long,
+            env = "CAMELID_GATEWAY_MAX_ORG_MODEL_SELECTIONS",
+            requires = "identity_db"
+        )]
+        max_org_model_selections: Option<NonZeroUsize>,
         /// Bind address for client traffic.
         #[arg(long, default_value = "127.0.0.1:8080", env = "CAMELID_GATEWAY_ADDR")]
         addr: SocketAddr,
@@ -237,6 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model_route,
             max_model_selection_body_bytes,
             model_selection_memory_budget_bytes,
+            max_org_model_selections,
             addr,
             max_in_flight,
             max_connection_seconds,
@@ -251,6 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 model_routes: model_route,
                 max_model_selection_body_bytes,
                 model_selection_memory_budget_bytes,
+                max_org_model_selections,
                 addr,
                 max_in_flight,
                 max_connection_seconds,
@@ -328,6 +340,7 @@ struct ServeArgs {
     model_routes: Vec<String>,
     max_model_selection_body_bytes: NonZeroUsize,
     model_selection_memory_budget_bytes: NonZeroUsize,
+    max_org_model_selections: Option<NonZeroUsize>,
     addr: SocketAddr,
     max_in_flight: NonZeroUsize,
     max_connection_seconds: u64,
@@ -417,6 +430,7 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         model_routes,
         max_model_selection_body_bytes,
         model_selection_memory_budget_bytes,
+        max_org_model_selections,
         addr,
         max_in_flight,
         max_connection_seconds,
@@ -494,9 +508,19 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 max_model_selection_body_bytes = selection_limits.max_body_bytes().get(),
                 model_selection_memory_budget_bytes = selection_limits.memory_budget_bytes().get(),
                 max_concurrent_model_selections = selection_limits.max_concurrent().get(),
+                max_org_model_selections = max_org_model_selections
+                    .unwrap_or(DEFAULT_MAX_ORG_MODEL_SELECTIONS)
+                    .get(),
                 "gateway static model catalog enabled"
             );
-            router_with_model_catalog(catalog, max_in_flight, selection_limits, auth, audit)
+            router_with_model_catalog(
+                catalog,
+                max_in_flight,
+                selection_limits,
+                max_org_model_selections,
+                auth,
+                audit,
+            )
         }
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -797,6 +821,7 @@ mod tests {
             model_route,
             max_model_selection_body_bytes,
             model_selection_memory_budget_bytes,
+            max_org_model_selections,
             ..
         } = cli.command
         else {
@@ -812,6 +837,7 @@ mod tests {
             model_selection_memory_budget_bytes,
             DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES
         );
+        assert_eq!(max_org_model_selections, None);
         let routing = parse_serve_routing(upstream, model_route).unwrap();
         assert!(matches!(routing, ConfiguredServeRouting::Catalog(_)));
 
@@ -824,6 +850,34 @@ mod tests {
             "alpha=http://127.0.0.1:8181",
         ])
         .is_err());
+        assert!(Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--model-route",
+            "alpha=http://127.0.0.1:8181",
+            "--max-org-model-selections",
+            "2",
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--model-route",
+            "alpha=http://127.0.0.1:8181",
+            "--identity-db",
+            "identity.sqlite",
+            "--max-org-model-selections",
+            "2",
+        ])
+        .unwrap();
+        let Command::Serve {
+            max_org_model_selections,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the parsed command to be Serve");
+        };
+        assert_eq!(max_org_model_selections, NonZeroUsize::new(2));
         assert!(Cli::try_parse_from(["camelid-enterprise-gateway", "serve"]).is_err());
         assert!(Cli::try_parse_from([
             "camelid-enterprise-gateway",

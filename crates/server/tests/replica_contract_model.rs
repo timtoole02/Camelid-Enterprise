@@ -7,13 +7,12 @@ use std::time::Duration;
 use tower::ServiceExt;
 
 const MODEL_ENV: &str = "CAMELID_ENTERPRISE_TEST_MODEL";
-// The deterministic lane serializes generation, so the queue-saturation test
-// spawns concurrent requests that decode one at a time behind a shared lock.
-// Each task's timeout is measured from spawn, so a task queued behind many
-// slow decodes on constrained CI hardware can wait well past its own decode
-// time. This bound is a hang detector, not a performance target; the CI job's
-// own timeout-minutes remains the real ceiling on total wall-clock time.
-const STEP_TIMEOUT: Duration = Duration::from_secs(900);
+// The deterministic lane serializes generation. This test configures the
+// engine's bounded queue to one slot before building AppState, so its
+// saturation probe can prove typed backpressure with at most two accepted
+// generations rather than queuing a long serialized batch on shared CI.
+const STEP_TIMEOUT: Duration = Duration::from_secs(600);
+const ENGINE_QUEUE_DEPTH_ENV: &str = "CAMELID_QUEUE_DEPTH";
 
 async fn body_json(response: axum::response::Response) -> Value {
     let bytes = tokio::time::timeout(
@@ -60,9 +59,20 @@ async fn real_model_conforms_to_replica_http_v1() {
     .unwrap_or_else(|error| panic!("could not resolve {MODEL_ENV}: {error}"));
     let config = apply_deterministic().expect("the test process must apply the lane contract");
     let expected_sha = config.sha256.clone();
+    // EngineHandle reads this setting while AppState is built. This ignored
+    // model test is run as the sole test in its binary (`--exact
+    // --test-threads=1` in CI), so temporarily setting the process environment
+    // cannot affect another test. Restore any caller-provided value immediately
+    // after the worker has captured it.
+    let prior_queue_depth = std::env::var_os(ENGINE_QUEUE_DEPTH_ENV);
+    std::env::set_var(ENGINE_QUEUE_DEPTH_ENV, "1");
     let state = camelid::api::AppState::with_configured_threads(Some(4))
         .with_default_enable_thinking(false)
         .with_models_dir(None);
+    match prior_queue_depth {
+        Some(value) => std::env::set_var(ENGINE_QUEUE_DEPTH_ENV, value),
+        None => std::env::remove_var(ENGINE_QUEUE_DEPTH_ENV),
+    }
     let app = attributed_router(state, config.sha256, "contract-test/host".to_string(), None);
 
     let load = send(
@@ -175,18 +185,19 @@ async fn real_model_conforms_to_replica_http_v1() {
         serde_json::from_str::<Value>(event).expect("every data event before [DONE] is JSON");
     }
 
-    // 12, not 16: this must comfortably exceed the engine's admission
-    // capacity (observed at 9 elsewhere in this suite) so both the accepted
-    // and rejected branches below are exercised, while keeping the total
-    // serialized decode queue as short as the assertions allow. Constrained
-    // CI hardware pays for every admitted request's decode sequentially
-    // (the deterministic lane serializes generation), so queue depth is the
-    // single biggest lever on this test's wall-clock cost.
-    const CONCURRENT_REQUESTS: usize = 12;
+    // The worker is running plus one configured queue slot. Four requests with
+    // a deliberately nontrivial prompt therefore prove both acceptance and
+    // typed queue-full rejection while at most two requests can reach decode.
+    // This is a behavioral test of bounded backpressure, not a throughput
+    // benchmark; keeping the accepted set this small prevents CI's shared CPU
+    // from turning a queue test into a 15-minute serialized decode workload.
+    const CONCURRENT_REQUESTS: usize = 4;
+    let backpressure_prompt = "backpressure ".repeat(512);
     let mut requests = tokio::task::JoinSet::new();
     for index in 0..CONCURRENT_REQUESTS {
         let app = app.clone();
         let model_id = model_id.to_string();
+        let backpressure_prompt = backpressure_prompt.clone();
         requests.spawn(async move {
             send(
                 app,
@@ -196,14 +207,10 @@ async fn real_model_conforms_to_replica_http_v1() {
                         "model": model_id,
                         "messages": [{
                             "role": "user",
-                            "content": format!("Count briefly: {index}")
+                            "content": format!("{backpressure_prompt} {index}")
                         }],
                         "temperature": 0,
-                        // Minimal: this section only needs to prove
-                        // admission/rejection/attribution/recovery, not
-                        // generation quality. Every extra token here is paid
-                        // for once per admitted request, serialized.
-                        "max_tokens": 2,
+                        "max_tokens": 1,
                         "stream": false
                     }),
                 ),

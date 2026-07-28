@@ -55,6 +55,11 @@ pub const DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES: NonZeroUsize =
 /// selector bodies in memory than this declared budget allows.
 pub const DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES: NonZeroUsize =
     NonZeroUsize::new(32 * 1024 * 1024).unwrap();
+/// Authenticated catalog mode allows this many concurrently materialized
+/// selector bodies per organization unless the operator configures a higher
+/// explicit bound. The selector phase is normally short; one is sufficient to
+/// prevent one tenant's stalled body from occupying every global memory slot.
+pub const DEFAULT_MAX_ORG_MODEL_SELECTIONS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 /// How long shutdown waits for each JSONL log to drain what it already
 /// accepted. Deliberately short relative to a termination grace period: the
 /// point is to save the queue in the ordinary case, not to let a stuck
@@ -684,6 +689,7 @@ enum UpstreamRouting {
         catalog: VerifiedModelCatalog,
         selection_limits: ModelSelectionLimits,
         selection_admission: Arc<Semaphore>,
+        org_selection_admission: Option<Arc<OrgSelectionAdmission>>,
     },
 }
 
@@ -726,6 +732,69 @@ pub struct OrgQuota {
     limit: NonZeroU32,
     window: Duration,
     windows: Mutex<HashMap<String, OrgWindow>>,
+}
+
+/// Per-organization concurrency bound for catalog selector bodies. This is
+/// separate from [`OrgQuota`]: a selector is charged to quota only after it
+/// proves routable, but a tenant must not be able to keep an incomplete body
+/// open and monopolize global selector memory while remaining quota-free.
+struct OrgSelectionAdmission {
+    limit: NonZeroUsize,
+    in_flight: Mutex<HashMap<String, usize>>,
+}
+
+/// Releases one organization selector slot when the request finishes selection
+/// or its task is cancelled. It intentionally covers only the bounded body-read
+/// phase, never inference or a response stream.
+struct OrgSelectionPermit {
+    admission: Arc<OrgSelectionAdmission>,
+    organization: String,
+}
+
+impl OrgSelectionAdmission {
+    fn new(limit: NonZeroUsize) -> Self {
+        Self {
+            limit,
+            in_flight: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn try_acquire(
+        self: &Arc<Self>,
+        organization: &OrganizationId,
+    ) -> Result<OrgSelectionPermit, ()> {
+        let mut in_flight = GatewayLog::locked(&self.in_flight);
+        let count = in_flight
+            .entry(organization.as_str().to_string())
+            .or_insert(0);
+        if *count >= self.limit.get() {
+            return Err(());
+        }
+        *count += 1;
+        Ok(OrgSelectionPermit {
+            admission: Arc::clone(self),
+            organization: organization.as_str().to_string(),
+        })
+    }
+
+    fn release(&self, organization: &str) {
+        let mut in_flight = GatewayLog::locked(&self.in_flight);
+        let Some(count) = in_flight.get_mut(organization) else {
+            debug_assert!(false, "organization selector permit released twice");
+            return;
+        };
+        debug_assert!(*count > 0, "organization selector count must be positive");
+        *count -= 1;
+        if *count == 0 {
+            in_flight.remove(organization);
+        }
+    }
+}
+
+impl Drop for OrgSelectionPermit {
+    fn drop(&mut self) {
+        self.admission.release(&self.organization);
+    }
 }
 
 struct OrgWindow {
@@ -855,14 +924,21 @@ pub fn router_with_model_catalog(
     catalog: VerifiedModelCatalog,
     max_in_flight: NonZeroUsize,
     selection_limits: ModelSelectionLimits,
+    max_org_model_selections: Option<NonZeroUsize>,
     auth: GatewayAuth,
     audit: Option<Arc<GatewayLog>>,
 ) -> Router {
+    let org_selection_admission = matches!(&auth, GatewayAuth::RequireToken { .. }).then(|| {
+        Arc::new(OrgSelectionAdmission::new(
+            max_org_model_selections.unwrap_or(DEFAULT_MAX_ORG_MODEL_SELECTIONS),
+        ))
+    });
     router_with_routing_options(
         UpstreamRouting::Catalog {
             catalog,
             selection_admission: Arc::new(Semaphore::new(selection_limits.max_concurrent().get())),
             selection_limits,
+            org_selection_admission,
         },
         max_in_flight,
         auth,
@@ -1015,9 +1091,11 @@ async fn proxy_request(
 
     // Catalog selection happens after authentication, so an authenticated
     // deployment does not disclose its model inventory to an unauthenticated
-    // caller. A separate selector-work semaphore bounds body materialization
-    // before an origin is known; the inference admission permit remains free
-    // until selection succeeds, and quota remains free for invalid selectors.
+    // caller. Per-organization capacity is acquired before the global
+    // selector-work semaphore: one tenant's stalled body cannot take every
+    // global slot while invalid selectors remain quota-free. Both permits cover
+    // only body materialization; inference admission stays free until selection
+    // succeeds.
     let selector_permit =
         if let Some(selector_admission) = state.routing.catalog_selection_admission(&request) {
             if !has_json_content_type(request.headers()) {
@@ -1040,8 +1118,48 @@ async fn proxy_request(
                     refusal.response,
                 );
             }
+            let org_selector_permit = if let (Some(identity), Some(admission)) = (
+                identity.as_ref(),
+                state.routing.organization_selection_admission(&request),
+            ) {
+                match admission.try_acquire(identity.organization_id()) {
+                    Ok(permit) => Some(permit),
+                    Err(()) => {
+                        let mut response = gateway_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "gateway organization model selection limit reached",
+                        );
+                        let (low, high) = RETRY_AFTER_JITTER_SECONDS;
+                        let retry_after = fastrand::u8(low..=high);
+                        response.headers_mut().insert(
+                            "retry-after",
+                            HeaderValue::from_str(&retry_after.to_string())
+                                .expect("a small decimal integer is a valid header value"),
+                        );
+                        return audited(
+                            &state,
+                            AuditedRequest {
+                                request_id: &request_id,
+                                identity: Some(identity),
+                                reason: Some("organization_model_selection_overloaded"),
+                                method: &method,
+                                path: &path,
+                                model_id: None,
+                                usage: None,
+                                request_metrics: None,
+                                connection_termination: connection_termination.clone(),
+                                started_ts,
+                                started_at,
+                            },
+                            response,
+                        );
+                    }
+                }
+            } else {
+                None
+            };
             match selector_admission.try_acquire_owned() {
-                Ok(permit) => Some(permit),
+                Ok(permit) => Some((org_selector_permit, permit)),
                 Err(_) => {
                     let mut response = gateway_error(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -1316,6 +1434,26 @@ impl UpstreamRouting {
                 ) =>
             {
                 Some(Arc::clone(selection_admission))
+            }
+            Self::Passthrough(_) | Self::Catalog { .. } => None,
+        }
+    }
+
+    fn organization_selection_admission(
+        &self,
+        request: &Request,
+    ) -> Option<Arc<OrgSelectionAdmission>> {
+        match self {
+            Self::Catalog {
+                org_selection_admission,
+                ..
+            } if request.method() == Method::POST
+                && matches!(
+                    request.uri().path(),
+                    "/v1/completions" | "/v1/chat/completions"
+                ) =>
+            {
+                org_selection_admission.clone()
             }
             Self::Passthrough(_) | Self::Catalog { .. } => None,
         }

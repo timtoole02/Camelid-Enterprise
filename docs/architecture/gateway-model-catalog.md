@@ -55,6 +55,14 @@ unsupported media type are rejected before quota, inference admission, and
 forwarding. This is a deliberate availability bound, not an attempt to validate
 the full inference schema: the pinned replica remains authoritative for that.
 
+With `--identity-db`, catalog mode also limits each organization to one
+concurrent selector body by default (`--max-org-model-selections` changes that
+bound). This permit is acquired after authentication and before global selector
+memory. It prevents one tenant's incomplete JSON body from occupying every
+global selector slot, while malformed or unknown selectors remain quota-free.
+The per-organization limit is per gateway process, like the fixed-window quota;
+it is not distributed policy or billing state.
+
 `/v1/health` and the currently unsupported compatibility POST routes have no
 model selection contract. Catalog mode returns typed `501` for them rather than
 arbitrarily choosing a pool or claiming aggregate readiness. `/healthz` remains
@@ -78,8 +86,9 @@ The tests use two real TCP upstream servers and cover model-specific routing,
 query-parameter non-override, stable local discovery, exact backend-id
 verification, malformed/missing/unknown/oversized selector rejection, strict
 media types, no-upstream-call failure paths, stalled-body selector saturation,
-authentication-before-discovery, quota preservation for invalid requests,
-streaming response preservation, and matching audit/usage model identities. A
+authentication-before-discovery, cross-organization selector fairness, quota
+preservation for invalid requests, streaming response preservation, and matching
+audit/usage model identities. A
 separate ignored real-GGUF test starts the attributed replica over TCP, discovers
 its actual model id, preflights the catalog, generates through the gateway, and
 joins its audit evidence to the replica receipt; CI runs it when gateway code

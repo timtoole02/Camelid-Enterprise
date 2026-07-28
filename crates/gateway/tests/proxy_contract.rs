@@ -187,7 +187,8 @@ async fn spawn_catalog_gateway_with_audit(
     let catalog = catalog.verify_backend_model_ids().await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router = router_with_model_catalog(catalog, max_in_flight, selection_limits, auth, audit);
+    let router =
+        router_with_model_catalog(catalog, max_in_flight, selection_limits, None, auth, audit);
     let task = tokio::spawn(async move {
         camelid_enterprise_gateway::serve(
             listener,
@@ -2692,6 +2693,7 @@ async fn catalog_selector_work_is_bounded_while_a_request_body_stalls() {
             NonZeroUsize::new(2048).unwrap(),
         )
         .unwrap(),
+        None,
         GatewayAuth::Disabled,
         None,
     );
@@ -2755,6 +2757,141 @@ async fn catalog_selector_work_is_bounded_while_a_request_body_stalls() {
         .unwrap();
     assert_eq!(recovered.status(), StatusCode::NO_CONTENT);
     assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn catalog_selector_capacity_is_fair_across_authenticated_organizations() {
+    let upstream_calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(
+        Router::new()
+            .route(
+                "/v1/models",
+                any(|| async { catalog_model_list_response("alpha") }),
+            )
+            .fallback(any({
+                let upstream_calls = Arc::clone(&upstream_calls);
+                move || {
+                    let upstream_calls = Arc::clone(&upstream_calls);
+                    async move {
+                        upstream_calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            })),
+    )
+    .await;
+    let catalog = ModelCatalog::new([(
+        "alpha".to_string(),
+        UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap(),
+    )])
+    .unwrap()
+    .verify_backend_model_ids()
+    .await
+    .unwrap();
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let tenant_a = store.create_user("tenant-a").unwrap();
+    let token_a = store.issue_token(&tenant_a, TokenLifetime::Never).unwrap();
+    let tenant_b = store.create_user("tenant-b").unwrap();
+    let token_b = store.issue_token(&tenant_b, TokenLifetime::Never).unwrap();
+    let app = router_with_model_catalog(
+        catalog,
+        DEFAULT_MAX_IN_FLIGHT,
+        ModelSelectionLimits::new(
+            NonZeroUsize::new(1024).unwrap(),
+            NonZeroUsize::new(4096).unwrap(),
+        )
+        .unwrap(),
+        None,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: Some(Arc::new(OrgQuota::new(
+                NonZeroU32::new(1).unwrap(),
+                NonZeroU64::new(60).unwrap(),
+            ))),
+            usage: None,
+        },
+        None,
+    );
+
+    let selector_started = Arc::new(Notify::new());
+    let wait_for_selector = selector_started.notified();
+    let stalled_body = Body::from_stream(
+        stream::once({
+            let selector_started = Arc::clone(&selector_started);
+            async move {
+                selector_started.notify_one();
+                Ok::<Bytes, Infallible>(Bytes::from_static(b"{\"model\":\"alpha\""))
+            }
+        })
+        .chain(stream::pending::<Result<Bytes, Infallible>>()),
+    );
+    let tenant_a_stalled = tokio::spawn({
+        let app = app.clone();
+        let token_a = token_a.clone();
+        async move {
+            app.oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("authorization", format!("Bearer {token_a}"))
+                    .header("content-type", "application/json")
+                    .body(stalled_body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+    wait_for_selector.await;
+
+    let tenant_a_rejected = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("authorization", format!("Bearer {token_a}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tenant_a_rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        to_bytes(Body::new(tenant_a_rejected.into_body()), 1024)
+            .await
+            .unwrap(),
+        r#"{"error":{"message":"gateway organization model selection limit reached","type":"gateway_error"}}"#
+    );
+
+    let tenant_b_accepted = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("authorization", format!("Bearer {token_b}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tenant_b_accepted.status(), StatusCode::NO_CONTENT);
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+
+    // The incomplete selector was intentionally quota-free, but it can no
+    // longer keep tenant A's organization from issuing another request once
+    // its selector slot is released.
+    tenant_a_stalled.abort();
+    let _ = tenant_a_stalled.await;
+    let tenant_a_recovered = app
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("authorization", format!("Bearer {token_a}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tenant_a_recovered.status(), StatusCode::NO_CONTENT);
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

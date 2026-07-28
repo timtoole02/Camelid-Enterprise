@@ -113,6 +113,14 @@ compatibility POST routes return typed `501` rather than being sent to an
 arbitrary pool; `/healthz` remains the gateway liveness endpoint. Catalog
 discovery reports configured inventory, not replica readiness.
 
+When identity is enabled, an organization also receives one concurrent catalog
+selector by default (`--max-org-model-selections` /
+`CAMELID_GATEWAY_MAX_ORG_MODEL_SELECTIONS` changes it). This per-process permit
+is acquired before the global selector memory slot, so one tenant's incomplete
+body cannot starve another tenant's valid selection. It is intentionally
+separate from request quota: invalid selectors remain uncharged, but cannot
+monopolize selector capacity.
+
 Authentication runs before catalog selection, so an authenticated deployment
 does not disclose model inventory to an anonymous caller. Catalog mode does
 not implement per-organization model permissions: every authenticated caller

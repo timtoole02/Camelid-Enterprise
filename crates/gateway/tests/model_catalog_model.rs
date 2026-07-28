@@ -154,6 +154,7 @@ async fn real_model_routes_through_a_verified_static_catalog() {
         catalog,
         DEFAULT_MAX_IN_FLIGHT,
         selection_limits,
+        None,
         GatewayAuth::Disabled,
         Some(GatewayLog::open(&audit_path).unwrap()),
     ))
