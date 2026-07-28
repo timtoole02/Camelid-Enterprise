@@ -25,6 +25,11 @@ mode. Authentication and per-organization quotas are optional in either mode;
 the manifest configures neither an identity database nor a quota, so keep both
 services on a trusted network until an operator supplies identity and enables
 authentication.
+Catalog ids are exact backend ids, not aliases: before binding, catalog mode
+queries each configured pool's `/v1/models` and refuses startup unless that
+pool advertises the configured id. This matters because selection forwards the
+client body unchanged; an alias would otherwise produce a late
+`model_not_found` from the correctly selected pool.
 With both an identity database and `CAMELID_GATEWAY_USAGE_LOG=<path>`, the
 gateway also writes an append-only JSONL terminal transport record for each
 authenticated, quota-admitted request:
@@ -92,9 +97,15 @@ are enabled.
 In transparent mode, request and response bodies remain streaming and opaque.
 Catalog mode keeps response bodies streaming and opaque, but materializes a
 JSON generation request up to `--max-model-selection-body-bytes` (2 MiB by
-default) to read its `model` field. It accepts `application/json` and
-`application/*+json`; malformed, missing, unknown, or oversized selectors are
-rejected before quota, admission, or any upstream call. Only
+default) to read its `model` field. A separate
+`--model-selection-memory-budget-bytes` limit (32 MiB by default) allows at
+most `memory_budget / (2 * max_body)` concurrent materialized selectors: 8 at
+the defaults. Each slot reserves a raw body plus a possible decoded escaped
+model-id copy. A stalled selector holds one of those slots, and a full selector
+budget returns typed `503` before another body is read. It accepts only
+`application/json` and `application/*+json`; malformed, missing, unknown,
+oversized, or other-media-type selectors are rejected before quota, inference
+admission, or any upstream call. Only
 `POST /v1/completions` and `POST /v1/chat/completions` are routable in catalog
 mode because the pinned Enterprise contract proves their JSON `model` field.
 Catalog discovery is served locally. `/v1/health` and the currently unsupported

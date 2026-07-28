@@ -61,7 +61,7 @@ deploy/
 | **Serving replica** | `crates/server` (`camelid-enterprise` bin) | CLI (`serve`), binds an HTTP listener, applies the deterministic lane, stamps attribution, loads one model at startup. |
 | **Lane / config freeze** | `crates/server/src/lane.rs` | Applies a canonical env-var configuration vector, fails closed on any override, publishes its SHA-256. Engine pinned by revision (`ENGINE_PIN`). |
 | **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-host` on every response, injects fields into completion bodies, writes optional JSONL serving receipts (each carrying the gateway-stamped `request_id` when present, or `null` for direct-to-replica traffic). |
-| **Gateway / static catalog** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Two mutually exclusive modes. Transparent `--upstream` mode forwards the full `/v1` allowlist derived from `replica_contract::PUBLIC_ROUTES`; static catalog mode maps operator-configured `--model-route <model-id>=<http://origin>` entries to replica pools. Catalog mode serves model discovery locally, and routes only completion/chat requests by a bounded JSON `model` selector; all other public routes are refused rather than sent to an arbitrary pool. Both modes preserve opaque streaming responses, filter hop-by-hop headers, retry nothing, bound concurrency, and expose no replica control routes. Auth is optional and runs before catalog selection; a selected `model_id` reaches gateway audit/usage records but never a replica. A catalog maps models to pools, not callers to models: every resolved token may use every catalog entry today. Accepted logs drain on clean shutdown within a bounded per-log deadline. |
+| **Gateway / static catalog** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Two mutually exclusive modes. Transparent `--upstream` mode forwards the full `/v1` allowlist derived from `replica_contract::PUBLIC_ROUTES`; static catalog mode maps operator-configured `--model-route <backend-model-id>=<http://origin>` entries to replica pools. Before binding, catalog mode verifies that each configured id is advertised by its mapped pool's `/v1/models`, so it never accepts a public alias then forwards an invalid unchanged request. It serves model discovery locally and routes only completion/chat requests by a bounded JSON `model` selector; all other public routes are refused rather than sent to an arbitrary pool. Selector work has a separate memory-derived semaphore, so body collection cannot bypass inference admission. Both modes preserve opaque streaming responses, filter hop-by-hop headers, retry nothing, bound concurrency, and expose no replica control routes. Auth is optional and runs before catalog selection; a selected `model_id` reaches gateway audit/usage records but never a replica. A catalog maps models to pools, not callers to models: every resolved token may use every catalog entry today. Accepted logs drain on clean shutdown within a bounded per-log deadline. |
 | **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | The gateway exposes `/v1/health`, model discovery, completions/chat, and the pinned engine's compatibility endpoints. Replica-local `/api` model management remains private. Provided by the pinned engine crate, **not** by this repo. |
 | **Engine core** | `crates/engine-core` | GGUF container, model config, tensor/forward/tokenizer types. Host-agnostic. |
 | **Platform kernels** | `crates/engine-{macos,linux,windows}` | Runtime CPU feature detection (`probe()`), platform kernels. macOS port landing first; Linux/Windows currently capability-detection only. |
@@ -83,9 +83,11 @@ deploy/
   federation layer.
 - **Gateway static model routing.** The gateway retains transparent fixed-origin
   mode for one replica or one K8s `Service`, and also has an immutable static
-  catalog mode for multiple operator-configured model-to-pool mappings. Catalog
-  mode performs bounded JSON selection only for completions/chat, serves model
-  discovery locally, and otherwise fails closed rather than guessing a pool.
+  catalog mode for multiple operator-configured exact backend-model-id-to-pool
+  mappings, validated against each pool's `/v1/models` before binding. Catalog
+  mode performs bounded JSON selection only for completions/chat, with a
+  separate memory-derived selector-work limit, serves model discovery locally,
+  and otherwise fails closed rather than guessing a pool.
   It has no dynamic catalog, pool-health aggregation, per-organization model
   authorization, or durable shared control-plane state.
 
@@ -192,9 +194,9 @@ tokens for one model"; everything multi-user is layered on top.
 | Service | Owns | Must never | Exists today? |
 |---|---|---|---|
 | **Inference Replica Pool** | Producing attributed tokens for exactly one model, one generation at a time; lane guarantee; attribution stamping. | Know about users, auth, or other models. Hold cross-request state. | **Yes** — `crates/server`. Reuse as-is. |
-| **Gateway / Control Plane** | Terminating client connections, authenticating requests, routing to the right model pool, quotas, rate limiting, usage metering. | Run inference. Store user credentials (delegates to Identity). | **Partial** — transparent forwarding, immutable static model-to-pool routing, admission control, opt-in bearer auth, per-organization request quotas, audit records, and raw terminal transport accounting exist. Dynamic catalog management, pool-health aggregation, per-organization model policy, durable shared quota state, and model-token metering do not. |
+| **Gateway / Control Plane** | Terminating client connections, authenticating requests, routing to the right model pool, quotas, rate limiting, usage metering. | Run inference. Store user credentials (delegates to Identity). | **Partial** — transparent forwarding, immutable static exact-backend-id-to-pool routing with pre-bind verification and memory-bounded selector work, admission control, opt-in bearer auth, per-organization request quotas, audit records, and raw terminal transport accounting exist. Dynamic catalog management, pool-health aggregation, per-organization model policy, durable shared quota state, and model-token metering do not. |
 | **Identity & Auth Service** | Users, orgs/teams, credentials, sessions, API tokens, roles/permissions. | Route inference or store conversation content. | **Partial** — local users, organizations, memberships, organization-scoped tokens, expiry, rotation, and revocation exist; no roles, sessions, remote refresh, or federation. |
-| **Model / Catalog Service** | Registry of available models, their files, and lifecycle (register, load target, retire); mapping model name → replica pool. | Serve inference itself. Own user data. | **Initial static slice** — the gateway owns an immutable startup catalog of public model id → pool mappings and local discovery. There is no durable registry, lifecycle, health aggregation, or dynamic reload. |
+| **Model / Catalog Service** | Registry of available models, their files, and lifecycle (register, load target, retire); mapping model name → replica pool. | Serve inference itself. Own user data. | **Initial static slice** — the gateway owns an immutable startup catalog of exact backend model id → pool mappings and local discovery; pre-bind verification proves the id exists in its pool. There is no durable registry, lifecycle, health aggregation, or dynamic reload. |
 | **Application Tier** | End-user experiences: WebUI, desktop app, agentic terminal, Kanban agents. | Bypass the gateway to reach replicas directly. | **External** — not in this repo. |
 | **Platform Data + Observability** | Aggregated audit/usage records, metering rollups, shared quota state, receipts, metrics, and logs. | Own identity records. Be reached directly by replicas or clients. | **Not built** — raw per-pod gateway logs, per-replica receipts, and stderr tracing exist, but the decided PostgreSQL aggregation store does not. |
 
@@ -350,24 +352,30 @@ tokens for one model"; everything multi-user is layered on top.
   the per-log deadlines, which the shipped manifest now does and the previous
   300s-against-300s configuration did not. An abrupt crash still loses the
   queue. **Initial static model routing is built:** `serve --model-route
-  <model-id>=<http://origin>` is mutually exclusive with `--upstream`; it
-  validates an immutable model id to pool map at startup, serves `/v1/models`
-  and `/v1/models/{model}` from that map, and routes only `/v1/completions` and
-  `/v1/chat/completions` by their required bounded JSON `model` field. The
-  selector cannot choose an origin, selection happens after authentication but
-  before quota/admission, responses remain streaming, and each selected id is
-  added to gateway audit/usage evidence. Requests with malformed, missing,
-  unknown, or oversized selectors reach neither a pool nor a quota counter;
-  failed generations are not retried. Catalog mode deliberately returns typed
-  `501` for `/v1/health` and compatibility POST routes whose contract does not
-  prove a model selector, rather than pretending to aggregate pool health or
-  guessing a destination. It is **not** model authorization: every resolved
-  token can use every configured entry. Still no state in replicas.
+  <backend-model-id>=<http://origin>` is mutually exclusive with `--upstream`;
+  before binding it verifies that every configured id is advertised by its
+  mapped pool's `/v1/models`, then serves `/v1/models` and
+  `/v1/models/{model}` from the immutable map. It routes only
+  `/v1/completions` and `/v1/chat/completions` by their required bounded JSON
+  `model` field. Selector work has a separate memory-derived semaphore, so
+  stalled bodies cannot bypass a bounded number of materializations; the
+  default 32 MiB selector budget and 2 MiB request limit allow 8 selectors;
+  each reservation covers a raw body and a possible decoded escaped model id.
+  The selector cannot choose an origin, selection happens after authentication
+  but before quota/inference admission, responses remain streaming, and each
+  selected id is added to gateway audit/usage evidence. Requests with malformed,
+  missing, unknown, oversized, or non-`application/*` media-type selectors
+  reach neither a pool nor a quota counter; failed generations are not retried.
+  Catalog mode deliberately returns typed `501` for `/v1/health` and
+  compatibility POST routes whose contract does not prove a model selector,
+  rather than pretending to aggregate pool health or guessing a destination.
+  It is **not** model authorization: every resolved token can use every
+  configured entry. Still no state in replicas.
 5. **Model/catalog service — initial static routing slice implemented.** The
   gateway now owns an operator-configured, process-lifetime catalog mapping a
-  public model id to one replica pool; catalog discovery is stable and local.
-  This does not yet promote ad-hoc `--model` + `/api/models/load` into a model
-  management service. Still missing: durable registry and lifecycle APIs,
+  exact backend model id to one replica pool; catalog discovery is stable and
+  local. This does not yet promote ad-hoc `--model` + `/api/models/load` into a
+  model management service. Still missing: durable registry and lifecycle APIs,
   upload/registration workflow, dynamic reload, pool-health aggregation,
   failover, per-organization model policy, and a durable catalog store. The
   exact current routing contract is `gateway-model-catalog.md`.

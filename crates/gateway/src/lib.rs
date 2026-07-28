@@ -14,7 +14,7 @@ use axum::routing::{get, MethodRouter};
 use axum::{Extension, Json, Router};
 use bytes::Buf;
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use http_body_util::LengthLimitError;
+use http_body_util::{BodyExt as _, LengthLimitError, Limited};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
@@ -22,6 +22,7 @@ use identity::{AuthenticatedContext, IdentityError, OrganizationId, SqliteIdenti
 use pin_project_lite::pin_project;
 use replica_contract::{HttpMethod, RouteSpec};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, Write};
@@ -41,11 +42,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IDLE_PER_HOST: usize = 32;
 const MAX_PENDING_LOG_RECORDS: usize = 1_024;
+const CATALOG_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CATALOG_DISCOVERY_BODY_BYTES: usize = 1024 * 1024;
 /// The largest JSON generation request catalog mode will materialize to select
 /// its model. This is an explicit bound: without it, a caller could make the
 /// gateway allocate arbitrarily before it knows which replica pool to use.
 pub const DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES: NonZeroUsize =
     NonZeroUsize::new(2 * 1024 * 1024).unwrap();
+/// Total bytes catalog mode reserves for concurrently materialized selector
+/// bodies. The selector semaphore capacity is
+/// `memory_budget / max_body_bytes`, so the gateway never has more bounded
+/// selector bodies in memory than this declared budget allows.
+pub const DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES: NonZeroUsize =
+    NonZeroUsize::new(32 * 1024 * 1024).unwrap();
 /// How long shutdown waits for each JSONL log to drain what it already
 /// accepted. Deliberately short relative to a termination grace period: the
 /// point is to save the queue in the ordinary case, not to let a stuck
@@ -372,6 +381,10 @@ impl UpstreamOrigin {
         parts.path_and_query = incoming.path_and_query().cloned();
         Uri::from_parts(parts)
     }
+
+    fn label(&self) -> String {
+        format!("{}://{}", self.scheme, self.authority)
+    }
 }
 
 /// Immutable gateway-owned mapping from a public model id to its replica pool.
@@ -385,6 +398,15 @@ pub struct ModelCatalog {
     routes: BTreeMap<String, UpstreamOrigin>,
 }
 
+/// A [`ModelCatalog`] whose exact model ids have been verified against the
+/// `/v1/models` response of every configured origin. Only this type can build
+/// catalog routing, preventing a caller from serving an alias the backend will
+/// reject after the gateway has already accepted the request.
+#[derive(Clone, Debug)]
+pub struct VerifiedModelCatalog {
+    catalog: ModelCatalog,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidModelCatalog(String);
 
@@ -395,6 +417,93 @@ impl fmt::Display for InvalidModelCatalog {
 }
 
 impl std::error::Error for InvalidModelCatalog {}
+
+/// Limits for the request-body work catalog mode performs before it knows which
+/// replica pool to use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelSelectionLimits {
+    max_body_bytes: NonZeroUsize,
+    memory_budget_bytes: NonZeroUsize,
+    bytes_per_selector: NonZeroUsize,
+    max_concurrent: NonZeroUsize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidModelSelectionLimits(String);
+
+impl fmt::Display for InvalidModelSelectionLimits {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidModelSelectionLimits {}
+
+impl ModelSelectionLimits {
+    /// Creates a selector-work limit. The body limit must fit in the declared
+    /// budget so one valid selector is always possible. A selector holds its
+    /// bounded raw body and can also allocate a decoded copy of the JSON
+    /// `model` string when it contains escapes, so every slot reserves two
+    /// body limits. The integer quotient is the exact maximum number of those
+    /// worst-case selector states that may exist at once.
+    pub fn new(
+        max_body_bytes: NonZeroUsize,
+        memory_budget_bytes: NonZeroUsize,
+    ) -> Result<Self, InvalidModelSelectionLimits> {
+        let bytes_per_selector = max_body_bytes
+            .get()
+            .checked_mul(2)
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| {
+                InvalidModelSelectionLimits(
+                    "max model selection body size is too large to reserve a decoded model id"
+                        .into(),
+                )
+            })?;
+        if memory_budget_bytes.get() < bytes_per_selector.get() {
+            return Err(InvalidModelSelectionLimits(
+                "model selection memory budget must reserve both the request body and a decoded model id"
+                    .into(),
+            ));
+        }
+        let max_concurrent =
+            NonZeroUsize::new(memory_budget_bytes.get() / bytes_per_selector.get())
+                .expect("a budget at least as large as one selector reservation has one slot");
+        Ok(Self {
+            max_body_bytes,
+            memory_budget_bytes,
+            bytes_per_selector,
+            max_concurrent,
+        })
+    }
+
+    pub fn max_body_bytes(self) -> NonZeroUsize {
+        self.max_body_bytes
+    }
+
+    pub fn memory_budget_bytes(self) -> NonZeroUsize {
+        self.memory_budget_bytes
+    }
+
+    pub fn bytes_per_selector(self) -> NonZeroUsize {
+        self.bytes_per_selector
+    }
+
+    pub fn max_concurrent(self) -> NonZeroUsize {
+        self.max_concurrent
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogBackendVerificationError(String);
+
+impl fmt::Display for CatalogBackendVerificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CatalogBackendVerificationError {}
 
 impl ModelCatalog {
     /// Builds a static catalog, rejecting an empty catalog, duplicate ids, and
@@ -430,23 +539,135 @@ impl ModelCatalog {
         Ok(Self { routes: catalog })
     }
 
+    /// Proves every catalog id is an exact id advertised by its configured
+    /// replica pool. Catalog mode forwards a generation body unchanged, so an
+    /// alias that differs from the backend's loaded id would route correctly
+    /// and then fail at the replica as `model_not_found`; refusing startup is
+    /// the only honest behavior without introducing request rewriting.
+    pub async fn verify_backend_model_ids(
+        self,
+    ) -> Result<VerifiedModelCatalog, CatalogBackendVerificationError> {
+        let mut origins: Vec<(UpstreamOrigin, Vec<String>)> = Vec::new();
+        for (model_id, origin) in &self.routes {
+            if let Some((_, configured_ids)) = origins
+                .iter_mut()
+                .find(|(configured_origin, _)| configured_origin == origin)
+            {
+                configured_ids.push(model_id.clone());
+            } else {
+                origins.push((origin.clone(), vec![model_id.clone()]));
+            }
+        }
+
+        let client = http_client();
+        for (origin, configured_ids) in origins {
+            let uri = origin
+                .request_uri(&"/v1/models".parse().expect("a constant URI is valid"))
+                .map_err(|error| {
+                    CatalogBackendVerificationError(format!(
+                        "could not build model discovery URI for {}: {error}",
+                        origin.label()
+                    ))
+                })?;
+            let request = Request::get(uri).body(Body::empty()).map_err(|error| {
+                CatalogBackendVerificationError(format!(
+                    "could not build model discovery request for {}: {error}",
+                    origin.label()
+                ))
+            })?;
+            let response = tokio::time::timeout(CATALOG_DISCOVERY_TIMEOUT, client.request(request))
+                .await
+                .map_err(|_| {
+                    CatalogBackendVerificationError(format!(
+                        "timed out discovering models from {}",
+                        origin.label()
+                    ))
+                })?
+                .map_err(|error| {
+                    CatalogBackendVerificationError(format!(
+                        "could not discover models from {}: {error}",
+                        origin.label()
+                    ))
+                })?;
+            if response.status() != StatusCode::OK {
+                return Err(CatalogBackendVerificationError(format!(
+                    "model discovery from {} returned HTTP {}",
+                    origin.label(),
+                    response.status()
+                )));
+            }
+            let body = tokio::time::timeout(
+                CATALOG_DISCOVERY_TIMEOUT,
+                Limited::new(response.into_body(), MAX_CATALOG_DISCOVERY_BODY_BYTES).collect(),
+            )
+            .await
+            .map_err(|_| {
+                CatalogBackendVerificationError(format!(
+                    "timed out reading model discovery from {}",
+                    origin.label()
+                ))
+            })?
+            .map_err(|error| {
+                CatalogBackendVerificationError(format!(
+                    "could not read model discovery from {}: {error}",
+                    origin.label()
+                ))
+            })?
+            .to_bytes();
+            let discovered: BackendModelList = serde_json::from_slice(&body).map_err(|error| {
+                CatalogBackendVerificationError(format!(
+                    "{} returned an invalid /v1/models response: {error}",
+                    origin.label()
+                ))
+            })?;
+            for model_id in configured_ids {
+                if !discovered.data.iter().any(|model| model.id == model_id) {
+                    return Err(CatalogBackendVerificationError(format!(
+                        "catalog model id {model_id:?} is not advertised by {}",
+                        origin.label()
+                    )));
+                }
+            }
+        }
+        Ok(VerifiedModelCatalog { catalog: self })
+    }
+}
+
+impl VerifiedModelCatalog {
     fn upstream(&self, model_id: &str) -> Option<&UpstreamOrigin> {
-        self.routes.get(model_id)
+        self.catalog.routes.get(model_id)
+    }
+
+    fn route(&self, model_id: &str) -> Option<(&str, &UpstreamOrigin)> {
+        self.catalog
+            .routes
+            .get_key_value(model_id)
+            .map(|(catalog_model_id, upstream)| (catalog_model_id.as_str(), upstream))
     }
 
     /// Number of configured public model ids.
     pub fn len(&self) -> usize {
-        self.routes.len()
+        self.catalog.routes.len()
     }
 
     /// Whether the catalog contains no public model ids.
     pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
+        self.catalog.routes.is_empty()
     }
 
     fn model_ids(&self) -> impl Iterator<Item = &str> {
-        self.routes.keys().map(String::as_str)
+        self.catalog.routes.keys().map(String::as_str)
     }
+}
+
+#[derive(Deserialize)]
+struct BackendModelList {
+    data: Vec<BackendModel>,
+}
+
+#[derive(Deserialize)]
+struct BackendModel {
+    id: String,
 }
 
 #[derive(Clone)]
@@ -460,8 +681,9 @@ enum UpstreamRouting {
     /// every other forwarded public route is refused instead of being sent to
     /// an arbitrary catalog entry whose semantics it cannot honestly represent.
     Catalog {
-        catalog: ModelCatalog,
-        max_selection_body_bytes: NonZeroUsize,
+        catalog: VerifiedModelCatalog,
+        selection_limits: ModelSelectionLimits,
+        selection_admission: Arc<Semaphore>,
     },
 }
 
@@ -630,16 +852,17 @@ pub fn router_with_options(
 /// field in their bounded JSON body. Discovery is served from `catalog`; no
 /// client-provided value can choose an origin outside that immutable map.
 pub fn router_with_model_catalog(
-    catalog: ModelCatalog,
+    catalog: VerifiedModelCatalog,
     max_in_flight: NonZeroUsize,
-    max_selection_body_bytes: NonZeroUsize,
+    selection_limits: ModelSelectionLimits,
     auth: GatewayAuth,
     audit: Option<Arc<GatewayLog>>,
 ) -> Router {
     router_with_routing_options(
         UpstreamRouting::Catalog {
             catalog,
-            max_selection_body_bytes,
+            selection_admission: Arc::new(Semaphore::new(selection_limits.max_concurrent().get())),
+            selection_limits,
         },
         max_in_flight,
         auth,
@@ -653,15 +876,7 @@ fn router_with_routing_options(
     auth: GatewayAuth,
     audit: Option<Arc<GatewayLog>>,
 ) -> Router {
-    let mut connector = HttpConnector::new();
-    connector.enforce_http(true);
-    connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
-    let mut client_builder = Client::builder(TokioExecutor::new());
-    client_builder.retry_canceled_requests(false);
-    client_builder.pool_timer(TokioTimer::new());
-    client_builder.pool_idle_timeout(POOL_IDLE_TIMEOUT);
-    client_builder.pool_max_idle_per_host(MAX_IDLE_PER_HOST);
-    let client = client_builder.build(connector);
+    let client = http_client();
     // `/healthz` is the gateway's own liveness probe, not part of the replica
     // contract, so it is registered explicitly and answered locally.
     let mut router = Router::new().route("/healthz", get(gateway_health));
@@ -684,6 +899,18 @@ fn router_with_routing_options(
             auth,
             audit,
         })
+}
+
+fn http_client() -> Client<HttpConnector, Body> {
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(true);
+    connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    let mut client_builder = Client::builder(TokioExecutor::new());
+    client_builder.retry_canceled_requests(false);
+    client_builder.pool_timer(TokioTimer::new());
+    client_builder.pool_idle_timeout(POOL_IDLE_TIMEOUT);
+    client_builder.pool_max_idle_per_host(MAX_IDLE_PER_HOST);
+    client_builder.build(connector)
 }
 
 async fn gateway_health() -> StatusCode {
@@ -788,8 +1015,67 @@ async fn proxy_request(
 
     // Catalog selection happens after authentication, so an authenticated
     // deployment does not disclose its model inventory to an unauthenticated
-    // caller. It happens before quota and admission, because malformed,
-    // unknown, and non-routable requests must not consume inference budget.
+    // caller. A separate selector-work semaphore bounds body materialization
+    // before an origin is known; the inference admission permit remains free
+    // until selection succeeds, and quota remains free for invalid selectors.
+    let selector_permit =
+        if let Some(selector_admission) = state.routing.catalog_selection_admission(&request) {
+            if !has_json_content_type(request.headers()) {
+                let refusal = unsupported_model_selection_media_type_refusal();
+                return audited(
+                    &state,
+                    AuditedRequest {
+                        request_id: &request_id,
+                        identity: identity.as_ref(),
+                        reason: Some(refusal.audit_reason),
+                        method: &method,
+                        path: &path,
+                        model_id: None,
+                        usage: None,
+                        request_metrics: None,
+                        connection_termination: connection_termination.clone(),
+                        started_ts,
+                        started_at,
+                    },
+                    refusal.response,
+                );
+            }
+            match selector_admission.try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    let mut response = gateway_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "gateway model selection limit reached",
+                    );
+                    let (low, high) = RETRY_AFTER_JITTER_SECONDS;
+                    let retry_after = fastrand::u8(low..=high);
+                    response.headers_mut().insert(
+                        "retry-after",
+                        HeaderValue::from_str(&retry_after.to_string())
+                            .expect("a small decimal integer is a valid header value"),
+                    );
+                    return audited(
+                        &state,
+                        AuditedRequest {
+                            request_id: &request_id,
+                            identity: identity.as_ref(),
+                            reason: Some("gateway_model_selection_overloaded"),
+                            method: &method,
+                            path: &path,
+                            model_id: None,
+                            usage: None,
+                            request_metrics: None,
+                            connection_termination: connection_termination.clone(),
+                            started_ts,
+                            started_at,
+                        },
+                        response,
+                    );
+                }
+            }
+        } else {
+            None
+        };
     let route = match resolve_route(&state.routing, &mut request, detail_model_id.as_deref()).await
     {
         Ok(route) => route,
@@ -813,6 +1099,10 @@ async fn proxy_request(
             )
         }
     };
+    // `to_bytes` has completed or failed. The request body is now either back
+    // in `request` for forwarding or the handler has returned, so selector
+    // capacity can be released before quota/admission and the response stream.
+    drop(selector_permit);
 
     // Quota is checked after authentication (it needs a resolved organization)
     // and after a request has proved routable, but before it can take an
@@ -1010,14 +1300,36 @@ impl RoutedRequest {
     }
 }
 
+impl UpstreamRouting {
+    /// Returns selector-work capacity only for the two catalog-routable
+    /// generation endpoints. Local catalog discovery and endpoints with no
+    /// model-selection contract do not materialize a request body.
+    fn catalog_selection_admission(&self, request: &Request) -> Option<Arc<Semaphore>> {
+        match self {
+            Self::Catalog {
+                selection_admission,
+                ..
+            } if request.method() == Method::POST
+                && matches!(
+                    request.uri().path(),
+                    "/v1/completions" | "/v1/chat/completions"
+                ) =>
+            {
+                Some(Arc::clone(selection_admission))
+            }
+            Self::Passthrough(_) | Self::Catalog { .. } => None,
+        }
+    }
+}
+
 struct RoutingRefusal {
     audit_reason: &'static str,
     response: Response,
 }
 
 #[derive(Deserialize)]
-struct ModelSelectionRequest {
-    model: Option<String>,
+struct ModelSelectionRequest<'a> {
+    model: Option<Cow<'a, str>>,
 }
 
 async fn resolve_route(
@@ -1032,7 +1344,8 @@ async fn resolve_route(
         }),
         UpstreamRouting::Catalog {
             catalog,
-            max_selection_body_bytes,
+            selection_limits,
+            ..
         } => {
             let is_read = matches!(request.method(), &Method::GET | &Method::HEAD);
             if is_read && request.uri().path() == "/v1/models" {
@@ -1058,7 +1371,12 @@ async fn resolve_route(
                     "/v1/completions" | "/v1/chat/completions"
                 )
             {
-                return select_catalog_upstream(catalog, request, *max_selection_body_bytes).await;
+                return select_catalog_upstream(
+                    catalog,
+                    request,
+                    selection_limits.max_body_bytes(),
+                )
+                .await;
             }
             Err(RoutingRefusal {
                 audit_reason: "model_routing_unsupported",
@@ -1075,21 +1393,12 @@ async fn resolve_route(
 }
 
 async fn select_catalog_upstream(
-    catalog: &ModelCatalog,
+    catalog: &VerifiedModelCatalog,
     request: &mut Request,
     max_selection_body_bytes: NonZeroUsize,
 ) -> Result<RoutedRequest, RoutingRefusal> {
     if !has_json_content_type(request.headers()) {
-        return Err(RoutingRefusal {
-            audit_reason: "unsupported_model_selection_media_type",
-            response: gateway_api_error(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "model routing requires an application/json request body",
-                "invalid_request",
-                Some("unsupported_media_type"),
-                None,
-            ),
-        });
+        return Err(unsupported_model_selection_media_type_refusal());
     }
 
     let incoming = std::mem::replace(request, Request::new(Body::empty()));
@@ -1127,7 +1436,7 @@ async fn select_catalog_upstream(
             });
         }
     };
-    let selection: ModelSelectionRequest = match serde_json::from_slice(&body) {
+    let selection: ModelSelectionRequest<'_> = match serde_json::from_slice(&body) {
         Ok(selection) => selection,
         Err(_) => {
             return Err(RoutingRefusal {
@@ -1142,7 +1451,11 @@ async fn select_catalog_upstream(
             });
         }
     };
-    let Some(model_id) = selection.model.filter(|model_id| !model_id.is_empty()) else {
+    let Some(model_id) = selection
+        .model
+        .as_deref()
+        .filter(|model_id| !model_id.is_empty())
+    else {
         return Err(RoutingRefusal {
             audit_reason: "missing_model",
             response: gateway_api_error(
@@ -1154,9 +1467,10 @@ async fn select_catalog_upstream(
             ),
         });
     };
-    let Some(upstream) = catalog.upstream(&model_id) else {
+    let Some((catalog_model_id, upstream)) = catalog.route(model_id) else {
         return Err(unknown_model_refusal());
     };
+    let routed_model_id = catalog_model_id.to_string();
 
     // The exact bytes, headers, and URI survive selection. The catalog changes
     // only the destination, leaving the pinned engine as the authority for all
@@ -1164,7 +1478,7 @@ async fn select_catalog_upstream(
     *request = Request::from_parts(parts, Body::from(body));
     Ok(RoutedRequest::Forward {
         upstream: upstream.clone(),
-        model_id: Some(model_id),
+        model_id: Some(routed_model_id),
     })
 }
 
@@ -1175,8 +1489,22 @@ fn has_json_content_type(headers: &HeaderMap) -> bool {
         .and_then(|value| value.split(';').next())
         .is_some_and(|media_type| {
             let media_type = media_type.trim().to_ascii_lowercase();
-            media_type == "application/json" || media_type.ends_with("+json")
+            media_type == "application/json"
+                || (media_type.starts_with("application/") && media_type.ends_with("+json"))
         })
+}
+
+fn unsupported_model_selection_media_type_refusal() -> RoutingRefusal {
+    RoutingRefusal {
+        audit_reason: "unsupported_model_selection_media_type",
+        response: gateway_api_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "model routing requires an application/json request body",
+            "invalid_request",
+            Some("unsupported_media_type"),
+            None,
+        ),
+    }
 }
 
 fn unknown_model_refusal() -> RoutingRefusal {
@@ -1192,7 +1520,7 @@ fn unknown_model_refusal() -> RoutingRefusal {
     }
 }
 
-fn catalog_models_response(catalog: &ModelCatalog) -> Response {
+fn catalog_models_response(catalog: &VerifiedModelCatalog) -> Response {
     Json(serde_json::json!({
         "object": "list",
         "data": catalog.model_ids().map(catalog_model_item).collect::<Vec<_>>(),
@@ -1931,17 +2259,14 @@ mod tests {
     }
 
     #[test]
-    fn model_catalog_rejects_ambiguous_ids_and_orders_discovery_stably() {
+    fn model_catalog_rejects_ambiguous_ids_before_backend_verification() {
         let alpha = UpstreamOrigin::parse("http://alpha.test").unwrap();
         let bravo = UpstreamOrigin::parse("http://bravo.test").unwrap();
-        let catalog = ModelCatalog::new([
+        assert!(ModelCatalog::new([
             ("bravo".to_string(), bravo.clone()),
             ("alpha".to_string(), alpha.clone()),
         ])
-        .unwrap();
-        assert_eq!(catalog.len(), 2);
-        assert_eq!(catalog.model_ids().collect::<Vec<_>>(), ["alpha", "bravo"]);
-        assert_eq!(catalog.upstream("alpha"), Some(&alpha));
+        .is_ok());
 
         let duplicate = ModelCatalog::new([
             ("alpha".to_string(), alpha.clone()),
@@ -1952,6 +2277,28 @@ mod tests {
         assert!(ModelCatalog::new([(String::new(), alpha.clone())]).is_err());
         assert!(ModelCatalog::new([("line\nbreak".to_string(), alpha)]).is_err());
         assert!(ModelCatalog::new(Vec::<(String, UpstreamOrigin)>::new()).is_err());
+    }
+
+    #[test]
+    fn model_selection_limits_bound_materialized_bodies_by_the_declared_budget() {
+        let limits = ModelSelectionLimits::new(
+            NonZeroUsize::new(2 * 1024 * 1024).unwrap(),
+            NonZeroUsize::new(32 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(limits.max_concurrent().get(), 8);
+        assert_eq!(
+            limits
+                .max_concurrent()
+                .get()
+                .saturating_mul(limits.bytes_per_selector().get()),
+            limits.memory_budget_bytes().get()
+        );
+        assert!(ModelSelectionLimits::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(3).unwrap(),
+        )
+        .is_err());
     }
 
     #[test]

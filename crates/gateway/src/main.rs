@@ -1,7 +1,8 @@
 use camelid_enterprise_gateway::{
     router_with_model_catalog, router_with_options, GatewayAuth, GatewayLog, LogFlush,
-    ModelCatalog, OrgQuota, UpstreamOrigin, DEFAULT_LOG_FLUSH_DEADLINE,
-    DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES,
+    ModelCatalog, ModelSelectionLimits, OrgQuota, UpstreamOrigin, VerifiedModelCatalog,
+    DEFAULT_LOG_FLUSH_DEADLINE, DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT,
+    DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES, DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES,
 };
 use clap::{Parser, Subcommand};
 use identity::{OrganizationId, PrincipalId, RotationLifetime, SqliteIdentityStore, TokenLifetime};
@@ -38,8 +39,22 @@ enum Command {
         model_route: Vec<String>,
         /// Largest JSON generation request catalog mode may materialize to
         /// select a model. Ignored by transparent --upstream mode.
-        #[arg(long, default_value_t = DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES)]
+        #[arg(
+            long,
+            default_value_t = DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES,
+            env = "CAMELID_GATEWAY_MAX_MODEL_SELECTION_BODY_BYTES"
+        )]
         max_model_selection_body_bytes: NonZeroUsize,
+        /// Total memory reserved for concurrently materialized catalog selector
+        /// bodies. Must be at least --max-model-selection-body-bytes. The
+        /// gateway permits `budget / (2 * max-body)` selector bodies at once,
+        /// reserving space for a decoded escaped model id.
+        #[arg(
+            long,
+            default_value_t = DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES,
+            env = "CAMELID_GATEWAY_MODEL_SELECTION_MEMORY_BUDGET_BYTES"
+        )]
+        model_selection_memory_budget_bytes: NonZeroUsize,
         /// Bind address for client traffic.
         #[arg(long, default_value = "127.0.0.1:8080", env = "CAMELID_GATEWAY_ADDR")]
         addr: SocketAddr,
@@ -221,6 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             upstream,
             model_route,
             max_model_selection_body_bytes,
+            model_selection_memory_budget_bytes,
             addr,
             max_in_flight,
             max_connection_seconds,
@@ -234,6 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 upstream,
                 model_routes: model_route,
                 max_model_selection_body_bytes,
+                model_selection_memory_budget_bytes,
                 addr,
                 max_in_flight,
                 max_connection_seconds,
@@ -310,6 +327,7 @@ struct ServeArgs {
     upstream: Option<String>,
     model_routes: Vec<String>,
     max_model_selection_body_bytes: NonZeroUsize,
+    model_selection_memory_budget_bytes: NonZeroUsize,
     addr: SocketAddr,
     max_in_flight: NonZeroUsize,
     max_connection_seconds: u64,
@@ -320,29 +338,47 @@ struct ServeArgs {
 
 type GatewayLogs = (Option<Arc<GatewayLog>>, Option<Arc<GatewayLog>>);
 
-enum ServeRouting {
+enum ConfiguredServeRouting {
     Passthrough(UpstreamOrigin),
     Catalog(ModelCatalog),
+}
+
+enum ServeRouting {
+    Passthrough(UpstreamOrigin),
+    Catalog(VerifiedModelCatalog),
 }
 
 fn parse_serve_routing(
     upstream: Option<String>,
     model_routes: Vec<String>,
-) -> Result<ServeRouting, Box<dyn std::error::Error>> {
+) -> Result<ConfiguredServeRouting, Box<dyn std::error::Error>> {
     match (upstream, model_routes.is_empty()) {
-        (Some(upstream), true) => Ok(ServeRouting::Passthrough(UpstreamOrigin::parse(&upstream)?)),
+        (Some(upstream), true) => Ok(ConfiguredServeRouting::Passthrough(UpstreamOrigin::parse(
+            &upstream,
+        )?)),
         (None, false) => {
             let routes = model_routes
                 .into_iter()
                 .map(|route| parse_model_route(&route))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(ServeRouting::Catalog(ModelCatalog::new(routes)?))
+            Ok(ConfiguredServeRouting::Catalog(ModelCatalog::new(routes)?))
         }
         // Clap enforces this for command-line callers. Retaining the check
         // makes `serve` correct for direct callers and protects future CLI
         // changes from silently choosing a routing mode.
         (Some(_), false) => Err("--upstream and --model-route cannot be combined".into()),
         (None, true) => Err("either --upstream or at least one --model-route is required".into()),
+    }
+}
+
+async fn verify_serve_routing(
+    routing: ConfiguredServeRouting,
+) -> Result<ServeRouting, Box<dyn std::error::Error>> {
+    match routing {
+        ConfiguredServeRouting::Passthrough(upstream) => Ok(ServeRouting::Passthrough(upstream)),
+        ConfiguredServeRouting::Catalog(catalog) => Ok(ServeRouting::Catalog(
+            catalog.verify_backend_model_ids().await?,
+        )),
     }
 }
 
@@ -380,6 +416,7 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         upstream,
         model_routes,
         max_model_selection_body_bytes,
+        model_selection_memory_budget_bytes,
         addr,
         max_in_flight,
         max_connection_seconds,
@@ -387,7 +424,21 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         logs,
         org_request_quota,
     } = args;
-    let routing = parse_serve_routing(upstream, model_routes)?;
+    let configured_routing = parse_serve_routing(upstream, model_routes)?;
+    let selection_limits = match &configured_routing {
+        ConfiguredServeRouting::Passthrough(_) => None,
+        ConfiguredServeRouting::Catalog(_) => {
+            let limits = ModelSelectionLimits::new(
+                max_model_selection_body_bytes,
+                model_selection_memory_budget_bytes,
+            )?;
+            // The catalog selector never rewrites a client request. Requiring
+            // exact backend ids before binding avoids a gateway that accepts a
+            // public alias and only fails later at the selected replica.
+            Some(limits)
+        }
+    };
+    let routing = verify_serve_routing(configured_routing).await?;
     let (audit, usage) = open_gateway_logs(&logs)?;
     // Cloned before the sinks are moved into the router and the auth mode:
     // both must still be reachable after `serve` returns so shutdown can drain
@@ -436,18 +487,16 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             router_with_options(upstream, max_in_flight, auth, audit)
         }
         ServeRouting::Catalog(catalog) => {
+            let selection_limits = selection_limits
+                .expect("catalog routing creates validated selection limits before binding");
             tracing::info!(
                 model_count = catalog.len(),
-                max_model_selection_body_bytes = max_model_selection_body_bytes.get(),
+                max_model_selection_body_bytes = selection_limits.max_body_bytes().get(),
+                model_selection_memory_budget_bytes = selection_limits.memory_budget_bytes().get(),
+                max_concurrent_model_selections = selection_limits.max_concurrent().get(),
                 "gateway static model catalog enabled"
             );
-            router_with_model_catalog(
-                catalog,
-                max_in_flight,
-                max_model_selection_body_bytes,
-                auth,
-                audit,
-            )
+            router_with_model_catalog(catalog, max_in_flight, selection_limits, auth, audit)
         }
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -747,6 +796,7 @@ mod tests {
             upstream,
             model_route,
             max_model_selection_body_bytes,
+            model_selection_memory_budget_bytes,
             ..
         } = cli.command
         else {
@@ -758,8 +808,12 @@ mod tests {
             max_model_selection_body_bytes,
             DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES
         );
+        assert_eq!(
+            model_selection_memory_budget_bytes,
+            DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES
+        );
         let routing = parse_serve_routing(upstream, model_route).unwrap();
-        assert!(matches!(routing, ServeRouting::Catalog(catalog) if catalog.len() == 2));
+        assert!(matches!(routing, ConfiguredServeRouting::Catalog(_)));
 
         assert!(Cli::try_parse_from([
             "camelid-enterprise-gateway",
@@ -771,6 +825,15 @@ mod tests {
         ])
         .is_err());
         assert!(Cli::try_parse_from(["camelid-enterprise-gateway", "serve"]).is_err());
+        assert!(Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--model-route",
+            "alpha=http://127.0.0.1:8181",
+            "--model-selection-memory-budget-bytes",
+            "0",
+        ])
+        .is_err());
         assert!(parse_serve_routing(
             None,
             vec![
