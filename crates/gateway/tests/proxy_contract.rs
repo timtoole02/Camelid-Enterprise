@@ -6,8 +6,9 @@ use axum::routing::{any, post};
 use axum::Router;
 use bytes::Bytes;
 use camelid_enterprise_gateway::{
-    router as gateway_router, router_with_max_in_flight, router_with_options, GatewayAuth,
-    GatewayLog, LogFlush, OrgQuota, UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT,
+    router as gateway_router, router_with_max_in_flight, router_with_model_catalog,
+    router_with_options, GatewayAuth, GatewayLog, LogFlush, ModelCatalog, OrgQuota, UpstreamOrigin,
+    DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES,
 };
 use futures_util::stream;
 use http_body_util::BodyExt;
@@ -46,6 +47,19 @@ async fn spawn_server(app: Router) -> TestServer {
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
+    });
+    TestServer { addr, task }
+}
+
+async fn spawn_connection_dropper(calls: Arc<AtomicUsize>) -> TestServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            calls.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
     });
     TestServer { addr, task }
 }
@@ -113,6 +127,62 @@ async fn spawn_gateway_with_options(
             listener,
             router,
             max_connection_duration,
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    });
+    TestServer { addr, task }
+}
+
+async fn spawn_catalog_gateway(routes: &[(&str, SocketAddr)]) -> TestServer {
+    spawn_catalog_gateway_with_options(
+        routes,
+        DEFAULT_MAX_IN_FLIGHT,
+        DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES,
+        GatewayAuth::Disabled,
+    )
+    .await
+}
+
+async fn spawn_catalog_gateway_with_options(
+    routes: &[(&str, SocketAddr)],
+    max_in_flight: NonZeroUsize,
+    max_selection_body_bytes: NonZeroUsize,
+    auth: GatewayAuth,
+) -> TestServer {
+    spawn_catalog_gateway_with_audit(routes, max_in_flight, max_selection_body_bytes, auth, None)
+        .await
+}
+
+async fn spawn_catalog_gateway_with_audit(
+    routes: &[(&str, SocketAddr)],
+    max_in_flight: NonZeroUsize,
+    max_selection_body_bytes: NonZeroUsize,
+    auth: GatewayAuth,
+    audit: Option<Arc<GatewayLog>>,
+) -> TestServer {
+    let catalog = ModelCatalog::new(routes.iter().map(|(model_id, upstream)| {
+        (
+            (*model_id).to_string(),
+            UpstreamOrigin::parse(&format!("http://{upstream}")).unwrap(),
+        )
+    }))
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = router_with_model_catalog(
+        catalog,
+        max_in_flight,
+        max_selection_body_bytes,
+        auth,
+        audit,
+    );
+    let task = tokio::spawn(async move {
+        camelid_enterprise_gateway::serve(
+            listener,
+            router,
+            Duration::from_secs(30),
             std::future::pending(),
         )
         .await
@@ -2259,6 +2329,384 @@ async fn record_method_and_path(
 
 /// Every `(method, path)` an upstream test handler saw the gateway forward.
 type ForwardedRequests = Arc<Mutex<Vec<(Method, String)>>>;
+
+#[derive(Clone)]
+struct CatalogUpstream {
+    name: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+async fn catalog_upstream(State(state): State<CatalogUpstream>, request: Request) -> Response {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("x-test-catalog-upstream", state.name)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn catalog_routes_generation_by_json_model_and_preserves_request_bytes() {
+    let alpha_calls = Arc::new(AtomicUsize::new(0));
+    let alpha = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "alpha",
+            calls: Arc::clone(&alpha_calls),
+        },
+    ))
+    .await;
+    let bravo_calls = Arc::new(AtomicUsize::new(0));
+    let bravo = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "bravo",
+            calls: Arc::clone(&bravo_calls),
+        },
+    ))
+    .await;
+    let gateway = spawn_catalog_gateway(&[("alpha", alpha.addr), ("bravo", bravo.addr)]).await;
+
+    // Query parameters are preserved for compatibility, but only the JSON
+    // field selects an origin. A client therefore cannot use `?model=` to
+    // redirect a request around the catalog.
+    let chat_body =
+        r#"{"model":"alpha","messages":[{"role":"user","content":"hello"}],"stream":false}"#;
+    let chat = Request::post(format!(
+        "http://{}/v1/chat/completions?model=bravo",
+        gateway.addr
+    ))
+    .header("content-type", "application/json")
+    .body(Body::from(chat_body))
+    .unwrap();
+    let chat_response = client().request(chat).await.unwrap();
+    assert_eq!(chat_response.status(), StatusCode::OK);
+    assert_eq!(chat_response.headers()["x-test-catalog-upstream"], "alpha");
+    assert_eq!(
+        to_bytes(Body::new(chat_response.into_body()), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+        chat_body
+    );
+
+    let completion_body = r#"{"model":"bravo","prompt":"2+2=","max_tokens":4}"#;
+    let completion = Request::post(format!("http://{}/v1/completions", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(completion_body))
+        .unwrap();
+    let completion_response = client().request(completion).await.unwrap();
+    assert_eq!(completion_response.status(), StatusCode::OK);
+    assert_eq!(
+        completion_response.headers()["x-test-catalog-upstream"],
+        "bravo"
+    );
+    assert_eq!(
+        to_bytes(Body::new(completion_response.into_body()), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+        completion_body
+    );
+    assert_eq!(alpha_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(bravo_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn catalog_serves_stable_model_discovery_without_contacting_replicas() {
+    let alpha_calls = Arc::new(AtomicUsize::new(0));
+    let alpha = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "alpha",
+            calls: Arc::clone(&alpha_calls),
+        },
+    ))
+    .await;
+    let bravo_calls = Arc::new(AtomicUsize::new(0));
+    let bravo = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "bravo",
+            calls: Arc::clone(&bravo_calls),
+        },
+    ))
+    .await;
+    // The input order is intentionally reversed. Discovery must not inherit
+    // incidental CLI ordering from a deployment manifest.
+    let gateway = spawn_catalog_gateway(&[("bravo", bravo.addr), ("alpha", alpha.addr)]).await;
+
+    let list = client()
+        .request(
+            Request::get(format!("http://{}/v1/models", gateway.addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let list: serde_json::Value =
+        serde_json::from_slice(&to_bytes(Body::new(list.into_body()), 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(list["object"], "list");
+    assert_eq!(list["data"][0]["id"], "alpha");
+    assert_eq!(list["data"][1]["id"], "bravo");
+
+    let detail = client()
+        .request(
+            Request::get(format!("http://{}/v1/models/alpha", gateway.addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail: serde_json::Value =
+        serde_json::from_slice(&to_bytes(Body::new(detail.into_body()), 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(detail["id"], "alpha");
+    assert_eq!(detail["owned_by"], "camelid");
+
+    let missing = client()
+        .request(
+            Request::get(format!("http://{}/v1/models/not-configured", gateway.addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let missing: serde_json::Value = serde_json::from_slice(
+        &to_bytes(Body::new(missing.into_body()), 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(missing["error"]["code"], "model_not_found");
+    assert_eq!(alpha_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(bravo_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn catalog_rejects_unroutable_or_oversized_requests_without_contacting_replicas() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "alpha",
+            calls: Arc::clone(&calls),
+        },
+    ))
+    .await;
+    let gateway = spawn_catalog_gateway(&[("alpha", upstream.addr)]).await;
+
+    let unknown = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"http://127.0.0.1:9"}"#))
+        .unwrap();
+    let unknown = client().request(unknown).await.unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let unknown: serde_json::Value = serde_json::from_slice(
+        &to_bytes(Body::new(unknown.into_body()), 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(unknown["error"]["code"], "model_not_found");
+
+    let missing = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"messages":[]}"#))
+        .unwrap();
+    let missing = client().request(missing).await.unwrap();
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+    let malformed = Request::post(format!("http://{}/v1/completions", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"alpha""#))
+        .unwrap();
+    let malformed = client().request(malformed).await.unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+    let unsupported = Request::post(format!("http://{}/v1/embeddings", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"alpha","input":"test"}"#))
+        .unwrap();
+    let unsupported = client().request(unsupported).await.unwrap();
+    assert_eq!(unsupported.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let limited_gateway = spawn_catalog_gateway_with_options(
+        &[("alpha", upstream.addr)],
+        DEFAULT_MAX_IN_FLIGHT,
+        NonZeroUsize::new(8).unwrap(),
+        GatewayAuth::Disabled,
+    )
+    .await;
+    let oversized = Request::post(format!(
+        "http://{}/v1/chat/completions",
+        limited_gateway.addr
+    ))
+    .header("content-type", "application/json")
+    .body(Body::from("123456789"))
+    .unwrap();
+    let oversized = client().request(oversized).await.unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn catalog_never_retries_a_generation_after_an_upstream_connection_failure() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_connection_dropper(Arc::clone(&attempts)).await;
+    let gateway = spawn_catalog_gateway(&[("alpha", upstream.addr)]).await;
+    let request = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+        .unwrap();
+
+    let response = client().request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "a failed generation request must not be replayed to its model pool"
+    );
+}
+
+#[tokio::test]
+async fn catalog_authenticates_before_discovery_and_invalid_models_do_not_spend_quota() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "alpha",
+            calls: Arc::clone(&calls),
+        },
+    ))
+    .await;
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
+    let gateway = spawn_catalog_gateway_with_options(
+        &[("alpha", upstream.addr)],
+        DEFAULT_MAX_IN_FLIGHT,
+        DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: Some(Arc::new(OrgQuota::new(
+                NonZeroU32::new(1).unwrap(),
+                NonZeroU64::new(60).unwrap(),
+            ))),
+            usage: None,
+        },
+    )
+    .await;
+
+    let anonymous = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        client().request(anonymous).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let unknown = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"not-configured"}"#))
+        .unwrap();
+    assert_eq!(
+        client().request(unknown).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let request = || {
+        Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+            .unwrap()
+    };
+    assert_eq!(
+        client().request(request()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client().request(request()).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn catalog_records_the_selected_model_in_audit_and_usage_logs() {
+    let upstream =
+        spawn_server(Router::new().fallback(any(|| async { StatusCode::NO_CONTENT }))).await;
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let usage_path = dir.path().join("usage.jsonl");
+    let gateway = spawn_catalog_gateway_with_audit(
+        &[("alpha", upstream.addr)],
+        DEFAULT_MAX_IN_FLIGHT,
+        DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: Some(gateway_log(&usage_path)),
+        },
+        Some(gateway_log(&audit_path)),
+    )
+    .await;
+
+    let request = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+        .unwrap();
+    assert_eq!(
+        client().request(request).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let audit = read_audit_records(&audit_path, 1).await;
+    let usage = read_usage_records(&usage_path, 1).await;
+    assert_eq!(audit[0]["model_id"], "alpha");
+    assert_eq!(usage[0]["model_id"], "alpha");
+    assert_eq!(audit[0]["request_id"], usage[0]["request_id"]);
+}
+
+#[tokio::test]
+async fn catalog_streams_replica_responses_after_model_selection() {
+    let release_second = Arc::new(Notify::new());
+    let upstream = spawn_server(
+        Router::new()
+            .route("/v1/chat/completions", any(delayed_sse))
+            .with_state(Arc::clone(&release_second)),
+    )
+    .await;
+    let gateway = spawn_catalog_gateway(&[("alpha", upstream.addr)]).await;
+    let request = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"alpha","messages":[],"stream":true}"#,
+        ))
+        .unwrap();
+    let response = client().request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("the first streamed event must not wait for completion")
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(first, "data: first\n\n");
+    release_second.notify_one();
+    assert_eq!(
+        body.frame().await.unwrap().unwrap().into_data().unwrap(),
+        "data: second\n\n"
+    );
+}
 
 /// Every `(method, path)` in `replica_contract::PUBLIC_ROUTES` must be forwarded
 /// to the upstream (proved via `probe_path` for the parameterized route). This

@@ -14,12 +14,18 @@ route present in the pinned desktop engine is a stable Enterprise API.
 The dependency-free public route registry in `crates/replica-contract` is the
 source of truth for contractual paths, methods, and classification, structured
 so replicas and gateways *can* share it without linking the inference engine.
-The gateway now derives its forwarded route surface directly from
-`replica_contract::PUBLIC_ROUTES` rather than a hand-maintained mirror, so its
-allowlist cannot silently drift from this contract; a gateway integration test
-(`forwards_exactly_the_public_contract_routes`) asserts it forwards exactly the
-contractual routes and methods, and nothing beyond them. The private
-pinned-route inventory and executable conformance live in
+In its legacy transparent mode, the gateway derives its forwarded route surface
+directly from `replica_contract::PUBLIC_ROUTES` rather than a hand-maintained
+mirror, so its allowlist cannot silently drift from this contract; a gateway
+integration test (`forwards_exactly_the_public_contract_routes`) asserts it
+forwards exactly the contractual routes and methods, and nothing beyond them.
+Static catalog mode keeps that default-deny surface but intentionally routes
+only the two generation routes with a proven JSON `model` selector; it serves
+model discovery locally and refuses the remaining routes rather than inventing
+a pool-selection rule. That gateway-specific behavior is documented in
+`docs/architecture/gateway-model-catalog.md`, not promoted into this
+single-replica contract. The private pinned-route inventory and executable
+conformance live in
 `crates/server/src/contract.rs`; they drive the exact pinned
 `camelid::api::router_with_state` and do not reimplement the engine API.
 

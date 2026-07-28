@@ -327,6 +327,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "pin-project-lite",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

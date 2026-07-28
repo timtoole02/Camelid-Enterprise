@@ -15,18 +15,22 @@ clients verify what they got. Keep each replica pool on **one instance type**:
 the lane's behavior is scoped to a hardware class, so a pool that mixes node
 types is really several pools wearing one Service.
 
-The gateway in this release is deliberately transparent: one fixed upstream,
-opaque streaming request/response bodies, no retries, and no response rewriting.
-On Kubernetes, point it at the replica Service and let Kubernetes balance the
-identical pool. On one box, point it directly at the replica. Authentication and
-per-organization quotas are optional gateway features; tenant-aware model
-routing has not landed. The stock Kubernetes manifest configures neither an
-identity database nor a quota, so keep both services on a trusted network until
-an operator supplies an identity deployment and enables authentication.
+The gateway has two explicit startup modes. Legacy transparent mode uses one
+fixed `--upstream`, keeps request and response bodies opaque and streaming, and
+forwards the replica contract unchanged. Static catalog mode uses one or more
+`--model-route <model-id>=<http://replica-pool>` entries instead; it maps a
+model to a pool without letting a client select an arbitrary origin. The modes
+are mutually exclusive. The stock Kubernetes manifest remains single-upstream
+mode. Authentication and per-organization quotas are optional in either mode;
+the manifest configures neither an identity database nor a quota, so keep both
+services on a trusted network until an operator supplies identity and enables
+authentication.
 With both an identity database and `CAMELID_GATEWAY_USAGE_LOG=<path>`, the
 gateway also writes an append-only JSONL terminal transport record for each
 authenticated, quota-admitted request:
-`{ts, started_ts, duration_ms, request_id, principal, organization, method, path, response_head_status, request_bytes, response_bytes, stream_outcome}`.
+`{ts, started_ts, duration_ms, request_id, principal, organization, method, path, model_id, response_head_status, request_bytes, response_bytes, stream_outcome}`.
+`model_id` is the selected static-catalog entry, or `null` for legacy
+transparent mode, catalog discovery, and requests rejected before selection.
 `stream_outcome` is `completed` when the response reached EOF, `body_error`
 when it returned an error, `gateway_timeout` when the gateway's connection
 deadline closed it, or `incomplete` when the stream was dropped without an
@@ -62,7 +66,7 @@ serialized replica at steady decode is *supposed* to sit near its CPU limit).
 
 ## Gateway contract
 
-The gateway forwards only these replica routes:
+Both modes default-deny every route outside this replica surface:
 
 - `/v1/health`
 - `/v1/models` and `/v1/models/{model}`
@@ -72,11 +76,9 @@ The gateway forwards only these replica routes:
 
 Everything else returns `404` at the gateway without contacting the replica.
 In particular, `/api/*`, legacy `/models/*`, workspace routes, and the embedded
-WebUI are replica-local and never public client paths. This list is a
-hand-maintained mirror of the pinned engine's public surface; nothing today
-verifies it stays in sync with the replica's actual contract if the engine
-pin moves (see `crates/replica-contract`, landing separately, for the
-authoritative tested inventory).
+WebUI are replica-local and never public client paths. The route registry in
+`crates/replica-contract` is the authoritative tested inventory shared by the
+gateway and replica contract checks.
 `GET /healthz` is gateway-local and returns `204`; Kubernetes uses it for both
 readiness and liveness so replica saturation or temporary unavailability does
 not remove otherwise healthy gateway endpoints and amplify an outage.
@@ -87,14 +89,31 @@ with `Access-Control-Request-Method`) is answered locally by the CORS layer
 and never reaches the replica or consumes an admission permit. No credentials
 are enabled.
 
-Request and response bodies remain streaming and opaque. The gateway removes
-HTTP hop-by-hop headers and strips client-supplied `Forwarded`, `X-Forwarded-*`,
-and `X-Real-IP` values because this release does not yet establish trusted
-client identity. It does not retry requests. The upstream connection pool keeps
-at most 32 idle connections for 30 seconds, and the configurable concurrency
+In transparent mode, request and response bodies remain streaming and opaque.
+Catalog mode keeps response bodies streaming and opaque, but materializes a
+JSON generation request up to `--max-model-selection-body-bytes` (2 MiB by
+default) to read its `model` field. It accepts `application/json` and
+`application/*+json`; malformed, missing, unknown, or oversized selectors are
+rejected before quota, admission, or any upstream call. Only
+`POST /v1/completions` and `POST /v1/chat/completions` are routable in catalog
+mode because the pinned Enterprise contract proves their JSON `model` field.
+Catalog discovery is served locally. `/v1/health` and the currently unsupported
+compatibility POST routes return typed `501` rather than being sent to an
+arbitrary pool; `/healthz` remains the gateway liveness endpoint. Catalog
+discovery reports configured inventory, not replica readiness.
+
+Authentication runs before catalog selection, so an authenticated deployment
+does not disclose model inventory to an anonymous caller. Catalog mode does
+not implement per-organization model permissions: every authenticated caller
+can use every configured entry. Do not present this as an IDOR control; roles
+and resource policy remain future authorization work. The gateway removes HTTP
+hop-by-hop headers and strips client-supplied `Forwarded`, `X-Forwarded-*`, and
+`X-Real-IP` values because this release does not yet establish trusted client
+identity. It does not retry requests. The upstream connection pool keeps at
+most 32 idle connections for 30 seconds, and the configurable concurrency
 limit is held until a streaming response completes, disconnects, or the
-connection's maximum duration elapses. Saturation returns a typed `503` with
-a `Retry-After` of 1-3 seconds (randomized, so clients rejected at the same
+connection's maximum duration elapses. Saturation returns a typed `503` with a
+`Retry-After` of 1-3 seconds (randomized, so clients rejected at the same
 instant do not retry in lockstep).
 
 ## Docker

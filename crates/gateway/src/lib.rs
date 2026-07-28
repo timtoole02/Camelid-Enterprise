@@ -4,23 +4,25 @@
 //! not retry, inspect, buffer, or rewrite inference traffic; the replica remains
 //! the authority for output and attribution.
 
-use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::body::{to_bytes, Body};
+use axum::extract::{Path as AxumPath, Request, State};
 use axum::http::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, WWW_AUTHENTICATE};
 use axum::http::uri::{Authority, Scheme};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, MethodRouter};
 use axum::{Extension, Json, Router};
 use bytes::Buf;
 use http_body::{Body as HttpBody, Frame, SizeHint};
+use http_body_util::LengthLimitError;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use identity::{AuthenticatedContext, IdentityError, OrganizationId, SqliteIdentityStore};
 use pin_project_lite::pin_project;
-use replica_contract::HttpMethod;
-use std::collections::HashMap;
+use replica_contract::{HttpMethod, RouteSpec};
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, Write};
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
@@ -39,6 +41,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IDLE_PER_HOST: usize = 32;
 const MAX_PENDING_LOG_RECORDS: usize = 1_024;
+/// The largest JSON generation request catalog mode will materialize to select
+/// its model. This is an explicit bound: without it, a caller could make the
+/// gateway allocate arbitrarily before it knows which replica pool to use.
+pub const DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES: NonZeroUsize =
+    NonZeroUsize::new(2 * 1024 * 1024).unwrap();
 /// How long shutdown waits for each JSONL log to drain what it already
 /// accepted. Deliberately short relative to a termination grace period: the
 /// point is to save the queue in the ordinary case, not to let a stuck
@@ -315,7 +322,7 @@ fn write_jsonl_records(
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpstreamOrigin {
     scheme: Scheme,
     authority: Authority,
@@ -367,9 +374,100 @@ impl UpstreamOrigin {
     }
 }
 
+/// Immutable gateway-owned mapping from a public model id to its replica pool.
+///
+/// The catalog is validated before the gateway starts accepting traffic. Model
+/// ids are opaque application identifiers: they are not paths, hostnames, or
+/// client-supplied routing targets. The only network destinations are the
+/// operator-configured [`UpstreamOrigin`] values held here.
+#[derive(Clone, Debug)]
+pub struct ModelCatalog {
+    routes: BTreeMap<String, UpstreamOrigin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidModelCatalog(String);
+
+impl fmt::Display for InvalidModelCatalog {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidModelCatalog {}
+
+impl ModelCatalog {
+    /// Builds a static catalog, rejecting an empty catalog, duplicate ids, and
+    /// control characters that could make a model id unsafe to log or render.
+    /// A [`BTreeMap`] gives discovery a stable lexical order regardless of the
+    /// order in which an operator supplied the routes.
+    pub fn new(
+        routes: impl IntoIterator<Item = (String, UpstreamOrigin)>,
+    ) -> Result<Self, InvalidModelCatalog> {
+        let mut catalog = BTreeMap::new();
+        for (model_id, upstream) in routes {
+            if model_id.is_empty() {
+                return Err(InvalidModelCatalog(
+                    "model catalog entries must have a non-empty model id".into(),
+                ));
+            }
+            if model_id.chars().any(char::is_control) {
+                return Err(InvalidModelCatalog(format!(
+                    "model catalog id {model_id:?} contains a control character"
+                )));
+            }
+            if catalog.insert(model_id.clone(), upstream).is_some() {
+                return Err(InvalidModelCatalog(format!(
+                    "model catalog contains duplicate model id {model_id:?}"
+                )));
+            }
+        }
+        if catalog.is_empty() {
+            return Err(InvalidModelCatalog(
+                "model catalog must contain at least one model route".into(),
+            ));
+        }
+        Ok(Self { routes: catalog })
+    }
+
+    fn upstream(&self, model_id: &str) -> Option<&UpstreamOrigin> {
+        self.routes.get(model_id)
+    }
+
+    /// Number of configured public model ids.
+    pub fn len(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// Whether the catalog contains no public model ids.
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    fn model_ids(&self) -> impl Iterator<Item = &str> {
+        self.routes.keys().map(String::as_str)
+    }
+}
+
+#[derive(Clone)]
+enum UpstreamRouting {
+    /// The original transparent gateway behavior. It leaves all public route
+    /// semantics, including the replica's default-model behavior, to one
+    /// fixed upstream.
+    Passthrough(UpstreamOrigin),
+    /// A gateway-owned static model catalog. Only the two generation routes
+    /// have a contractual JSON `model` selector at the pinned engine revision;
+    /// every other forwarded public route is refused instead of being sent to
+    /// an arbitrary catalog entry whose semantics it cannot honestly represent.
+    Catalog {
+        catalog: ModelCatalog,
+        max_selection_body_bytes: NonZeroUsize,
+    },
+}
+
 #[derive(Clone)]
 struct GatewayState {
-    upstream: UpstreamOrigin,
+    routing: UpstreamRouting,
     client: Client<HttpConnector, Body>,
     admission: Arc<Semaphore>,
     auth: GatewayAuth,
@@ -520,6 +618,41 @@ pub fn router_with_options(
     auth: GatewayAuth,
     audit: Option<Arc<GatewayLog>>,
 ) -> Router {
+    router_with_routing_options(
+        UpstreamRouting::Passthrough(upstream),
+        max_in_flight,
+        auth,
+        audit,
+    )
+}
+
+/// Builds a gateway that routes supported generation requests by the `model`
+/// field in their bounded JSON body. Discovery is served from `catalog`; no
+/// client-provided value can choose an origin outside that immutable map.
+pub fn router_with_model_catalog(
+    catalog: ModelCatalog,
+    max_in_flight: NonZeroUsize,
+    max_selection_body_bytes: NonZeroUsize,
+    auth: GatewayAuth,
+    audit: Option<Arc<GatewayLog>>,
+) -> Router {
+    router_with_routing_options(
+        UpstreamRouting::Catalog {
+            catalog,
+            max_selection_body_bytes,
+        },
+        max_in_flight,
+        auth,
+        audit,
+    )
+}
+
+fn router_with_routing_options(
+    routing: UpstreamRouting,
+    max_in_flight: NonZeroUsize,
+    auth: GatewayAuth,
+    audit: Option<Arc<GatewayLog>>,
+) -> Router {
     let mut connector = HttpConnector::new();
     connector.enforce_http(true);
     connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
@@ -533,7 +666,7 @@ pub fn router_with_options(
     // contract, so it is registered explicitly and answered locally.
     let mut router = Router::new().route("/healthz", get(gateway_health));
     for spec in replica_contract::contractual_routes() {
-        router = router.route(spec.path, proxy_methods(spec.methods));
+        router = router.route(spec.path, proxy_methods(spec));
     }
     router
         // CORS preflight (`OPTIONS` with `Access-Control-Request-Method`) is
@@ -545,7 +678,7 @@ pub fn router_with_options(
         // response, not just `Access-Control-Allow-Origin`.
         .layer(CorsLayer::permissive())
         .with_state(GatewayState {
-            upstream,
+            routing,
             client,
             admission: Arc::new(Semaphore::new(max_in_flight.get())),
             auth,
@@ -563,10 +696,13 @@ async fn gateway_health() -> StatusCode {
 /// [`HttpMethod`] exhaustively means a new method variant added to the contract
 /// crate stops this crate from compiling until the gateway is taught to forward
 /// it, rather than silently dropping a newly-contractual method.
-fn proxy_methods(methods: &[HttpMethod]) -> MethodRouter<GatewayState> {
+fn proxy_methods(route: &RouteSpec) -> MethodRouter<GatewayState> {
     let mut method_router = MethodRouter::new();
-    for method in methods {
+    for method in route.methods {
         method_router = match method {
+            HttpMethod::Get if route.path == "/v1/models/:model" => {
+                method_router.get(proxy_model_detail)
+            }
             HttpMethod::Get => method_router.get(proxy),
             HttpMethod::Post => method_router.post(proxy),
             HttpMethod::Delete => method_router.delete(proxy),
@@ -578,7 +714,25 @@ fn proxy_methods(methods: &[HttpMethod]) -> MethodRouter<GatewayState> {
 async fn proxy(
     State(state): State<GatewayState>,
     connection_termination: Option<Extension<Arc<ConnectionTermination>>>,
+    request: Request,
+) -> Response {
+    proxy_request(state, connection_termination, request, None).await
+}
+
+async fn proxy_model_detail(
+    State(state): State<GatewayState>,
+    AxumPath(model_id): AxumPath<String>,
+    connection_termination: Option<Extension<Arc<ConnectionTermination>>>,
+    request: Request,
+) -> Response {
+    proxy_request(state, connection_termination, request, Some(model_id)).await
+}
+
+async fn proxy_request(
+    state: GatewayState,
+    connection_termination: Option<Extension<Arc<ConnectionTermination>>>,
     mut request: Request,
+    detail_model_id: Option<String>,
 ) -> Response {
     let connection_termination = connection_termination.map(|Extension(marker)| marker);
     let started_ts = unix_timestamp();
@@ -598,7 +752,7 @@ async fn proxy(
     // lookup time behind each one) meant for legitimate authenticated
     // traffic before ever being rejected; a request that fails auth must
     // never take a permit at all.
-    let (identity, usage) = match &state.auth {
+    let (identity, quota, usage) = match &state.auth {
         GatewayAuth::RequireToken {
             store,
             quota,
@@ -615,6 +769,7 @@ async fn proxy(
                             reason: Some(refusal.audit_reason()),
                             method: &method,
                             path: &path,
+                            model_id: None,
                             usage: None,
                             request_metrics: None,
                             connection_termination: connection_termination.clone(),
@@ -626,35 +781,65 @@ async fn proxy(
                 }
             };
 
-            // Quota is checked after authentication (it needs a resolved
-            // organization to charge) but before the admission permit is
-            // acquired. A request the gateway is about to reject must never
-            // first take a permit meant for traffic that will be forwarded.
-            if let Some(quota) = quota {
-                if let Err(retry_after) = quota.admit(identity.organization_id()) {
-                    let response = quota_exceeded(retry_after);
-                    return audited(
-                        &state,
-                        AuditedRequest {
-                            request_id: &request_id,
-                            identity: Some(&identity),
-                            reason: Some("organization_quota_exceeded"),
-                            method: &method,
-                            path: &path,
-                            usage: None,
-                            request_metrics: None,
-                            connection_termination: connection_termination.clone(),
-                            started_ts,
-                            started_at,
-                        },
-                        response,
-                    );
-                }
-            }
-            (Some(identity), usage.clone())
+            (Some(identity), quota.clone(), usage.clone())
         }
-        GatewayAuth::Disabled => (None, None),
+        GatewayAuth::Disabled => (None, None, None),
     };
+
+    // Catalog selection happens after authentication, so an authenticated
+    // deployment does not disclose its model inventory to an unauthenticated
+    // caller. It happens before quota and admission, because malformed,
+    // unknown, and non-routable requests must not consume inference budget.
+    let route = match resolve_route(&state.routing, &mut request, detail_model_id.as_deref()).await
+    {
+        Ok(route) => route,
+        Err(refusal) => {
+            return audited(
+                &state,
+                AuditedRequest {
+                    request_id: &request_id,
+                    identity: identity.as_ref(),
+                    reason: Some(refusal.audit_reason),
+                    method: &method,
+                    path: &path,
+                    model_id: None,
+                    usage: None,
+                    request_metrics: None,
+                    connection_termination: connection_termination.clone(),
+                    started_ts,
+                    started_at,
+                },
+                refusal.response,
+            )
+        }
+    };
+
+    // Quota is checked after authentication (it needs a resolved organization)
+    // and after a request has proved routable, but before it can take an
+    // admission permit. A request the gateway rejects must never first take a
+    // permit meant for traffic that can reach a replica.
+    if let (Some(identity), Some(quota)) = (identity.as_ref(), quota.as_ref()) {
+        if let Err(retry_after) = quota.admit(identity.organization_id()) {
+            let response = quota_exceeded(retry_after);
+            return audited(
+                &state,
+                AuditedRequest {
+                    request_id: &request_id,
+                    identity: Some(identity),
+                    reason: Some("organization_quota_exceeded"),
+                    method: &method,
+                    path: &path,
+                    model_id: route.model_id(),
+                    usage: None,
+                    request_metrics: None,
+                    connection_termination: connection_termination.clone(),
+                    started_ts,
+                    started_at,
+                },
+                response,
+            );
+        }
+    }
 
     let permit = match Arc::clone(&state.admission).try_acquire_owned() {
         Ok(permit) => permit,
@@ -678,6 +863,7 @@ async fn proxy(
                     reason: Some("gateway_overloaded"),
                     method: &method,
                     path: &path,
+                    model_id: route.model_id(),
                     usage: usage.clone(),
                     request_metrics: None,
                     connection_termination: connection_termination.clone(),
@@ -688,7 +874,30 @@ async fn proxy(
             );
         }
     };
-    let upstream_uri = match state.upstream.request_uri(request.uri()) {
+    let (upstream, model_id) = match route {
+        RoutedRequest::Forward { upstream, model_id } => (upstream, model_id),
+        RoutedRequest::Local { response, model_id } => {
+            drop(permit);
+            return audited(
+                &state,
+                AuditedRequest {
+                    request_id: &request_id,
+                    identity: identity.as_ref(),
+                    reason: None,
+                    method: &method,
+                    path: &path,
+                    model_id: model_id.as_deref(),
+                    usage,
+                    request_metrics: None,
+                    connection_termination,
+                    started_ts,
+                    started_at,
+                },
+                response,
+            );
+        }
+    };
+    let upstream_uri = match upstream.request_uri(request.uri()) {
         Ok(uri) => uri,
         Err(error) => {
             tracing::error!(%error, "could not construct upstream request URI");
@@ -700,6 +909,7 @@ async fn proxy(
                     reason: Some("upstream_uri_invalid"),
                     method: &method,
                     path: &path,
+                    model_id: model_id.as_deref(),
                     usage: usage.clone(),
                     request_metrics: None,
                     connection_termination: connection_termination.clone(),
@@ -717,7 +927,7 @@ async fn proxy(
     *request.uri_mut() = upstream_uri;
     remove_hop_by_hop(request.headers_mut());
     remove_untrusted_forwarding_headers(request.headers_mut());
-    let host = HeaderValue::from_str(state.upstream.authority.as_str())
+    let host = HeaderValue::from_str(upstream.authority.as_str())
         .expect("a valid URI authority is a valid Host header");
     request.headers_mut().insert(HOST, host);
     // Stamp the gateway-authoritative correlation id after the untrusted
@@ -770,6 +980,7 @@ async fn proxy(
             reason,
             method: &method,
             path: &path,
+            model_id: model_id.as_deref(),
             usage,
             request_metrics,
             connection_termination,
@@ -778,6 +989,228 @@ async fn proxy(
         },
         response,
     )
+}
+
+enum RoutedRequest {
+    Forward {
+        upstream: UpstreamOrigin,
+        model_id: Option<String>,
+    },
+    Local {
+        response: Response,
+        model_id: Option<String>,
+    },
+}
+
+impl RoutedRequest {
+    fn model_id(&self) -> Option<&str> {
+        match self {
+            Self::Forward { model_id, .. } | Self::Local { model_id, .. } => model_id.as_deref(),
+        }
+    }
+}
+
+struct RoutingRefusal {
+    audit_reason: &'static str,
+    response: Response,
+}
+
+#[derive(Deserialize)]
+struct ModelSelectionRequest {
+    model: Option<String>,
+}
+
+async fn resolve_route(
+    routing: &UpstreamRouting,
+    request: &mut Request,
+    detail_model_id: Option<&str>,
+) -> Result<RoutedRequest, RoutingRefusal> {
+    match routing {
+        UpstreamRouting::Passthrough(upstream) => Ok(RoutedRequest::Forward {
+            upstream: upstream.clone(),
+            model_id: None,
+        }),
+        UpstreamRouting::Catalog {
+            catalog,
+            max_selection_body_bytes,
+        } => {
+            let is_read = matches!(request.method(), &Method::GET | &Method::HEAD);
+            if is_read && request.uri().path() == "/v1/models" {
+                return Ok(RoutedRequest::Local {
+                    response: catalog_models_response(catalog),
+                    model_id: None,
+                });
+            }
+            if is_read {
+                if let Some(model_id) = detail_model_id {
+                    return match catalog.upstream(model_id) {
+                        Some(_) => Ok(RoutedRequest::Local {
+                            response: catalog_model_response(model_id),
+                            model_id: Some(model_id.to_string()),
+                        }),
+                        None => Err(unknown_model_refusal()),
+                    };
+                }
+            }
+            if request.method() == Method::POST
+                && matches!(
+                    request.uri().path(),
+                    "/v1/completions" | "/v1/chat/completions"
+                )
+            {
+                return select_catalog_upstream(catalog, request, *max_selection_body_bytes).await;
+            }
+            Err(RoutingRefusal {
+                audit_reason: "model_routing_unsupported",
+                response: gateway_api_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "this endpoint cannot be routed by a multi-model gateway",
+                    "not_implemented",
+                    Some("model_routing_unsupported"),
+                    None,
+                ),
+            })
+        }
+    }
+}
+
+async fn select_catalog_upstream(
+    catalog: &ModelCatalog,
+    request: &mut Request,
+    max_selection_body_bytes: NonZeroUsize,
+) -> Result<RoutedRequest, RoutingRefusal> {
+    if !has_json_content_type(request.headers()) {
+        return Err(RoutingRefusal {
+            audit_reason: "unsupported_model_selection_media_type",
+            response: gateway_api_error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "model routing requires an application/json request body",
+                "invalid_request",
+                Some("unsupported_media_type"),
+                None,
+            ),
+        });
+    }
+
+    let incoming = std::mem::replace(request, Request::new(Body::empty()));
+    let (parts, body) = incoming.into_parts();
+    let body = match to_bytes(body, max_selection_body_bytes.get()).await {
+        Ok(body) => body,
+        Err(error) => {
+            let is_too_large = std::error::Error::source(&error)
+                .is_some_and(|source| source.is::<LengthLimitError>());
+            return Err(RoutingRefusal {
+                audit_reason: if is_too_large {
+                    "model_selection_body_too_large"
+                } else {
+                    "model_selection_body_unreadable"
+                },
+                response: gateway_api_error(
+                    if is_too_large {
+                        StatusCode::PAYLOAD_TOO_LARGE
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
+                    if is_too_large {
+                        "request body exceeds the model-selection limit"
+                    } else {
+                        "gateway could not read the request body"
+                    },
+                    "invalid_request",
+                    Some(if is_too_large {
+                        "request_too_large"
+                    } else {
+                        "unreadable_request_body"
+                    }),
+                    None,
+                ),
+            });
+        }
+    };
+    let selection: ModelSelectionRequest = match serde_json::from_slice(&body) {
+        Ok(selection) => selection,
+        Err(_) => {
+            return Err(RoutingRefusal {
+                audit_reason: "malformed_model_selection",
+                response: gateway_api_error(
+                    StatusCode::BAD_REQUEST,
+                    "request body is not valid JSON",
+                    "invalid_request",
+                    Some("malformed_json"),
+                    None,
+                ),
+            });
+        }
+    };
+    let Some(model_id) = selection.model.filter(|model_id| !model_id.is_empty()) else {
+        return Err(RoutingRefusal {
+            audit_reason: "missing_model",
+            response: gateway_api_error(
+                StatusCode::BAD_REQUEST,
+                "request must specify a non-empty model",
+                "invalid_request",
+                Some("model_required"),
+                Some("model"),
+            ),
+        });
+    };
+    let Some(upstream) = catalog.upstream(&model_id) else {
+        return Err(unknown_model_refusal());
+    };
+
+    // The exact bytes, headers, and URI survive selection. The catalog changes
+    // only the destination, leaving the pinned engine as the authority for all
+    // request-field validation and generation semantics.
+    *request = Request::from_parts(parts, Body::from(body));
+    Ok(RoutedRequest::Forward {
+        upstream: upstream.clone(),
+        model_id: Some(model_id),
+    })
+}
+
+fn has_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| {
+            let media_type = media_type.trim().to_ascii_lowercase();
+            media_type == "application/json" || media_type.ends_with("+json")
+        })
+}
+
+fn unknown_model_refusal() -> RoutingRefusal {
+    RoutingRefusal {
+        audit_reason: "unknown_model",
+        response: gateway_api_error(
+            StatusCode::NOT_FOUND,
+            "requested model is not available from this gateway",
+            "invalid_request",
+            Some("model_not_found"),
+            Some("model"),
+        ),
+    }
+}
+
+fn catalog_models_response(catalog: &ModelCatalog) -> Response {
+    Json(serde_json::json!({
+        "object": "list",
+        "data": catalog.model_ids().map(catalog_model_item).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+fn catalog_model_response(model_id: &str) -> Response {
+    Json(catalog_model_item(model_id)).into_response()
+}
+
+fn catalog_model_item(model_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": model_id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "camelid",
+    })
 }
 
 /// Records the audit line for a handled request, when auditing is enabled, and
@@ -802,6 +1235,9 @@ struct AuditedRequest<'a> {
     reason: Option<&'static str>,
     method: &'a str,
     path: &'a str,
+    /// The catalog entry selected for this request. `None` means transparent
+    /// legacy routing, catalog discovery, or a refusal before selection.
+    model_id: Option<&'a str>,
     usage: Option<Arc<GatewayLog>>,
     request_metrics: Option<Arc<RequestBodyMetrics>>,
     connection_termination: Option<Arc<ConnectionTermination>>,
@@ -811,15 +1247,7 @@ struct AuditedRequest<'a> {
 
 fn audited(state: &GatewayState, request: AuditedRequest<'_>, response: Response) -> Response {
     if let Some(log) = &state.audit {
-        write_audit_record(
-            log,
-            request.request_id,
-            request.identity,
-            request.reason,
-            request.method,
-            request.path,
-            response.status(),
-        );
+        write_audit_record(log, &request, response.status());
     }
     let Some((log, identity)) = request.usage.zip(request.identity) else {
         return response;
@@ -832,6 +1260,7 @@ fn audited(state: &GatewayState, request: AuditedRequest<'_>, response: Response
         organization: identity.organization_id().as_str().to_string(),
         method: request.method.to_string(),
         path: request.path.to_string(),
+        model_id: request.model_id.map(str::to_string),
         response_head_status: parts.status.as_u16(),
         request_metrics: request.request_metrics,
         response_bytes: 0,
@@ -843,7 +1272,7 @@ fn audited(state: &GatewayState, request: AuditedRequest<'_>, response: Response
 }
 
 /// Appends one JSONL audit line: `{ts, request_id, principal, organization,
-/// reason, method, path, status}`. `principal` and `organization` are opaque
+/// reason, method, path, model_id, status}`. `principal` and `organization` are opaque
 /// gateway-local identity fields, or JSON `null` when authentication is
 /// disabled or rejected before identity was established. `reason` names the
 /// gateway's own refusal, or is `null` for a request it forwarded. They are
@@ -856,23 +1285,16 @@ fn audited(state: &GatewayState, request: AuditedRequest<'_>, response: Response
 /// [`GatewayLog`] emits
 /// rate-limited warnings for each condition. Its single writer serializes
 /// complete JSONL records so concurrent requests cannot interleave lines.
-fn write_audit_record(
-    log: &GatewayLog,
-    request_id: &str,
-    identity: Option<&AuthenticatedContext>,
-    reason: Option<&'static str>,
-    method: &str,
-    path: &str,
-    status: StatusCode,
-) {
+fn write_audit_record(log: &GatewayLog, request: &AuditedRequest<'_>, status: StatusCode) {
     let line = serde_json::json!({
         "ts": unix_timestamp(),
-        "request_id": request_id,
-        "principal": identity.map(|context| context.principal_id().as_str()),
-        "organization": identity.map(|context| context.organization_id().as_str()),
-        "reason": reason,
-        "method": method,
-        "path": path,
+        "request_id": request.request_id,
+        "principal": request.identity.map(|context| context.principal_id().as_str()),
+        "organization": request.identity.map(|context| context.organization_id().as_str()),
+        "reason": request.reason,
+        "method": request.method,
+        "path": request.path,
+        "model_id": request.model_id,
         "status": status.as_u16(),
     });
     log.write(jsonl_line(line));
@@ -885,6 +1307,7 @@ struct UsageRecord {
     organization: String,
     method: String,
     path: String,
+    model_id: Option<String>,
     response_head_status: u16,
     request_metrics: Option<Arc<RequestBodyMetrics>>,
     response_bytes: u64,
@@ -935,7 +1358,7 @@ impl Drop for UsageTracker {
 
 /// Appends one terminal JSONL usage record:
 /// `{ts, started_ts, duration_ms, request_id, principal, organization, method,
-/// path, response_head_status, request_bytes, response_bytes, stream_outcome}`.
+/// path, model_id, response_head_status, request_bytes, response_bytes, stream_outcome}`.
 /// `request_bytes` is `null` unless the gateway observed the forwarded request
 /// body reach EOF. Byte counts are raw payload bytes the gateway read or
 /// forwarded, never tokenizer counts, so this record must not be used as an
@@ -950,6 +1373,7 @@ fn write_usage_record(record: UsageRecord, outcome: &'static str) {
         "organization": record.organization,
         "method": record.method,
         "path": record.path,
+        "model_id": record.model_id,
         "response_head_status": record.response_head_status,
         "request_bytes": record
             .request_metrics
@@ -1167,16 +1591,26 @@ where
 }
 
 fn gateway_error(status: StatusCode, message: &'static str) -> Response {
-    let mut response = (
-        status,
-        Json(serde_json::json!({
-            "error": {
-                "message": message,
-                "type": "gateway_error"
-            }
-        })),
-    )
-        .into_response();
+    gateway_api_error(status, message, "gateway_error", None, None)
+}
+
+fn gateway_api_error(
+    status: StatusCode,
+    message: &'static str,
+    error_type: &'static str,
+    code: Option<&'static str>,
+    parameter: Option<&'static str>,
+) -> Response {
+    let mut error = serde_json::Map::new();
+    error.insert("message".into(), serde_json::Value::String(message.into()));
+    error.insert("type".into(), serde_json::Value::String(error_type.into()));
+    if let Some(code) = code {
+        error.insert("code".into(), serde_json::Value::String(code.into()));
+    }
+    if let Some(parameter) = parameter {
+        error.insert("param".into(), serde_json::Value::String(parameter.into()));
+    }
+    let mut response = (status, Json(serde_json::json!({ "error": error }))).into_response();
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -1494,6 +1928,30 @@ mod tests {
                 .to_string(),
             "upstream must be an origin without a path or query"
         );
+    }
+
+    #[test]
+    fn model_catalog_rejects_ambiguous_ids_and_orders_discovery_stably() {
+        let alpha = UpstreamOrigin::parse("http://alpha.test").unwrap();
+        let bravo = UpstreamOrigin::parse("http://bravo.test").unwrap();
+        let catalog = ModelCatalog::new([
+            ("bravo".to_string(), bravo.clone()),
+            ("alpha".to_string(), alpha.clone()),
+        ])
+        .unwrap();
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog.model_ids().collect::<Vec<_>>(), ["alpha", "bravo"]);
+        assert_eq!(catalog.upstream("alpha"), Some(&alpha));
+
+        let duplicate = ModelCatalog::new([
+            ("alpha".to_string(), alpha.clone()),
+            ("alpha".to_string(), bravo.clone()),
+        ])
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("duplicate model id"));
+        assert!(ModelCatalog::new([(String::new(), alpha.clone())]).is_err());
+        assert!(ModelCatalog::new([("line\nbreak".to_string(), alpha)]).is_err());
+        assert!(ModelCatalog::new(Vec::<(String, UpstreamOrigin)>::new()).is_err());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use camelid_enterprise_gateway::{
-    router_with_options, GatewayAuth, GatewayLog, LogFlush, OrgQuota, UpstreamOrigin,
-    DEFAULT_LOG_FLUSH_DEADLINE, DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT,
+    router_with_model_catalog, router_with_options, GatewayAuth, GatewayLog, LogFlush,
+    ModelCatalog, OrgQuota, UpstreamOrigin, DEFAULT_LOG_FLUSH_DEADLINE,
+    DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES,
 };
 use clap::{Parser, Subcommand};
 use identity::{OrganizationId, PrincipalId, RotationLifetime, SqliteIdentityStore, TokenLifetime};
@@ -19,11 +20,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the transparent gateway in front of one replica or cluster Service.
+    /// Start a transparent single-upstream gateway or a static multi-model gateway.
     Serve {
-        /// Replica origin, including the http:// scheme and optional port.
-        #[arg(long, env = "CAMELID_GATEWAY_UPSTREAM")]
-        upstream: String,
+        /// Replica origin for legacy transparent mode, including the http://
+        /// scheme and optional port. Mutually exclusive with --model-route.
+        #[arg(
+            long,
+            env = "CAMELID_GATEWAY_UPSTREAM",
+            required_unless_present = "model_route",
+            conflicts_with = "model_route"
+        )]
+        upstream: Option<String>,
+        /// Static model-id-to-replica-pool mapping, written as
+        /// `<model-id>=<http://origin>`. Repeat for every model. Enables
+        /// catalog mode and is mutually exclusive with --upstream.
+        #[arg(long, value_name = "MODEL_ID=ORIGIN", conflicts_with = "upstream")]
+        model_route: Vec<String>,
+        /// Largest JSON generation request catalog mode may materialize to
+        /// select a model. Ignored by transparent --upstream mode.
+        #[arg(long, default_value_t = DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES)]
+        max_model_selection_body_bytes: NonZeroUsize,
         /// Bind address for client traffic.
         #[arg(long, default_value = "127.0.0.1:8080", env = "CAMELID_GATEWAY_ADDR")]
         addr: SocketAddr,
@@ -203,6 +219,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
         Command::Serve {
             upstream,
+            model_route,
+            max_model_selection_body_bytes,
             addr,
             max_in_flight,
             max_connection_seconds,
@@ -212,21 +230,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             org_request_quota,
             org_request_quota_window_seconds,
         } => {
-            serve(
-                &upstream,
+            serve(ServeArgs {
+                upstream,
+                model_routes: model_route,
+                max_model_selection_body_bytes,
                 addr,
                 max_in_flight,
                 max_connection_seconds,
                 identity_db,
-                GatewayLogArgs {
+                logs: GatewayLogArgs {
                     audit_log,
                     usage_log,
                 },
-                OrgQuotaArgs {
+                org_request_quota: OrgQuotaArgs {
                     limit: org_request_quota,
                     window_seconds: org_request_quota_window_seconds,
                 },
-            )
+            })
             .await
         }
         Command::CreateUser { identity_db, name } => create_user(&identity_db, &name),
@@ -284,7 +304,57 @@ struct GatewayLogArgs {
     usage_log: Option<PathBuf>,
 }
 
+/// Fully parsed `serve` configuration. Grouping this before startup keeps the
+/// CLI match and the operating path from drifting as gateway modes grow.
+struct ServeArgs {
+    upstream: Option<String>,
+    model_routes: Vec<String>,
+    max_model_selection_body_bytes: NonZeroUsize,
+    addr: SocketAddr,
+    max_in_flight: NonZeroUsize,
+    max_connection_seconds: u64,
+    identity_db: Option<PathBuf>,
+    logs: GatewayLogArgs,
+    org_request_quota: OrgQuotaArgs,
+}
+
 type GatewayLogs = (Option<Arc<GatewayLog>>, Option<Arc<GatewayLog>>);
+
+enum ServeRouting {
+    Passthrough(UpstreamOrigin),
+    Catalog(ModelCatalog),
+}
+
+fn parse_serve_routing(
+    upstream: Option<String>,
+    model_routes: Vec<String>,
+) -> Result<ServeRouting, Box<dyn std::error::Error>> {
+    match (upstream, model_routes.is_empty()) {
+        (Some(upstream), true) => Ok(ServeRouting::Passthrough(UpstreamOrigin::parse(&upstream)?)),
+        (None, false) => {
+            let routes = model_routes
+                .into_iter()
+                .map(|route| parse_model_route(&route))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ServeRouting::Catalog(ModelCatalog::new(routes)?))
+        }
+        // Clap enforces this for command-line callers. Retaining the check
+        // makes `serve` correct for direct callers and protects future CLI
+        // changes from silently choosing a routing mode.
+        (Some(_), false) => Err("--upstream and --model-route cannot be combined".into()),
+        (None, true) => Err("either --upstream or at least one --model-route is required".into()),
+    }
+}
+
+fn parse_model_route(value: &str) -> Result<(String, UpstreamOrigin), Box<dyn std::error::Error>> {
+    let (model_id, origin) = value
+        .split_once('=')
+        .ok_or("--model-route must use MODEL_ID=http://ORIGIN")?;
+    if model_id.is_empty() || origin.is_empty() {
+        return Err("--model-route must use a non-empty MODEL_ID and ORIGIN".into());
+    }
+    Ok((model_id.to_string(), UpstreamOrigin::parse(origin)?))
+}
 
 fn open_gateway_logs(logs: &GatewayLogArgs) -> Result<GatewayLogs, Box<dyn std::error::Error>> {
     let audit = logs
@@ -305,16 +375,19 @@ fn open_gateway_logs(logs: &GatewayLogArgs) -> Result<GatewayLogs, Box<dyn std::
     Ok((audit, usage))
 }
 
-async fn serve(
-    upstream: &str,
-    addr: SocketAddr,
-    max_in_flight: NonZeroUsize,
-    max_connection_seconds: u64,
-    identity_db: Option<PathBuf>,
-    logs: GatewayLogArgs,
-    org_request_quota: OrgQuotaArgs,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let upstream = UpstreamOrigin::parse(upstream)?;
+async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let ServeArgs {
+        upstream,
+        model_routes,
+        max_model_selection_body_bytes,
+        addr,
+        max_in_flight,
+        max_connection_seconds,
+        identity_db,
+        logs,
+        org_request_quota,
+    } = args;
+    let routing = parse_serve_routing(upstream, model_routes)?;
     let (audit, usage) = open_gateway_logs(&logs)?;
     // Cloned before the sinks are moved into the router and the auth mode:
     // both must still be reachable after `serve` returns so shutdown can drain
@@ -358,6 +431,25 @@ async fn serve(
             GatewayAuth::Disabled
         }
     };
+    let router = match routing {
+        ServeRouting::Passthrough(upstream) => {
+            router_with_options(upstream, max_in_flight, auth, audit)
+        }
+        ServeRouting::Catalog(catalog) => {
+            tracing::info!(
+                model_count = catalog.len(),
+                max_model_selection_body_bytes = max_model_selection_body_bytes.get(),
+                "gateway static model catalog enabled"
+            );
+            router_with_model_catalog(
+                catalog,
+                max_in_flight,
+                max_model_selection_body_bytes,
+                auth,
+                audit,
+            )
+        }
+    };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let max_connection_duration = Duration::from_secs(max_connection_seconds);
     // Shutdown happens in stages -- connections drain, then each configured
@@ -386,7 +478,7 @@ async fn serve(
     );
     let served = camelid_enterprise_gateway::serve(
         listener,
-        router_with_options(upstream, max_in_flight, auth, audit),
+        router,
         max_connection_duration,
         shutdown_signal(),
     )
@@ -638,6 +730,56 @@ mod tests {
             panic!("expected the parsed command to be Serve");
         };
         assert_eq!(max_in_flight, DEFAULT_MAX_IN_FLIGHT);
+    }
+
+    #[test]
+    fn catalog_mode_requires_complete_unambiguous_routing_configuration() {
+        let cli = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--model-route",
+            "alpha=http://127.0.0.1:8181",
+            "--model-route",
+            "bravo=http://127.0.0.1:8282",
+        ])
+        .unwrap();
+        let Command::Serve {
+            upstream,
+            model_route,
+            max_model_selection_body_bytes,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the parsed command to be Serve");
+        };
+        assert_eq!(upstream, None);
+        assert_eq!(model_route.len(), 2);
+        assert_eq!(
+            max_model_selection_body_bytes,
+            DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES
+        );
+        let routing = parse_serve_routing(upstream, model_route).unwrap();
+        assert!(matches!(routing, ServeRouting::Catalog(catalog) if catalog.len() == 2));
+
+        assert!(Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+            "--model-route",
+            "alpha=http://127.0.0.1:8181",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["camelid-enterprise-gateway", "serve"]).is_err());
+        assert!(parse_serve_routing(
+            None,
+            vec![
+                "alpha=http://127.0.0.1:8181".into(),
+                "alpha=http://127.0.0.1:8282".into()
+            ],
+        )
+        .is_err());
+        assert!(parse_model_route("alpha-without-an-origin").is_err());
     }
 
     #[test]
