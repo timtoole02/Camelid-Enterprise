@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::time::Instant;
@@ -39,6 +39,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IDLE_PER_HOST: usize = 32;
 const MAX_PENDING_LOG_RECORDS: usize = 1_024;
+/// How long shutdown waits for each JSONL log to drain what it already
+/// accepted. Deliberately short relative to a termination grace period: the
+/// point is to save the queue in the ordinary case, not to let a stuck
+/// filesystem hold the process open until the orchestrator kills it, which
+/// would lose the records anyway and delay everything else on the way out.
+pub const DEFAULT_LOG_FLUSH_DEADLINE: Duration = Duration::from_secs(5);
 /// Retry-After is jittered across this inclusive range (seconds) so that
 /// clients rejected at the same instant do not retry in lockstep and
 /// re-create the exact saturation spike that rejected them.
@@ -99,10 +105,59 @@ impl Default for ConnectionTermination {
 /// the gateway accepts traffic. Runtime writes never block a request task: a
 /// full queue drops the record and reports a rate-limited warning instead of
 /// growing an unbounded backlog on Tokio's blocking pool.
+///
+/// The queue is drained by a dedicated thread, so a record that has been
+/// accepted is not yet a record that has been written. [`Self::flush_and_stop`]
+/// closes that gap at shutdown; without it, everything still queued when the
+/// process exits is lost, which on Kubernetes is every rolling update rather
+/// than an edge case.
 pub struct GatewayLog {
     destination: PathBuf,
-    sender: SyncSender<String>,
+    /// The record sender and the writer's completion signal, behind one lock.
+    ///
+    /// One lock rather than two on purpose: shutdown has to take both halves
+    /// atomically. Split across separate mutexes, two concurrent flushes can
+    /// interleave so that each takes one half, and then neither waits for the
+    /// drain it just triggered.
+    ///
+    /// This costs one uncontended mutex acquisition per record. The bounded
+    /// channel behind it already takes an internal lock on every send, so this
+    /// adds a second lock of the same order to a path that is already far
+    /// cheaper than the request it accompanies.
+    channel: Mutex<LogChannel>,
+    queued_records: AtomicU64,
+    written_records: Arc<AtomicU64>,
     dropped_records: AtomicU64,
+}
+
+/// Both halves are `None` once [`GatewayLog::flush_and_stop`] has taken them.
+/// Dropping the sender is what tells the writer thread to drain and exit, and
+/// holding it here means shutdown does not depend on every `Arc` clone of the
+/// log having been released first.
+struct LogChannel {
+    records: Option<SyncSender<String>>,
+    /// A channel rather than a `JoinHandle` because joining a thread cannot be
+    /// given a deadline, and shutdown must stay bounded.
+    writer_stopped: Option<Receiver<()>>,
+}
+
+/// What [`GatewayLog::flush_and_stop`] managed to do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogFlush {
+    /// The writer drained every accepted record and stopped.
+    Drained,
+    /// The deadline expired first. `pending_at_deadline` records had been
+    /// accepted but not yet written when the wait gave up.
+    ///
+    /// Deliberately not called "lost". Giving up on the wait does not stop the
+    /// writer: it keeps draining on its own, so some or all of these may still
+    /// reach the file before the process exits. What the count states is how
+    /// far behind the writer was at the deadline, which is an upper bound on
+    /// the loss rather than a measurement of it. An exact figure is not
+    /// available to a caller that has chosen not to keep waiting.
+    TimedOut { pending_at_deadline: u64 },
+    /// The log was already stopped. Flushing twice is not an error.
+    AlreadyStopped,
 }
 
 impl GatewayLog {
@@ -113,13 +168,27 @@ impl GatewayLog {
             .open(path.as_ref())?;
         let destination = std::fs::canonicalize(path.as_ref())?;
         let (sender, receiver) = sync_channel(MAX_PENDING_LOG_RECORDS);
+        let (stopped_sender, stopped_receiver) = sync_channel::<()>(1);
         let writer_destination = destination.clone();
+        let written_records = Arc::new(AtomicU64::new(0));
+        let writer_written = Arc::clone(&written_records);
         std::thread::Builder::new()
             .name("camelid-gateway-jsonl".into())
-            .spawn(move || write_jsonl_records(file, receiver, writer_destination))?;
+            .spawn(move || {
+                write_jsonl_records(file, receiver, writer_destination, writer_written);
+                // Best-effort: if the flush already timed out and dropped the
+                // receiver, nobody is waiting for this and the send fails
+                // harmlessly.
+                let _ = stopped_sender.send(());
+            })?;
         Ok(Arc::new(Self {
             destination,
-            sender,
+            channel: Mutex::new(LogChannel {
+                records: Some(sender),
+                writer_stopped: Some(stopped_receiver),
+            }),
+            queued_records: AtomicU64::new(0),
+            written_records,
             dropped_records: AtomicU64::new(0),
         }))
     }
@@ -132,11 +201,76 @@ impl GatewayLog {
         self.destination == other.destination
     }
 
+    /// Stops accepting records, waits up to `deadline` for the writer to drain
+    /// what was already accepted, and reports the outcome.
+    ///
+    /// Bounded on purpose. An unbounded wait would make a stuck filesystem able
+    /// to hold the process open past the orchestrator's termination grace
+    /// period, at which point the process is killed anyway and the wait has
+    /// bought nothing while delaying every other shutdown step. Losing a
+    /// bounded number of evidence records is the better failure, provided the
+    /// shortfall is reported rather than silent.
+    ///
+    /// Giving up does not stop the writer. It continues draining until the
+    /// process exits, so [`LogFlush::TimedOut`] reports how far behind it was,
+    /// not how much was ultimately lost.
+    ///
+    /// Safe to call more than once and from any thread; later calls return
+    /// [`LogFlush::AlreadyStopped`].
+    pub fn flush_and_stop(&self, deadline: Duration) -> LogFlush {
+        // Both halves come out under one lock, so a concurrent flush either
+        // does all of this or none of it.
+        //
+        // Dropping the sender closes the channel. `Receiver`'s iterator yields
+        // everything already buffered before it observes the disconnect, so
+        // accepted records are written rather than discarded.
+        let (sender, stopped) = {
+            let mut channel = Self::locked(&self.channel);
+            (channel.records.take(), channel.writer_stopped.take())
+        };
+        let (Some(sender), Some(stopped)) = (sender, stopped) else {
+            return LogFlush::AlreadyStopped;
+        };
+        drop(sender);
+        match stopped.recv_timeout(deadline) {
+            Ok(()) => LogFlush::Drained,
+            Err(_) => LogFlush::TimedOut {
+                pending_at_deadline: self
+                    .queued_records
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(self.written_records.load(Ordering::Relaxed)),
+            },
+        }
+    }
+
+    fn locked<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
+        value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn write(&self, line: String) {
-        match self.sender.try_send(line) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => self.record_drop("writer queue is full"),
-            Err(TrySendError::Disconnected(_)) => self.record_drop("writer thread stopped"),
+        let refusal = {
+            let channel = Self::locked(&self.channel);
+            match channel.records.as_ref() {
+                None => Some("log is shutting down"),
+                Some(sender) => match sender.try_send(line) {
+                    Ok(()) => {
+                        // Counted under the same lock `flush_and_stop` takes,
+                        // so no record can be accepted after a flush has
+                        // decided what the totals are.
+                        self.queued_records.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                    Err(TrySendError::Full(_)) => Some("writer queue is full"),
+                    Err(TrySendError::Disconnected(_)) => Some("writer thread stopped"),
+                },
+            }
+        };
+        // Reported outside the lock: the warning must not serialise other
+        // request tasks behind a logging call.
+        if let Some(reason) = refusal {
+            self.record_drop(reason);
         }
     }
 
@@ -153,7 +287,12 @@ impl GatewayLog {
     }
 }
 
-fn write_jsonl_records(mut file: std::fs::File, records: Receiver<String>, destination: PathBuf) {
+fn write_jsonl_records(
+    mut file: std::fs::File,
+    records: Receiver<String>,
+    destination: PathBuf,
+    written: Arc<AtomicU64>,
+) {
     let mut failed_writes = 0_u64;
     for line in records {
         if let Err(error) = file.write_all(line.as_bytes()) {
@@ -169,6 +308,10 @@ fn write_jsonl_records(mut file: std::fs::File, records: Receiver<String>, desti
         } else {
             failed_writes = 0;
         }
+        // Counted whether or not the write succeeded: this tracks records the
+        // writer has finished with, which is what makes the pending count at a
+        // flush timeout mean "still queued" rather than "not yet durable".
+        written.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -708,8 +851,9 @@ fn audited(state: &GatewayState, request: AuditedRequest<'_>, response: Response
 /// sent upstream.
 ///
 /// Best-effort and off the request's async context: a failed write must never
-/// fail the request. The dedicated bounded writer queue can lose records on
-/// process exit, when full, or after a write failure; [`GatewayLog`] emits
+/// fail the request. The dedicated bounded writer queue can lose records when
+/// full, after a write failure, or if an abrupt crash takes the process down;
+/// [`GatewayLog`] emits
 /// rate-limited warnings for each condition. Its single writer serializes
 /// complete JSONL records so concurrent requests cannot interleave lines.
 fn write_audit_record(
@@ -1469,5 +1613,160 @@ mod tests {
         assert_eq!(retry_after_seconds(Duration::from_millis(1)), 1);
         assert_eq!(retry_after_seconds(Duration::from_secs(1)), 1);
         assert_eq!(retry_after_seconds(Duration::new(59, 999_999_999)), 60);
+    }
+
+    /// Reads the sink without retrying. Every test below asserts on the file
+    /// the instant `flush_and_stop` returns, because polling until the writer
+    /// happens to catch up would pass whether or not shutdown drains anything
+    /// -- which is precisely the bug these tests exist to hold closed.
+    fn read_lines_now(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn flush_and_stop_persists_every_accepted_record() {
+        // Comfortably more than the writer can drain in the time it takes to
+        // enqueue them, and well under MAX_PENDING_LOG_RECORDS so nothing is
+        // dropped for a full queue: every record here is *accepted*, which is
+        // what shutdown promises to persist.
+        const RECORDS: usize = 500;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = GatewayLog::open(&path).unwrap();
+
+        for index in 0..RECORDS {
+            log.write(format!("{{\"n\":{index}}}\n"));
+        }
+        assert_eq!(
+            log.flush_and_stop(Duration::from_secs(30)),
+            LogFlush::Drained
+        );
+
+        let lines = read_lines_now(&path);
+        assert_eq!(
+            lines.len(),
+            RECORDS,
+            "every accepted record must be on disk once flush reports Drained"
+        );
+        // Order is the queue's order, so the sink is append-only and in
+        // sequence rather than merely complete.
+        for (index, line) in lines.iter().enumerate() {
+            assert_eq!(line, &format!("{{\"n\":{index}}}"));
+        }
+        assert_eq!(log.dropped_records.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn flush_and_stop_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = GatewayLog::open(dir.path().join("audit.jsonl")).unwrap();
+
+        assert_eq!(
+            log.flush_and_stop(Duration::from_secs(30)),
+            LogFlush::Drained
+        );
+        assert_eq!(
+            log.flush_and_stop(Duration::from_secs(30)),
+            LogFlush::AlreadyStopped,
+            "a second flush must be a no-op, not a hang or a panic"
+        );
+    }
+
+    #[test]
+    fn writes_after_flush_are_dropped_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = GatewayLog::open(&path).unwrap();
+
+        log.write("{\"before\":true}\n".to_string());
+        assert_eq!(
+            log.flush_and_stop(Duration::from_secs(30)),
+            LogFlush::Drained
+        );
+        // A request that finishes after shutdown began must not panic the
+        // gateway, and must not silently look like it was recorded.
+        log.write("{\"after\":true}\n".to_string());
+
+        assert_eq!(read_lines_now(&path), vec!["{\"before\":true}".to_string()]);
+        assert_eq!(log.dropped_records.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn flush_outcome_is_self_consistent_under_an_expired_deadline() {
+        // A zero deadline races the writer by construction, so this asserts the
+        // invariant that holds either way rather than pinning one arm and
+        // becoming flaky: whatever is reported pending was accepted and not yet
+        // written. It is an upper bound on loss, not a measurement -- the
+        // writer keeps draining after the wait gives up.
+        const RECORDS: u64 = 500;
+        let dir = tempfile::tempdir().unwrap();
+        let log = GatewayLog::open(dir.path().join("audit.jsonl")).unwrap();
+        for index in 0..RECORDS {
+            log.write(format!("{{\"n\":{index}}}\n"));
+        }
+
+        let queued = log.queued_records.load(Ordering::Relaxed);
+        match log.flush_and_stop(Duration::ZERO) {
+            LogFlush::Drained => {}
+            LogFlush::TimedOut {
+                pending_at_deadline,
+            } => {
+                assert!(
+                    pending_at_deadline <= queued,
+                    "pending {pending_at_deadline} cannot exceed the {queued} accepted"
+                );
+            }
+            LogFlush::AlreadyStopped => panic!("a first flush cannot report AlreadyStopped"),
+        }
+        assert_eq!(queued, RECORDS, "no record should have been rejected");
+    }
+
+    #[test]
+    fn concurrent_flushes_still_drain_exactly_once() {
+        // Pins the invariant that exactly one caller owns the drain and the
+        // rest are no-ops. It does not claim to reproduce the interleaving that
+        // motivated putting both halves behind one lock -- that window is a few
+        // instructions wide and would not fail reliably -- but the invariant it
+        // asserts is the one that interleaving violates, and it also holds
+        // shutdown idempotency closed against simpler regressions.
+        const FLUSHERS: usize = 16;
+        const RECORDS: usize = 200;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = GatewayLog::open(&path).unwrap();
+        for index in 0..RECORDS {
+            log.write(format!("{{\"n\":{index}}}\n"));
+        }
+
+        let outcomes: Vec<LogFlush> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..FLUSHERS)
+                .map(|_| {
+                    let log = Arc::clone(&log);
+                    scope.spawn(move || log.flush_and_stop(Duration::from_secs(30)))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let drained = outcomes
+            .iter()
+            .filter(|outcome| **outcome == LogFlush::Drained)
+            .count();
+        let already = outcomes
+            .iter()
+            .filter(|outcome| **outcome == LogFlush::AlreadyStopped)
+            .count();
+        assert_eq!(
+            drained, 1,
+            "exactly one caller owns the drain: {outcomes:?}"
+        );
+        assert_eq!(already, FLUSHERS - 1, "every other caller is a no-op");
+        // The caller that reported Drained really did wait for it.
+        assert_eq!(read_lines_now(&path).len(), RECORDS);
     }
 }

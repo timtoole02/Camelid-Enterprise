@@ -1,6 +1,6 @@
 use camelid_enterprise_gateway::{
-    router_with_options, GatewayAuth, GatewayLog, OrgQuota, UpstreamOrigin,
-    DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT,
+    router_with_options, GatewayAuth, GatewayLog, LogFlush, OrgQuota, UpstreamOrigin,
+    DEFAULT_LOG_FLUSH_DEADLINE, DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT,
 };
 use clap::{Parser, Subcommand};
 use identity::{OrganizationId, PrincipalId, RotationLifetime, SqliteIdentityStore, TokenLifetime};
@@ -316,6 +316,11 @@ async fn serve(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream = UpstreamOrigin::parse(upstream)?;
     let (audit, usage) = open_gateway_logs(&logs)?;
+    // Cloned before the sinks are moved into the router and the auth mode:
+    // both must still be reachable after `serve` returns so shutdown can drain
+    // what is still queued.
+    let audit_sink = audit.clone();
+    let usage_sink = usage.clone();
     if let Some(audit) = &audit {
         tracing::info!(path = %audit.path().display(), "gateway request audit log enabled");
     }
@@ -355,20 +360,97 @@ async fn serve(
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let max_connection_duration = Duration::from_secs(max_connection_seconds);
+    // Shutdown happens in stages -- connections drain, then each configured
+    // JSONL log drains -- and an orchestrator that only budgets for the first
+    // stage kills the process mid-drain. Nothing here can read the configured
+    // termination grace period, so state the requirement instead of assuming
+    // it: an operator comparing this line against their manifest can see the
+    // mismatch that would otherwise only show up as a quietly truncated log.
+    let configured_logs = u64::from(audit_sink.is_some()) + u64::from(usage_sink.is_some());
+    // Computed before the macro, not inside it. `tracing` only evaluates field
+    // expressions when the level is enabled, so arithmetic left in the macro
+    // runs or does not run depending on `RUST_LOG` -- which would make whether
+    // this process starts a function of how it is configured to log. Saturating
+    // because `--max-connection-seconds` is an unbounded `u64` and a caller may
+    // pass one whose budget is not representable.
+    let required_budget = required_shutdown_budget_seconds(max_connection_seconds, configured_logs);
     tracing::info!(
         %addr,
         max_in_flight = max_in_flight.get(),
         max_connection_seconds,
-        "gateway listening"
+        log_flush_deadline_seconds = DEFAULT_LOG_FLUSH_DEADLINE.as_secs(),
+        configured_logs,
+        required_shutdown_budget_seconds = required_budget,
+        "gateway listening; termination grace period must exceed the required \
+         shutdown budget or logs will be killed mid-drain"
     );
-    camelid_enterprise_gateway::serve(
+    let served = camelid_enterprise_gateway::serve(
         listener,
         router_with_options(upstream, max_in_flight, auth, audit),
         max_connection_duration,
         shutdown_signal(),
     )
-    .await?;
+    .await;
+    // Drained after the connection drain, never before it: records for the
+    // requests that finished during graceful shutdown are queued while `serve`
+    // is still running, and those are exactly the ones an early flush would
+    // miss. Run it even when `serve` failed -- whatever was accepted before
+    // the failure is still evidence.
+    flush_gateway_log("audit", audit_sink);
+    flush_gateway_log("usage", usage_sink);
+    served?;
     Ok(())
+}
+
+/// Seconds a deployment must allow between SIGTERM and SIGKILL for the gateway
+/// to finish shutting down: the connection drain, then one flush deadline per
+/// configured JSONL log.
+///
+/// Saturating rather than checked. This is a diagnostic an operator compares
+/// against their orchestrator's grace period, and a nonsensical connection cap
+/// should produce a nonsensical-looking budget, not stop the gateway from
+/// starting. `u64::MAX` seconds is already unsatisfiable by any grace period,
+/// which is the message either way.
+fn required_shutdown_budget_seconds(max_connection_seconds: u64, configured_logs: u64) -> u64 {
+    max_connection_seconds
+        .saturating_add(configured_logs.saturating_mul(DEFAULT_LOG_FLUSH_DEADLINE.as_secs()))
+}
+
+/// Drains one JSONL sink at shutdown and reports what happened.
+///
+/// A timeout is logged at `error` rather than `warn`: the log is evidence, and
+/// a short one that nobody was told about is worse than no log at all, because
+/// it still looks complete to whatever aggregates it later. The reported count
+/// is how far behind the writer was when the wait gave up, not a measurement of
+/// what was ultimately lost -- the writer keeps draining until the process
+/// exits, so some or all of those records may still land.
+fn flush_gateway_log(kind: &'static str, log: Option<Arc<GatewayLog>>) {
+    let Some(log) = log else {
+        return;
+    };
+    match log.flush_and_stop(DEFAULT_LOG_FLUSH_DEADLINE) {
+        LogFlush::Drained => {
+            tracing::info!(
+                kind,
+                path = %log.path().display(),
+                "gateway JSONL log drained at shutdown"
+            );
+        }
+        LogFlush::TimedOut {
+            pending_at_deadline,
+        } => {
+            tracing::error!(
+                kind,
+                path = %log.path().display(),
+                pending_at_deadline,
+                deadline_seconds = DEFAULT_LOG_FLUSH_DEADLINE.as_secs(),
+                "gateway JSONL log did not finish draining before the flush \
+                 deadline; this many accepted records were still queued and \
+                 may not survive process exit"
+            );
+        }
+        LogFlush::AlreadyStopped => {}
+    }
 }
 
 fn create_user(identity_db: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -679,6 +761,23 @@ mod tests {
             "usage.jsonl",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn shutdown_budget_saturates_instead_of_overflowing() {
+        // The connection cap is an unbounded `u64` from the CLI. Computing the
+        // budget with `+` overflowed, and because `tracing` only evaluates
+        // field expressions when the level is enabled, that made startup
+        // succeed or panic depending on `RUST_LOG` -- logging configuration
+        // deciding process correctness.
+        assert_eq!(required_shutdown_budget_seconds(300, 2), 310);
+        assert_eq!(required_shutdown_budget_seconds(300, 0), 300);
+        assert_eq!(required_shutdown_budget_seconds(u64::MAX, 2), u64::MAX);
+        assert_eq!(
+            required_shutdown_budget_seconds(u64::MAX, u64::MAX),
+            u64::MAX
+        );
+        assert_eq!(required_shutdown_budget_seconds(0, u64::MAX), u64::MAX);
     }
 
     #[test]
