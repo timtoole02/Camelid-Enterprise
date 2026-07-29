@@ -2,8 +2,7 @@ use camelid_enterprise_gateway::{
     router_with_model_catalog, router_with_options, GatewayAuth, GatewayLog, LogFlush,
     ModelCatalog, ModelSelectionLimits, OrgQuota, UpstreamOrigin, VerifiedModelCatalog,
     DEFAULT_LOG_FLUSH_DEADLINE, DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT,
-    DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES, DEFAULT_MAX_ORG_MODEL_SELECTIONS,
-    DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES,
+    DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES, DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES,
 };
 use clap::{Parser, Subcommand};
 use identity::{OrganizationId, PrincipalId, RotationLifetime, SqliteIdentityStore, TokenLifetime};
@@ -57,8 +56,10 @@ enum Command {
         )]
         model_selection_memory_budget_bytes: NonZeroUsize,
         /// Maximum catalog selector bodies one authenticated organization may
-        /// materialize concurrently. Omitted defaults to one, so one tenant's
-        /// stalled body cannot monopolize the global selector memory budget.
+        /// materialize concurrently. Omitted defaults to half the global
+        /// selector capacity (four at the default budget), so no single
+        /// organization can take more than half of it and there is always
+        /// capacity left for another tenant.
         #[arg(
             long,
             env = "CAMELID_GATEWAY_MAX_ORG_MODEL_SELECTIONS",
@@ -509,8 +510,11 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 model_selection_memory_budget_bytes = selection_limits.memory_budget_bytes().get(),
                 max_concurrent_model_selections = selection_limits.max_concurrent().get(),
                 max_org_model_selections = max_org_model_selections
-                    .unwrap_or(DEFAULT_MAX_ORG_MODEL_SELECTIONS)
+                    .unwrap_or_else(|| selection_limits.default_max_org_selections())
                     .get(),
+                model_selection_acquire_timeout_seconds =
+                    selection_limits.acquire_timeout().as_secs(),
+                model_selection_read_timeout_seconds = selection_limits.read_timeout().as_secs(),
                 "gateway static model catalog enabled"
             );
             router_with_model_catalog(

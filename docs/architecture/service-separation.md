@@ -61,7 +61,7 @@ deploy/
 | **Serving replica** | `crates/server` (`camelid-enterprise` bin) | CLI (`serve`), binds an HTTP listener, applies the deterministic lane, stamps attribution, loads one model at startup. |
 | **Lane / config freeze** | `crates/server/src/lane.rs` | Applies a canonical env-var configuration vector, fails closed on any override, publishes its SHA-256. Engine pinned by revision (`ENGINE_PIN`). |
 | **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-host` on every response, injects fields into completion bodies, writes optional JSONL serving receipts (each carrying the gateway-stamped `request_id` when present, or `null` for direct-to-replica traffic). |
-| **Gateway / static catalog** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Two mutually exclusive modes. Transparent `--upstream` mode forwards the full `/v1` allowlist derived from `replica_contract::PUBLIC_ROUTES`; static catalog mode maps operator-configured `--model-route <backend-model-id>=<http://origin>` entries to replica pools. Before binding, catalog mode verifies that each configured id is advertised by its mapped pool's `/v1/models`, so it never accepts a public alias then forwards an invalid unchanged request. It serves model discovery locally and routes only completion/chat requests by a bounded JSON `model` selector; all other public routes are refused rather than sent to an arbitrary pool. Selector work has a separate memory-derived semaphore and, with identity enabled, a per-organization selector cap, so one tenant cannot hold every global selector slot with incomplete bodies. Both modes preserve opaque streaming responses, filter hop-by-hop headers, retry nothing, bound concurrency, and expose no replica control routes. Auth is optional and runs before catalog selection; a selected `model_id` reaches gateway audit/usage records but never a replica. A catalog maps models to pools, not callers to models: every resolved token may use every catalog entry today. Accepted logs drain on clean shutdown within a bounded per-log deadline. |
+| **Gateway / static catalog** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Two mutually exclusive modes. Transparent `--upstream` mode forwards the full `/v1` allowlist derived from `replica_contract::PUBLIC_ROUTES`; static catalog mode maps operator-configured `--model-route <backend-model-id>=<http://origin>` entries to replica pools. Before binding, catalog mode verifies that each configured id is advertised by its mapped pool's `/v1/models`, so it never accepts a public alias then forwards an invalid unchanged request. It serves model discovery locally and routes only completion/chat requests by a bounded JSON `model` selector; all other public routes are refused rather than sent to an arbitrary pool. Selector work has a separate memory-derived semaphore that queues rather than refuses, a bounded body-read deadline that reclaims a stalled slot, and, with identity enabled, a per-organization cap of half the global capacity, so one tenant cannot hold every global selector slot with incomplete bodies. Both modes preserve opaque streaming responses, filter hop-by-hop headers, retry nothing, bound concurrency, and expose no replica control routes. Auth is optional and runs before catalog selection; a selected `model_id` reaches gateway audit/usage records but never a replica. A catalog maps models to pools, not callers to models: every resolved token may use every catalog entry today. Accepted logs drain on clean shutdown within a bounded per-log deadline. |
 | **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | The gateway exposes `/v1/health`, model discovery, completions/chat, and the pinned engine's compatibility endpoints. Replica-local `/api` model management remains private. Provided by the pinned engine crate, **not** by this repo. |
 | **Engine core** | `crates/engine-core` | GGUF container, model config, tensor/forward/tokenizer types. Host-agnostic. |
 | **Platform kernels** | `crates/engine-{macos,linux,windows}` | Runtime CPU feature detection (`probe()`), platform kernels. macOS port landing first; Linux/Windows currently capability-detection only. |
@@ -86,8 +86,9 @@ deploy/
   catalog mode for multiple operator-configured exact backend-model-id-to-pool
   mappings, validated against each pool's `/v1/models` before binding. Catalog
   mode performs bounded JSON selection only for completions/chat, with a
-  separate memory-derived selector-work limit and, with identity enabled, a
-  per-organization selector cap; it serves model discovery locally and
+  separate memory-derived selector-work limit that queues rather than refuses
+  and, with identity enabled, a per-organization cap of half that capacity;
+  it serves model discovery locally and
   otherwise fails closed rather than guessing a pool.
   It has no dynamic catalog, pool-health aggregation, per-organization model
   authorization, or durable shared control-plane state.
@@ -361,14 +362,25 @@ tokens for one model"; everything multi-user is layered on top.
   `model` field. Selector work has a separate memory-derived semaphore, so
   stalled bodies cannot bypass a bounded number of materializations; the
   default 32 MiB selector budget and 2 MiB request limit allow 8 selectors;
-  each reservation covers a raw body and a possible decoded escaped model id.
-  With identity enabled, each organization is further limited to one selector
-  by default, preventing one tenant's stalled body from consuming all global
-  selector capacity while it remains quota-free. The selector cannot choose an
+  each reservation covers a raw body and the decoded model id. That capacity
+  is a queue rather than a gate: a request waits up to five seconds for a slot
+  and is shed with a typed `503` only if the wait expires, because a slot is
+  held for the milliseconds a body takes to arrive and refusing on contact
+  fails valid requests that merely overlapped. Waiting is bounded on the other
+  side too -- a body that does not arrive within fifteen seconds is refused
+  with `408` and its slot reclaimed, so slow clients cannot hold the budget for
+  the whole connection cap -- and a request whose declared `Content-Length`
+  already exceeds the limit is refused with `413` from its head, before it
+  takes a slot. With identity enabled, one organization may hold at most half
+  the global capacity by default (four slots at the default budget), derived
+  from the budget so the invariant survives reconfiguration: no tenant takes
+  more than half, and capacity always remains for another one. The selector
+  cannot choose an
   origin, selection happens after authentication
   but before quota/inference admission, responses remain streaming, and each
   selected id is added to gateway audit/usage evidence. Requests with malformed,
-  missing, unknown, oversized, or non-`application/*` media-type selectors
+  missing, unknown, oversized, non-object, or non-`application/*` media-type
+  selectors
   reach neither a pool nor a quota counter; failed generations are not retried.
   Catalog mode deliberately returns typed `501` for `/v1/health` and
   compatibility POST routes whose contract does not prove a model selector,

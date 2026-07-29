@@ -100,26 +100,46 @@ JSON generation request up to `--max-model-selection-body-bytes` (2 MiB by
 default) to read its `model` field. A separate
 `--model-selection-memory-budget-bytes` limit (32 MiB by default) allows at
 most `memory_budget / (2 * max_body)` concurrent materialized selectors: 8 at
-the defaults. Each slot reserves a raw body plus a possible decoded escaped
-model-id copy. A stalled selector holds one of those slots, and a full selector
-budget returns typed `503` before another body is read. It accepts only
-`application/json` and `application/*+json`; malformed, missing, unknown,
-oversized, or other-media-type selectors are rejected before quota, inference
-admission, or any upstream call. Only
-`POST /v1/completions` and `POST /v1/chat/completions` are routable in catalog
-mode because the pinned Enterprise contract proves their JSON `model` field.
-Catalog discovery is served locally. `/v1/health` and the currently unsupported
-compatibility POST routes return typed `501` rather than being sent to an
-arbitrary pool; `/healthz` remains the gateway liveness endpoint. Catalog
-discovery reports configured inventory, not replica readiness.
+the defaults. Each slot reserves a raw body plus the decoded model-id copy.
 
-When identity is enabled, an organization also receives one concurrent catalog
-selector by default (`--max-org-model-selections` /
-`CAMELID_GATEWAY_MAX_ORG_MODEL_SELECTIONS` changes it). This per-process permit
-is acquired before the global selector memory slot, so one tenant's incomplete
-body cannot starve another tenant's valid selection. It is intentionally
-separate from request quota: invalid selectors remain uncharged, but cannot
-monopolize selector capacity.
+That capacity queues rather than refuses. A request that finds it busy waits up
+to five seconds for a slot and gets a typed `503` only if the wait expires: a
+slot is held for the milliseconds a body takes to arrive, so refusing on
+contact would fail valid requests that merely overlapped. Holding a slot is
+bounded in turn -- a request that has one must deliver its body within fifteen
+seconds or it is refused with `408` and the slot is reclaimed, so slow clients
+cannot occupy the budget for the whole `--max-connection-seconds` window. A
+request whose declared `Content-Length` already exceeds the body limit is
+refused with `413` from its head, before it takes a slot. Catalog mode accepts
+only `application/json` and `application/*+json`, and only a JSON *object*;
+malformed, missing, unknown, non-object, oversized, or other-media-type
+selectors are rejected before quota, inference admission, or any upstream call.
+Only `POST /v1/completions` and `POST /v1/chat/completions` are routable in
+catalog mode because the pinned Enterprise contract proves their JSON `model`
+field. Catalog discovery is served locally and is charged against
+`--org-request-quota` like any other authenticated request. `/v1/health` and
+the currently unsupported compatibility POST routes return typed `501` rather
+than being sent to an arbitrary pool; `/healthz` remains the gateway liveness
+endpoint. Catalog discovery reports configured inventory, not replica
+readiness.
+
+When identity is enabled, one organization may hold at most half the global
+selector capacity by default -- four slots at the default budget
+(`--max-org-model-selections` / `CAMELID_GATEWAY_MAX_ORG_MODEL_SELECTIONS`
+changes it). The bound is derived from the budget rather than fixed, so the
+invariant holds however the budget is configured: no tenant takes more than
+half, and there is always capacity left for another one. This per-process
+permit is acquired before the global selector slot, and the two acquisitions
+share one five-second wait rather than one each. It is intentionally separate
+from request quota: invalid selectors remain uncharged, but cannot monopolize
+selector capacity.
+
+Catalog startup contacts every configured pool, so **the gateway will not start
+while any configured pool is unreachable**; on Kubernetes a gateway rollout
+that coincides with a pool outage restarts until the pool answers. That is
+deliberate -- a catalog the gateway cannot vouch for is worse than a gateway
+that is visibly not ready -- and it does not affect the stock manifest, which
+remains single-upstream mode.
 
 Authentication runs before catalog selection, so an authenticated deployment
 does not disclose model inventory to an anonymous caller. Catalog mode does

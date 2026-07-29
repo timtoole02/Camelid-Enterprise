@@ -6,7 +6,9 @@
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{Path as AxumPath, Request, State};
-use axum::http::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, WWW_AUTHENTICATE};
+use axum::http::header::{
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, WWW_AUTHENTICATE,
+};
 use axum::http::uri::{Authority, Scheme};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -55,11 +57,34 @@ pub const DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES: NonZeroUsize =
 /// selector bodies in memory than this declared budget allows.
 pub const DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES: NonZeroUsize =
     NonZeroUsize::new(32 * 1024 * 1024).unwrap();
-/// Authenticated catalog mode allows this many concurrently materialized
-/// selector bodies per organization unless the operator configures a higher
-/// explicit bound. The selector phase is normally short; one is sufficient to
-/// prevent one tenant's stalled body from occupying every global memory slot.
-pub const DEFAULT_MAX_ORG_MODEL_SELECTIONS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+/// How long a request may wait for selector capacity before the gateway sheds
+/// it with a typed `503`.
+///
+/// Waiting rather than refusing on contact is the whole point. Selector
+/// capacity is a *memory* reservation held only while a request body is being
+/// read, which for an ordinary generation request is milliseconds. Refusing
+/// immediately turns every momentary overlap between two valid requests into a
+/// failed request: measured on loopback with the previous fail-fast admission,
+/// sixteen concurrent 64 KiB requests from one organization lost three
+/// quarters of the burst, and sixty-four requests spread across sixty-four
+/// distinct organizations lost 84% of them to the global bound alone. A
+/// waiter holds no body memory, so queueing briefly costs nothing the bound
+/// exists to protect.
+///
+/// It is still bounded: past this the gateway is genuinely out of selector
+/// memory for long enough that shedding load is the honest answer.
+pub const DEFAULT_MODEL_SELECTION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a request that holds selector capacity may take to deliver its
+/// body before the gateway gives up on it.
+///
+/// This is what makes waiting for capacity safe. Without it the only bound on
+/// how long one slot can be occupied is [`DEFAULT_MAX_CONNECTION_DURATION`] --
+/// a client that dribbles a body could hold a selector slot for five minutes,
+/// so the global budget would be exhaustible by a handful of slow clients and
+/// every waiter behind them would time out. A request that cannot deliver at
+/// most `--max-model-selection-body-bytes` within this window is not a
+/// generation request the deployment can serve anyway.
+pub const DEFAULT_MODEL_SELECTION_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long shutdown waits for each JSONL log to drain what it already
 /// accepted. Deliberately short relative to a termination grace period: the
 /// point is to save the queue in the ordinary case, not to let a stuck
@@ -425,12 +450,20 @@ impl std::error::Error for InvalidModelCatalog {}
 
 /// Limits for the request-body work catalog mode performs before it knows which
 /// replica pool to use.
+///
+/// Four bounds, each answering a different question: how large one selector
+/// body may be, how much memory all of them may occupy at once, how long a
+/// request may wait for a share of that memory, and how long it may hold one.
+/// The last two are what keep the first two from turning ordinary concurrency
+/// into failed requests -- see [`DEFAULT_MODEL_SELECTION_ACQUIRE_TIMEOUT`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModelSelectionLimits {
     max_body_bytes: NonZeroUsize,
     memory_budget_bytes: NonZeroUsize,
     bytes_per_selector: NonZeroUsize,
     max_concurrent: NonZeroUsize,
+    acquire_timeout: Duration,
+    read_timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,10 +480,14 @@ impl std::error::Error for InvalidModelSelectionLimits {}
 impl ModelSelectionLimits {
     /// Creates a selector-work limit. The body limit must fit in the declared
     /// budget so one valid selector is always possible. A selector holds its
-    /// bounded raw body and can also allocate a decoded copy of the JSON
-    /// `model` string when it contains escapes, so every slot reserves two
-    /// body limits. The integer quotient is the exact maximum number of those
-    /// worst-case selector states that may exist at once.
+    /// bounded raw body and the decoded copy of the JSON `model` string it
+    /// extracts, so every slot reserves two body limits. The integer quotient
+    /// is the exact maximum number of those worst-case selector states that
+    /// may exist at once.
+    ///
+    /// Timing bounds start at [`DEFAULT_MODEL_SELECTION_ACQUIRE_TIMEOUT`] and
+    /// [`DEFAULT_MODEL_SELECTION_READ_TIMEOUT`]; see
+    /// [`Self::with_acquire_timeout`] and [`Self::with_read_timeout`].
     pub fn new(
         max_body_bytes: NonZeroUsize,
         memory_budget_bytes: NonZeroUsize,
@@ -479,7 +516,24 @@ impl ModelSelectionLimits {
             memory_budget_bytes,
             bytes_per_selector,
             max_concurrent,
+            acquire_timeout: DEFAULT_MODEL_SELECTION_ACQUIRE_TIMEOUT,
+            read_timeout: DEFAULT_MODEL_SELECTION_READ_TIMEOUT,
         })
+    }
+
+    /// Overrides how long a request may wait for selector capacity. Exists so
+    /// tests can exercise the shed-load path without waiting out the
+    /// production budget.
+    pub fn with_acquire_timeout(mut self, acquire_timeout: Duration) -> Self {
+        self.acquire_timeout = acquire_timeout;
+        self
+    }
+
+    /// Overrides how long a request may hold selector capacity while its body
+    /// arrives.
+    pub fn with_read_timeout(mut self, read_timeout: Duration) -> Self {
+        self.read_timeout = read_timeout;
+        self
     }
 
     pub fn max_body_bytes(self) -> NonZeroUsize {
@@ -496,6 +550,28 @@ impl ModelSelectionLimits {
 
     pub fn max_concurrent(self) -> NonZeroUsize {
         self.max_concurrent
+    }
+
+    pub fn acquire_timeout(self) -> Duration {
+        self.acquire_timeout
+    }
+
+    pub fn read_timeout(self) -> Duration {
+        self.read_timeout
+    }
+
+    /// How many selector bodies one authenticated organization may hold at
+    /// once when the operator does not say.
+    ///
+    /// Half the global capacity, so the invariant an operator has to remember
+    /// is a sentence: *no single organization can take more than half the
+    /// selector budget*, and there is always room left for somebody else. A
+    /// flat bound cannot say that -- it is either too small to serve one
+    /// tenant's ordinary concurrency or too large to reserve anything for a
+    /// second one, and which of the two it is depends on a budget it does not
+    /// know about.
+    pub fn default_max_org_selections(self) -> NonZeroUsize {
+        NonZeroUsize::new(self.max_concurrent.get() / 2).unwrap_or(NonZeroUsize::MIN)
     }
 }
 
@@ -738,62 +814,61 @@ pub struct OrgQuota {
 /// separate from [`OrgQuota`]: a selector is charged to quota only after it
 /// proves routable, but a tenant must not be able to keep an incomplete body
 /// open and monopolize global selector memory while remaining quota-free.
+///
+/// A semaphore per organization rather than a counter, because a request that
+/// finds its organization at its bound has to be able to *wait* for a slot.
+/// The bound exists to stop one tenant from occupying the global budget, not
+/// to serialize that tenant: a counter can only say yes or no on contact, and
+/// saying no to work that would have been admissible a millisecond later
+/// rejects ordinary concurrency rather than abuse.
 struct OrgSelectionAdmission {
     limit: NonZeroUsize,
-    in_flight: Mutex<HashMap<String, usize>>,
-}
-
-/// Releases one organization selector slot when the request finishes selection
-/// or its task is cancelled. It intentionally covers only the bounded body-read
-/// phase, never inference or a response stream.
-struct OrgSelectionPermit {
-    admission: Arc<OrgSelectionAdmission>,
-    organization: String,
+    slots: Mutex<HashMap<String, Arc<Semaphore>>>,
 }
 
 impl OrgSelectionAdmission {
     fn new(limit: NonZeroUsize) -> Self {
         Self {
             limit,
-            in_flight: Mutex::new(HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
         }
     }
 
-    fn try_acquire(
-        self: &Arc<Self>,
+    /// Waits until `deadline` for one of this organization's selector slots,
+    /// or `None` if the budget expires first. The returned permit covers only
+    /// the bounded body-read phase; it is released before quota, inference
+    /// admission, and any response stream.
+    async fn acquire(
+        &self,
         organization: &OrganizationId,
-    ) -> Result<OrgSelectionPermit, ()> {
-        let mut in_flight = GatewayLog::locked(&self.in_flight);
-        let count = in_flight
-            .entry(organization.as_str().to_string())
-            .or_insert(0);
-        if *count >= self.limit.get() {
-            return Err(());
-        }
-        *count += 1;
-        Ok(OrgSelectionPermit {
-            admission: Arc::clone(self),
-            organization: organization.as_str().to_string(),
-        })
+        deadline: tokio::time::Instant,
+    ) -> Option<OwnedSemaphorePermit> {
+        let slot = self.slot(organization);
+        // The semaphore is never closed, so an acquisition either succeeds or
+        // runs out of budget.
+        tokio::time::timeout_at(deadline, slot.acquire_owned())
+            .await
+            .ok()?
+            .ok()
     }
 
-    fn release(&self, organization: &str) {
-        let mut in_flight = GatewayLog::locked(&self.in_flight);
-        let Some(count) = in_flight.get_mut(organization) else {
-            debug_assert!(false, "organization selector permit released twice");
-            return;
-        };
-        debug_assert!(*count > 0, "organization selector count must be positive");
-        *count -= 1;
-        if *count == 0 {
-            in_flight.remove(organization);
+    fn slot(&self, organization: &OrganizationId) -> Arc<Semaphore> {
+        let mut slots = GatewayLog::locked(&self.slots);
+        if let Some(slot) = slots.get(organization.as_str()) {
+            return Arc::clone(slot);
         }
-    }
-}
-
-impl Drop for OrgSelectionPermit {
-    fn drop(&mut self) {
-        self.admission.release(&self.organization);
+        // A key is created only for an organization with no live slot, so this
+        // sweep runs off the steady-state path, exactly as `OrgQuota` sweeps
+        // its windows. A semaphore whose only remaining owner is this map has
+        // no permit holder and no waiter: every one of those clones the `Arc`
+        // before releasing this lock, so a strong count of one under it means
+        // the entry is idle and reclaimable.
+        slots.retain(|_, slot| Arc::strong_count(slot) > 1);
+        Arc::clone(
+            slots
+                .entry(organization.as_str().to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.limit.get()))),
+        )
     }
 }
 
@@ -930,7 +1005,8 @@ pub fn router_with_model_catalog(
 ) -> Router {
     let org_selection_admission = matches!(&auth, GatewayAuth::RequireToken { .. }).then(|| {
         Arc::new(OrgSelectionAdmission::new(
-            max_org_model_selections.unwrap_or(DEFAULT_MAX_ORG_MODEL_SELECTIONS),
+            max_org_model_selections
+                .unwrap_or_else(|| selection_limits.default_max_org_selections()),
         ))
     });
     router_with_routing_options(
@@ -1091,93 +1167,28 @@ async fn proxy_request(
 
     // Catalog selection happens after authentication, so an authenticated
     // deployment does not disclose its model inventory to an unauthenticated
-    // caller. Per-organization capacity is acquired before the global
-    // selector-work semaphore: one tenant's stalled body cannot take every
-    // global slot while invalid selectors remain quota-free. Both permits cover
-    // only body materialization; inference admission stays free until selection
-    // succeeds.
-    let selector_permit =
-        if let Some(selector_admission) = state.routing.catalog_selection_admission(&request) {
-            if !has_json_content_type(request.headers()) {
-                let refusal = unsupported_model_selection_media_type_refusal();
-                return audited(
-                    &state,
-                    AuditedRequest {
-                        request_id: &request_id,
-                        identity: identity.as_ref(),
-                        reason: Some(refusal.audit_reason),
-                        method: &method,
-                        path: &path,
-                        model_id: None,
-                        usage: None,
-                        request_metrics: None,
-                        connection_termination: connection_termination.clone(),
-                        started_ts,
-                        started_at,
-                    },
-                    refusal.response,
-                );
-            }
-            let org_selector_permit = if let (Some(identity), Some(admission)) = (
-                identity.as_ref(),
-                state.routing.organization_selection_admission(&request),
-            ) {
-                match admission.try_acquire(identity.organization_id()) {
-                    Ok(permit) => Some(permit),
-                    Err(()) => {
-                        let mut response = gateway_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "gateway organization model selection limit reached",
-                        );
-                        let (low, high) = RETRY_AFTER_JITTER_SECONDS;
-                        let retry_after = fastrand::u8(low..=high);
-                        response.headers_mut().insert(
-                            "retry-after",
-                            HeaderValue::from_str(&retry_after.to_string())
-                                .expect("a small decimal integer is a valid header value"),
-                        );
-                        return audited(
-                            &state,
-                            AuditedRequest {
-                                request_id: &request_id,
-                                identity: Some(identity),
-                                reason: Some("organization_model_selection_overloaded"),
-                                method: &method,
-                                path: &path,
-                                model_id: None,
-                                usage: None,
-                                request_metrics: None,
-                                connection_termination: connection_termination.clone(),
-                                started_ts,
-                                started_at,
-                            },
-                            response,
-                        );
-                    }
-                }
-            } else {
-                None
+    // caller. Anything decidable from the request head alone is refused before
+    // any capacity is committed to it, then per-organization capacity is
+    // acquired before the global selector-work budget: one tenant's stalled
+    // body cannot take every global slot while invalid selectors remain
+    // quota-free. Both permits cover only body materialization; inference
+    // admission stays free until selection succeeds.
+    let selector_permits = match state.routing.catalog_selection(&request) {
+        None => None,
+        Some(selection) => {
+            let acquired = match model_selection_head_refusal(request.headers(), selection.limits) {
+                Some(refusal) => Err(refusal),
+                None => acquire_selection_capacity(&selection, identity.as_ref()).await,
             };
-            match selector_admission.try_acquire_owned() {
-                Ok(permit) => Some((org_selector_permit, permit)),
-                Err(_) => {
-                    let mut response = gateway_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "gateway model selection limit reached",
-                    );
-                    let (low, high) = RETRY_AFTER_JITTER_SECONDS;
-                    let retry_after = fastrand::u8(low..=high);
-                    response.headers_mut().insert(
-                        "retry-after",
-                        HeaderValue::from_str(&retry_after.to_string())
-                            .expect("a small decimal integer is a valid header value"),
-                    );
+            match acquired {
+                Ok(permits) => Some(permits),
+                Err(refusal) => {
                     return audited(
                         &state,
                         AuditedRequest {
                             request_id: &request_id,
                             identity: identity.as_ref(),
-                            reason: Some("gateway_model_selection_overloaded"),
+                            reason: Some(refusal.audit_reason),
                             method: &method,
                             path: &path,
                             model_id: None,
@@ -1187,13 +1198,12 @@ async fn proxy_request(
                             started_ts,
                             started_at,
                         },
-                        response,
-                    );
+                        refusal.response,
+                    )
                 }
             }
-        } else {
-            None
-        };
+        }
+    };
     let route = match resolve_route(&state.routing, &mut request, detail_model_id.as_deref()).await
     {
         Ok(route) => route,
@@ -1217,10 +1227,11 @@ async fn proxy_request(
             )
         }
     };
-    // `to_bytes` has completed or failed. The request body is now either back
-    // in `request` for forwarding or the handler has returned, so selector
-    // capacity can be released before quota/admission and the response stream.
-    drop(selector_permit);
+    // Body materialization has completed, failed, or timed out. The request
+    // body is now either back in `request` for forwarding or the handler has
+    // returned, so selector capacity can be released before quota/admission
+    // and the response stream.
+    drop(selector_permits);
 
     // Quota is checked after authentication (it needs a resolved organization)
     // and after a request has proved routable, but before it can take an
@@ -1252,17 +1263,6 @@ async fn proxy_request(
     let permit = match Arc::clone(&state.admission).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            let mut response = gateway_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "gateway concurrency limit reached",
-            );
-            let (low, high) = RETRY_AFTER_JITTER_SECONDS;
-            let retry_after = fastrand::u8(low..=high);
-            response.headers_mut().insert(
-                "retry-after",
-                HeaderValue::from_str(&retry_after.to_string())
-                    .expect("a small decimal integer is a valid header value"),
-            );
             return audited(
                 &state,
                 AuditedRequest {
@@ -1278,7 +1278,7 @@ async fn proxy_request(
                     started_ts,
                     started_at,
                 },
-                response,
+                overloaded("gateway concurrency limit reached"),
             );
         }
     };
@@ -1419,45 +1419,101 @@ impl RoutedRequest {
 }
 
 impl UpstreamRouting {
-    /// Returns selector-work capacity only for the two catalog-routable
-    /// generation endpoints. Local catalog discovery and endpoints with no
-    /// model-selection contract do not materialize a request body.
-    fn catalog_selection_admission(&self, request: &Request) -> Option<Arc<Semaphore>> {
+    /// The selector-work capacity a request must hold before catalog mode may
+    /// read its body, or `None` when nothing about this request materializes
+    /// one: transparent routing, local catalog discovery, and endpoints with
+    /// no model-selection contract all read no body here.
+    fn catalog_selection(&self, request: &Request) -> Option<CatalogSelection> {
         match self {
             Self::Catalog {
+                selection_limits,
                 selection_admission,
-                ..
-            } if request.method() == Method::POST
-                && matches!(
-                    request.uri().path(),
-                    "/v1/completions" | "/v1/chat/completions"
-                ) =>
-            {
-                Some(Arc::clone(selection_admission))
-            }
-            Self::Passthrough(_) | Self::Catalog { .. } => None,
-        }
-    }
-
-    fn organization_selection_admission(
-        &self,
-        request: &Request,
-    ) -> Option<Arc<OrgSelectionAdmission>> {
-        match self {
-            Self::Catalog {
                 org_selection_admission,
                 ..
-            } if request.method() == Method::POST
-                && matches!(
-                    request.uri().path(),
-                    "/v1/completions" | "/v1/chat/completions"
-                ) =>
-            {
-                org_selection_admission.clone()
-            }
+            } if is_catalog_generation_route(request) => Some(CatalogSelection {
+                limits: *selection_limits,
+                global: Arc::clone(selection_admission),
+                per_organization: org_selection_admission.clone(),
+            }),
             Self::Passthrough(_) | Self::Catalog { .. } => None,
         }
     }
+}
+
+/// The two routes whose JSON body carries a contractual `model` selector at the
+/// pinned engine revision. Every place that has to agree on "is this request
+/// routed by its body?" asks here, so the admission gate, the refusal gate, and
+/// the router cannot drift apart.
+fn is_catalog_generation_route(request: &Request) -> bool {
+    request.method() == Method::POST
+        && matches!(
+            request.uri().path(),
+            "/v1/completions" | "/v1/chat/completions"
+        )
+}
+
+/// Selector-work capacity resolved from the routing mode for one request.
+struct CatalogSelection {
+    limits: ModelSelectionLimits,
+    global: Arc<Semaphore>,
+    /// `None` when the gateway is unauthenticated: without a resolved
+    /// organization there is no tenant to be fair between.
+    per_organization: Option<Arc<OrgSelectionAdmission>>,
+}
+
+/// Selector capacity held for exactly one request's body materialization.
+///
+/// Both permits release on drop, including when the request task is cancelled
+/// mid-body. Neither covers quota, inference admission, or a response stream:
+/// [`proxy_request`] drops this the moment selection resolves.
+struct SelectionPermits {
+    /// Acquired first, so a tenant already at its bound waits on its own share
+    /// instead of consuming a global slot to do so.
+    _per_organization: Option<OwnedSemaphorePermit>,
+    _global: OwnedSemaphorePermit,
+}
+
+/// Waits for selector capacity, or reports the refusal to send instead.
+///
+/// One deadline covers both acquisitions rather than one each: two five-second
+/// budgets in series is a ten-second budget, and the number a shed-load bound
+/// promises has to be the number a request can actually experience.
+async fn acquire_selection_capacity(
+    selection: &CatalogSelection,
+    identity: Option<&AuthenticatedContext>,
+) -> Result<SelectionPermits, RoutingRefusal> {
+    let deadline = tokio::time::Instant::now() + selection.limits.acquire_timeout();
+    let per_organization = match (identity, selection.per_organization.as_ref()) {
+        (Some(identity), Some(admission)) => {
+            let permit = admission
+                .acquire(identity.organization_id(), deadline)
+                .await;
+            if permit.is_none() {
+                return Err(RoutingRefusal {
+                    audit_reason: "organization_model_selection_overloaded",
+                    response: overloaded("gateway organization model selection limit reached"),
+                });
+            }
+            permit
+        }
+        _ => None,
+    };
+    // Same reasoning as the per-organization slot: closure is impossible, so
+    // the only failure is running out of budget.
+    let Some(Ok(global)) =
+        tokio::time::timeout_at(deadline, Arc::clone(&selection.global).acquire_owned())
+            .await
+            .ok()
+    else {
+        return Err(RoutingRefusal {
+            audit_reason: "gateway_model_selection_overloaded",
+            response: overloaded("gateway model selection limit reached"),
+        });
+    };
+    Ok(SelectionPermits {
+        _per_organization: per_organization,
+        _global: global,
+    })
 }
 
 struct RoutingRefusal {
@@ -1465,123 +1521,155 @@ struct RoutingRefusal {
     response: Response,
 }
 
-#[derive(Deserialize)]
-struct ModelSelectionRequest<'a> {
-    model: Option<Cow<'a, str>>,
+/// The one field catalog routing reads out of a generation request body.
+///
+/// Deserialized through an explicit map visitor rather than `#[derive]`.
+/// serde's derived struct implementation also accepts a JSON *sequence*,
+/// filling fields positionally, so `["alpha"]` would be read as
+/// `{"model":"alpha"}` and routed. A replica deserializing the same bytes maps
+/// position zero onto the first field of *its* request type, so gateway and
+/// replica would disagree about what the request says while the gateway logged
+/// a `model_id` it had inferred from a body that never named one. A selector
+/// that decides where a request goes must not be looser than the format it
+/// claims to read: only a JSON object carries a top-level `model` member.
+struct ModelSelection {
+    model: Option<String>,
 }
 
-async fn resolve_route(
-    routing: &UpstreamRouting,
-    request: &mut Request,
-    detail_model_id: Option<&str>,
-) -> Result<RoutedRequest, RoutingRefusal> {
-    match routing {
-        UpstreamRouting::Passthrough(upstream) => Ok(RoutedRequest::Forward {
-            upstream: upstream.clone(),
-            model_id: None,
-        }),
-        UpstreamRouting::Catalog {
-            catalog,
-            selection_limits,
-            ..
-        } => {
-            let is_read = matches!(request.method(), &Method::GET | &Method::HEAD);
-            if is_read && request.uri().path() == "/v1/models" {
-                return Ok(RoutedRequest::Local {
-                    response: catalog_models_response(catalog),
-                    model_id: None,
-                });
-            }
-            if is_read {
-                if let Some(model_id) = detail_model_id {
-                    return match catalog.upstream(model_id) {
-                        Some(_) => Ok(RoutedRequest::Local {
-                            response: catalog_model_response(model_id),
-                            model_id: Some(model_id.to_string()),
-                        }),
-                        None => Err(unknown_model_refusal()),
-                    };
-                }
-            }
-            if request.method() == Method::POST
-                && matches!(
-                    request.uri().path(),
-                    "/v1/completions" | "/v1/chat/completions"
-                )
-            {
-                return select_catalog_upstream(
-                    catalog,
-                    request,
-                    selection_limits.max_body_bytes(),
-                )
-                .await;
-            }
-            Err(RoutingRefusal {
-                audit_reason: "model_routing_unsupported",
-                response: gateway_api_error(
-                    StatusCode::NOT_IMPLEMENTED,
-                    "this endpoint cannot be routed by a multi-model gateway",
-                    "not_implemented",
-                    Some("model_routing_unsupported"),
-                    None,
-                ),
-            })
-        }
+impl<'de> Deserialize<'de> for ModelSelection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ModelSelectionVisitor)
     }
+}
+
+struct ModelSelectionVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ModelSelectionVisitor {
+    type Value = ModelSelection;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object with an optional string \"model\" member")
+    }
+
+    fn visit_map<A>(self, mut entries: A) -> Result<ModelSelection, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut model = None;
+        while let Some(key) = entries.next_key::<Cow<'_, str>>()? {
+            if key != "model" {
+                // Every other member is the replica's business. Skipping is
+                // what keeps this selector from becoming a second, divergent
+                // copy of the generation request schema.
+                entries.next_value::<serde::de::IgnoredAny>()?;
+                continue;
+            }
+            if model.is_some() {
+                // Matches the derived behavior this replaces. A body naming
+                // two models has no single answer, and picking one would make
+                // the gateway's choice differ from a parser that picks the
+                // other.
+                return Err(serde::de::Error::duplicate_field("model"));
+            }
+            model = Some(entries.next_value::<Option<String>>()?);
+        }
+        Ok(ModelSelection {
+            model: model.flatten(),
+        })
+    }
+}
+
+/// Refusals decidable from a generation request's head alone, before the
+/// gateway commits any selector capacity to reading its body.
+///
+/// Both are cheap and both are unconditional, so answering them first means a
+/// caller cannot spend a slot -- or the bandwidth behind it -- on a request
+/// that was never going to be routed.
+fn model_selection_head_refusal(
+    headers: &HeaderMap,
+    limits: ModelSelectionLimits,
+) -> Option<RoutingRefusal> {
+    if !has_json_content_type(headers) {
+        return Some(unsupported_model_selection_media_type_refusal());
+    }
+    // A declared length over the limit is a decision the streaming limit would
+    // reach anyway, after reading the whole allowance first. Hyper holds the
+    // body to this declaration, so a request that understates it is truncated
+    // rather than admitted.
+    if declared_content_length(headers).is_some_and(|declared| declared > limits.max_body_bytes()) {
+        return Some(model_selection_body_too_large_refusal());
+    }
+    None
+}
+
+fn declared_content_length(headers: &HeaderMap) -> Option<NonZeroUsize> {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .and_then(NonZeroUsize::new)
 }
 
 async fn select_catalog_upstream(
     catalog: &VerifiedModelCatalog,
     request: &mut Request,
-    max_selection_body_bytes: NonZeroUsize,
+    limits: ModelSelectionLimits,
 ) -> Result<RoutedRequest, RoutingRefusal> {
-    if !has_json_content_type(request.headers()) {
-        return Err(unsupported_model_selection_media_type_refusal());
+    if let Some(refusal) = model_selection_head_refusal(request.headers(), limits) {
+        return Err(refusal);
     }
 
     let incoming = std::mem::replace(request, Request::new(Body::empty()));
     let (parts, body) = incoming.into_parts();
-    let body = match to_bytes(body, max_selection_body_bytes.get()).await {
-        Ok(body) => body,
-        Err(error) => {
+    let body = match tokio::time::timeout(
+        limits.read_timeout(),
+        to_bytes(body, limits.max_body_bytes().get()),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(error)) => {
             let is_too_large = std::error::Error::source(&error)
                 .is_some_and(|source| source.is::<LengthLimitError>());
-            return Err(RoutingRefusal {
-                audit_reason: if is_too_large {
-                    "model_selection_body_too_large"
-                } else {
-                    "model_selection_body_unreadable"
-                },
-                response: gateway_api_error(
-                    if is_too_large {
-                        StatusCode::PAYLOAD_TOO_LARGE
-                    } else {
-                        StatusCode::BAD_REQUEST
-                    },
-                    if is_too_large {
-                        "request body exceeds the model-selection limit"
-                    } else {
-                        "gateway could not read the request body"
-                    },
-                    "invalid_request",
-                    Some(if is_too_large {
-                        "request_too_large"
-                    } else {
-                        "unreadable_request_body"
-                    }),
-                    None,
-                ),
+            return Err(if is_too_large {
+                model_selection_body_too_large_refusal()
+            } else {
+                RoutingRefusal {
+                    audit_reason: "model_selection_body_unreadable",
+                    response: gateway_api_error(
+                        StatusCode::BAD_REQUEST,
+                        "gateway could not read the request body",
+                        "invalid_request",
+                        Some("unreadable_request_body"),
+                        None,
+                    ),
+                }
             });
         }
+        Err(_) => {
+            return Err(RoutingRefusal {
+                audit_reason: "model_selection_body_timeout",
+                response: gateway_api_error(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request body did not arrive within the model-selection deadline",
+                    "invalid_request",
+                    Some("request_body_timeout"),
+                    None,
+                ),
+            })
+        }
     };
-    let selection: ModelSelectionRequest<'_> = match serde_json::from_slice(&body) {
+    let selection: ModelSelection = match serde_json::from_slice(&body) {
         Ok(selection) => selection,
         Err(_) => {
             return Err(RoutingRefusal {
                 audit_reason: "malformed_model_selection",
                 response: gateway_api_error(
                     StatusCode::BAD_REQUEST,
-                    "request body is not valid JSON",
+                    "request body is not a JSON object",
                     "invalid_request",
                     Some("malformed_json"),
                     None,
@@ -1620,6 +1708,56 @@ async fn select_catalog_upstream(
     })
 }
 
+async fn resolve_route(
+    routing: &UpstreamRouting,
+    request: &mut Request,
+    detail_model_id: Option<&str>,
+) -> Result<RoutedRequest, RoutingRefusal> {
+    match routing {
+        UpstreamRouting::Passthrough(upstream) => Ok(RoutedRequest::Forward {
+            upstream: upstream.clone(),
+            model_id: None,
+        }),
+        UpstreamRouting::Catalog {
+            catalog,
+            selection_limits,
+            ..
+        } => {
+            let is_read = matches!(request.method(), &Method::GET | &Method::HEAD);
+            if is_read && request.uri().path() == "/v1/models" {
+                return Ok(RoutedRequest::Local {
+                    response: catalog_models_response(catalog),
+                    model_id: None,
+                });
+            }
+            if is_read {
+                if let Some(model_id) = detail_model_id {
+                    return match catalog.upstream(model_id) {
+                        Some(_) => Ok(RoutedRequest::Local {
+                            response: catalog_model_response(model_id),
+                            model_id: Some(model_id.to_string()),
+                        }),
+                        None => Err(unknown_model_refusal()),
+                    };
+                }
+            }
+            if is_catalog_generation_route(request) {
+                return select_catalog_upstream(catalog, request, *selection_limits).await;
+            }
+            Err(RoutingRefusal {
+                audit_reason: "model_routing_unsupported",
+                response: gateway_api_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "this endpoint cannot be routed by a multi-model gateway",
+                    "not_implemented",
+                    Some("model_routing_unsupported"),
+                    None,
+                ),
+            })
+        }
+    }
+}
+
 fn has_json_content_type(headers: &HeaderMap) -> bool {
     headers
         .get(CONTENT_TYPE)
@@ -1640,6 +1778,19 @@ fn unsupported_model_selection_media_type_refusal() -> RoutingRefusal {
             "model routing requires an application/json request body",
             "invalid_request",
             Some("unsupported_media_type"),
+            None,
+        ),
+    }
+}
+
+fn model_selection_body_too_large_refusal() -> RoutingRefusal {
+    RoutingRefusal {
+        audit_reason: "model_selection_body_too_large",
+        response: gateway_api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds the model-selection limit",
+            "invalid_request",
+            Some("request_too_large"),
             None,
         ),
     }
@@ -2060,6 +2211,21 @@ fn gateway_error(status: StatusCode, message: &'static str) -> Response {
     gateway_api_error(status, message, "gateway_error", None, None)
 }
 
+/// A typed `503` with a jittered `Retry-After`: the shared shape for every
+/// capacity the gateway sheds load on, so a client sees one backpressure
+/// contract rather than one per bound.
+fn overloaded(message: &'static str) -> Response {
+    let mut response = gateway_error(StatusCode::SERVICE_UNAVAILABLE, message);
+    let (low, high) = RETRY_AFTER_JITTER_SECONDS;
+    let retry_after = fastrand::u8(low..=high);
+    response.headers_mut().insert(
+        "retry-after",
+        HeaderValue::from_str(&retry_after.to_string())
+            .expect("a small decimal integer is a valid header value"),
+    );
+    response
+}
+
 fn gateway_api_error(
     status: StatusCode,
     message: &'static str,
@@ -2437,6 +2603,67 @@ mod tests {
             NonZeroUsize::new(3).unwrap(),
         )
         .is_err());
+    }
+
+    /// The per-organization default is derived from the global capacity so the
+    /// invariant survives a reconfigured budget: no organization takes more
+    /// than half of it, and something is always left for another tenant. A
+    /// flat constant cannot state that, and the flat `1` this replaces made a
+    /// single-tenant deployment serialize its own selector work.
+    #[test]
+    fn the_per_organization_selector_default_is_half_the_global_capacity() {
+        let limits = |budget_multiple: usize| {
+            ModelSelectionLimits::new(
+                NonZeroUsize::new(1024).unwrap(),
+                NonZeroUsize::new(2048 * budget_multiple).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(limits(16).max_concurrent().get(), 16);
+        assert_eq!(limits(16).default_max_org_selections().get(), 8);
+        assert_eq!(limits(2).default_max_org_selections().get(), 1);
+        // A budget with room for a single selector cannot reserve half of one.
+        // One is the floor, never zero.
+        assert_eq!(limits(1).max_concurrent().get(), 1);
+        assert_eq!(limits(1).default_max_org_selections().get(), 1);
+    }
+
+    /// The selector decides where a request goes, so it must not read a body
+    /// shape that names no model. serde's derived struct impl fills fields
+    /// from a JSON sequence positionally, which would make `["alpha"]` a
+    /// routable selection of `alpha`.
+    #[test]
+    fn model_selection_accepts_only_a_json_object() {
+        let model = |body: &str| {
+            serde_json::from_str::<ModelSelection>(body).map(|selection| selection.model)
+        };
+        assert_eq!(
+            model(r#"{"model":"alpha"}"#).unwrap().as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            model(r#"{"messages":[],"model":"alpha"}"#)
+                .unwrap()
+                .as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(model(r#"{"model":null}"#).unwrap(), None);
+        assert_eq!(model("{}").unwrap(), None);
+        // Escapes decode, so the gateway matches on the same value the replica
+        // will parse out of the very bytes it forwards.
+        assert_eq!(
+            model(r#"{"model":"\u0061lpha"}"#).unwrap().as_deref(),
+            Some("alpha")
+        );
+        for not_an_object in [r#"["alpha"]"#, "[]", r#""alpha""#, "null", "7"] {
+            assert!(
+                model(not_an_object).is_err(),
+                "{not_an_object} names no top-level model member"
+            );
+        }
+        // Two answers is no answer: picking one would route somewhere a parser
+        // that picked the other would not.
+        assert!(model(r#"{"model":"alpha","model":"bravo"}"#).is_err());
     }
 
     #[test]
