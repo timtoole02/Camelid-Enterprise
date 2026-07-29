@@ -8,12 +8,12 @@ use std::time::Duration;
 use tower::ServiceExt;
 
 const MODEL_ENV: &str = "CAMELID_ENTERPRISE_TEST_MODEL";
-// The deterministic lane serializes generation. This test configures the
-// engine's bounded queue to one slot before building AppState, so its
-// saturation probe can prove typed backpressure with at most two accepted
-// generations rather than queuing a long serialized batch on shared CI.
+// The deterministic lane serializes generation. The saturation probe below
+// uses streaming requests, which post their engine job and return before the
+// decode runs, so this bound is a hang detector rather than a budget for
+// completed generations; the CI job's own timeout-minutes remains the real
+// ceiling on total wall-clock time.
 const STEP_TIMEOUT: Duration = Duration::from_secs(600);
-const ENGINE_QUEUE_DEPTH_ENV: &str = "CAMELID_QUEUE_DEPTH";
 
 async fn body_json(response: axum::response::Response) -> Value {
     let bytes = tokio::time::timeout(
@@ -60,20 +60,17 @@ async fn real_model_conforms_to_replica_http_v1() {
     .unwrap_or_else(|error| panic!("could not resolve {MODEL_ENV}: {error}"));
     let config = apply_deterministic().expect("the test process must apply the lane contract");
     let expected_sha = config.sha256.clone();
-    // EngineHandle reads this setting while AppState is built. This ignored
-    // model test is run as the sole test in its binary (`--exact
-    // --test-threads=1` in CI), so temporarily setting the process environment
-    // cannot affect another test. Restore any caller-provided value immediately
-    // after the worker has captured it.
-    let prior_queue_depth = std::env::var_os(ENGINE_QUEUE_DEPTH_ENV);
-    std::env::set_var(ENGINE_QUEUE_DEPTH_ENV, "1");
+    // Nothing here may touch the engine's environment after this point. The
+    // lane's guarantee is stated against a frozen configuration vector, and
+    // `apply_deterministic` refuses to start when a key it excludes -- such as
+    // CAMELID_QUEUE_DEPTH -- is set. Setting one after that check has passed
+    // would run the engine in a configuration the lane forbids while every
+    // response below still carried `expected_sha`, which asserts the opposite.
+    // The queue-saturation probe therefore works against the engine's real
+    // default queue depth.
     let state = camelid::api::AppState::with_configured_threads(Some(4))
         .with_default_enable_thinking(false)
         .with_models_dir(None);
-    match prior_queue_depth {
-        Some(value) => std::env::set_var(ENGINE_QUEUE_DEPTH_ENV, value),
-        None => std::env::remove_var(ENGINE_QUEUE_DEPTH_ENV),
-    }
     let app = attributed_router(state, config.sha256, "contract-test/host".to_string(), None);
 
     let load = send(
@@ -186,14 +183,16 @@ async fn real_model_conforms_to_replica_http_v1() {
         serde_json::from_str::<Value>(event).expect("every data event before [DONE] is JSON");
     }
 
-    // The worker is running plus one configured queue slot. Streaming handlers
-    // post their decode job before returning an SSE response, so four concurrent
-    // streaming requests prove both acceptance and typed queue-full rejection
+    // Above the engine's default admission capacity (a bounded queue of eight
+    // plus the one running job), so both the accepted and rejected branches
+    // below are exercised. Streaming handlers post their decode job before
+    // returning an SSE response and emit the role frame before awaiting any
+    // decode event, so this proves acceptance and typed queue-full rejection
     // without waiting for completed model generations. Polling each accepted
-    // body's initial role frame activates its cancellation guard; dropping the
-    // bodies then proves queue-depth recovery without turning this admission
-    // test into a hardware-duration benchmark.
-    const CONCURRENT_REQUESTS: usize = 4;
+    // body's role frame activates its cancellation guard; dropping the bodies
+    // then proves queue-depth recovery without turning this admission test
+    // into a hardware-duration benchmark.
+    const CONCURRENT_REQUESTS: usize = 12;
     let mut requests = tokio::task::JoinSet::new();
     for index in 0..CONCURRENT_REQUESTS {
         let app = app.clone();
