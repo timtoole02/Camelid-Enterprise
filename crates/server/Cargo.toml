@@ -34,6 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `ServiceExt` operates on the `tower_service::Service` a `Router` already
 # implements, so no version pinning to axum's internal tower is required.
 tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors"] }
 
 # Sizes the process-global data-parallel worker pool, whose resolved width this
 # replica publishes. Deliberately a bare "1": the width is only truthful if this
