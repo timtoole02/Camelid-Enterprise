@@ -1,0 +1,370 @@
+/* ==========================================================================
+   Camelid design tokens — "instrument panel" identity
+
+   Dark-first: the DARK palette is the canonical :root definition. Light is an
+   override, applied explicitly via [data-theme="light"] or, when no preference
+   attribute is present (preference = "system"), via prefers-color-scheme.
+   useTheme() deletes the data-theme attribute for "system" so the media query
+   can win. Keep the [data-theme="light"] block and the media-query block
+   byte-identical.
+
+   Status color doctrine (the identity — do not dilute):
+   - VERIFIED COPPER is reserved exclusively for supported/verified claims.
+     It is the receipt-stamp color. Nothing else may use it.
+   - EVIDENCE AMBER (desaturated, yellower than copper) marks evidence-only /
+     bounded claims.
+   - STEEL BLUE is the interactive + informational accent.
+   - UNSUPPORTED is a calm muted slate — it is a normal, honest state, never
+     styled as an alarm.
+   - RED is for errors only, never for "unsupported".
+
+   Fonts are self-hosted via Fontsource (imported in src/main.jsx); this file
+   must never import from a third-party CDN — the app renders fully offline.
+
+   All historical variable names are retained so existing styles keep rendering
+   during the redesign transition.
+   ========================================================================== */
+
+:root {
+  color-scheme: dark;
+
+  /* ---- Type ---- */
+  --font-ui: 'Inter Variable', 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-display: 'Space Grotesk Variable', 'Space Grotesk', 'Inter Variable', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-md: 0.9375rem;
+  --text-lg: 1.0625rem;
+  --text-xl: 1.3125rem;
+  --text-2xl: 1.75rem;
+  --text-display: clamp(2rem, 4.5vw, 2.875rem);
+  --leading-tight: 1.25;
+  --leading-snug: 1.4;
+  --leading-normal: 1.6;
+  --leading-relaxed: 1.75;
+  --tracking-wide: 0.08em;        /* mono labels, instrument captions */
+
+  /* ---- Space ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+  --space-9: 56px;
+  --space-10: 72px;
+
+  /* ---- Radius (instrument: tighter than the old chat-toy rounds) ---- */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-2xl: 20px;
+  --radius-pill: 999px;
+
+  /* ---- Motion ---- */
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --dur-slow: 320ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-emphasized: cubic-bezier(0.3, 0, 0, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* ---- Z-index ---- */
+  --z-rail: 30;
+  --z-topbar: 40;
+  --z-composer: 35;
+  --z-overlay: 70;
+  --z-modal: 80;
+  --z-notice: 90;
+  --z-tooltip: 100;
+
+  /* ---- Layout ---- */
+  --sidebar-width: 288px;
+  --rail-collapsed-width: 72px;
+  --content-max: 768px;
+  --content-wide: 1100px;
+
+  /* ====================================================================
+     DARK palette (canonical)
+     ==================================================================== */
+  --color-bg: #0e1216;
+  --color-bg-elevated: #141a21;
+  --color-canvas: #0e1216;
+  --color-surface: #141a21;
+  --color-surface-subtle: #11161c;
+  --color-surface-strong: #1c242e;
+  --color-surface-hover: #202a36;
+
+  --color-border-soft: rgba(148, 178, 209, 0.13);
+  --color-border-strong: rgba(148, 178, 209, 0.26);
+
+  --color-text: #dde5ed;
+  --color-text-muted: #9caab9;
+  --color-text-faint: #8190a0;
+
+  /* Interactive / informational accent: steel blue */
+  --color-accent: #8fb6dc;
+  --color-accent-hover: #a8c8e8;
+  --color-accent-soft: rgba(143, 182, 220, 0.14);
+  --color-accent-ink: #0a1828;       /* text on accent */
+  --color-accent-text: #a3c4e4;      /* accent-colored text on bg */
+  --color-chip: rgba(143, 182, 220, 0.10);
+
+  /* Evidence-state palette (the Evidence Chip speaks these) */
+  --color-verified: #dfa371;                        /* copper — supported/verified ONLY */
+  --color-verified-strong: #ecb888;
+  --color-verified-soft: rgba(223, 163, 113, 0.13);
+  --color-verified-border: rgba(223, 163, 113, 0.45);
+  --color-verified-ink: #2a1a09;                    /* text on copper fill */
+  --color-evidence: #cfb56a;                        /* desaturated amber — evidence-only/bounded */
+  --color-evidence-soft: rgba(207, 181, 106, 0.12);
+  --color-evidence-border: rgba(207, 181, 106, 0.40);
+  --color-planned: #8b9aab;                         /* planned/groundwork/acceptance-target */
+  --color-planned-soft: rgba(139, 154, 171, 0.12);
+  --color-planned-border: rgba(139, 154, 171, 0.34);
+  --color-unsupported: #8694a3;                     /* calm, honest, muted */
+  --color-unsupported-soft: rgba(134, 148, 163, 0.10);
+  --color-unsupported-border: rgba(134, 148, 163, 0.28);
+
+  /* Operational status (runtime health — never support evidence) */
+  --color-ready: #8cc9a0;
+  --color-warning: #d8b86a;
+  --color-error: #e9928a;
+  --color-info: #8fb6dc;
+
+  --color-spectrum-blue: #8fb6dc;
+  --color-spectrum-green: #8cc9a0;
+  --color-spectrum-yellow: #cfb56a;
+  --color-spectrum-red: #e9928a;
+
+  --color-user-bubble: #1b2430;
+  --color-user-chip: #1b2430;
+  --color-assistant-bubble: transparent;
+  --color-assistant-wash: transparent;
+  --color-thread-surface: transparent;
+  --color-sidebar-section: #11161c;
+  --color-composer-surface: #141a21;
+  --color-code-bg: #0a0e12;
+  --color-code-border: rgba(148, 178, 209, 0.15);
+
+  --color-selected-row: rgba(143, 182, 220, 0.13);
+  --color-selected-row-border: rgba(143, 182, 220, 0.32);
+  --color-overlay: rgba(3, 6, 10, 0.62);
+
+  --color-hero-glow: rgba(143, 182, 220, 0.07);
+  --color-hero-glow-strong: rgba(223, 163, 113, 0.06);
+  --color-glass: rgba(20, 26, 33, 0.80);
+  --color-glass-strong: rgba(14, 18, 22, 0.96);
+
+  /* ---- Elevation ---- */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.32);
+  --shadow-2: 0 6px 18px rgba(0, 0, 0, 0.50), 0 2px 6px rgba(0, 0, 0, 0.35);
+  --shadow-3: 0 16px 40px rgba(0, 0, 0, 0.58), 0 6px 14px rgba(0, 0, 0, 0.40);
+  --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --shadow-focus: 0 0 0 3px rgba(143, 182, 220, 0.38);
+  --focus-ring: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-accent);
+
+  /* ---- Brand (legacy aurora names now carry the instrument gradient) ---- */
+  --camelid-aurora: linear-gradient(120deg, #8fb6dc 0%, #b9ad8e 52%, #dfa371 100%);
+  --camelid-aurora-soft: linear-gradient(120deg, rgba(143, 182, 220, 0.16), rgba(185, 173, 142, 0.13), rgba(223, 163, 113, 0.14));
+  --camelid-aurora-glow: radial-gradient(circle, rgba(223, 163, 113, 0.09) 0%, rgba(143, 182, 220, 0.07) 50%, transparent 78%);
+}
+
+/* ====================================================================
+   LIGHT palette — applied explicitly via [data-theme="light"].
+   Keep this block byte-identical to the prefers-color-scheme block below.
+   ==================================================================== */
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --color-bg: #f6f8fa;
+  --color-bg-elevated: #ffffff;
+  --color-canvas: #f6f8fa;
+  --color-surface: #edf1f5;
+  --color-surface-subtle: #f2f5f8;
+  --color-surface-strong: #e1e8ef;
+  --color-surface-hover: #e7edf3;
+
+  --color-border-soft: rgba(26, 43, 59, 0.12);
+  --color-border-strong: rgba(26, 43, 59, 0.24);
+
+  --color-text: #1b2530;
+  --color-text-muted: #4d5d6d;
+  --color-text-faint: #56656f;
+
+  --color-accent: #2b5c84;
+  --color-accent-hover: #224a6c;
+  --color-accent-soft: rgba(43, 92, 132, 0.10);
+  --color-accent-ink: #ffffff;
+  --color-accent-text: #2b5c84;
+  --color-chip: rgba(43, 92, 132, 0.07);
+
+  --color-verified: #96531c;
+  --color-verified-strong: #7c4413;
+  --color-verified-soft: rgba(150, 83, 28, 0.10);
+  --color-verified-border: rgba(150, 83, 28, 0.38);
+  --color-verified-ink: #ffffff;
+  --color-evidence: #75601a;
+  --color-evidence-soft: rgba(117, 96, 26, 0.10);
+  --color-evidence-border: rgba(117, 96, 26, 0.36);
+  --color-planned: #546576;
+  --color-planned-soft: rgba(84, 101, 118, 0.10);
+  --color-planned-border: rgba(84, 101, 118, 0.30);
+  --color-unsupported: #5a6a79;
+  --color-unsupported-soft: rgba(90, 106, 121, 0.09);
+  --color-unsupported-border: rgba(90, 106, 121, 0.26);
+
+  --color-ready: #20713c;
+  --color-warning: #82610e;
+  --color-error: #b3261e;
+  --color-info: #2b5c84;
+
+  --color-spectrum-blue: #2b5c84;
+  --color-spectrum-green: #20713c;
+  --color-spectrum-yellow: #75601a;
+  --color-spectrum-red: #b3261e;
+
+  --color-user-bubble: #e4ebf2;
+  --color-user-chip: #e4ebf2;
+  --color-assistant-bubble: transparent;
+  --color-assistant-wash: transparent;
+  --color-thread-surface: transparent;
+  --color-sidebar-section: #edf1f5;
+  --color-composer-surface: #ffffff;
+  --color-code-bg: #f3f6f9;
+  --color-code-border: rgba(26, 43, 59, 0.13);
+
+  --color-selected-row: rgba(43, 92, 132, 0.10);
+  --color-selected-row-border: rgba(43, 92, 132, 0.26);
+  --color-overlay: rgba(20, 30, 40, 0.42);
+
+  --color-hero-glow: rgba(43, 92, 132, 0.06);
+  --color-hero-glow-strong: rgba(150, 83, 28, 0.05);
+  --color-glass: rgba(255, 255, 255, 0.84);
+  --color-glass-strong: rgba(246, 248, 250, 0.96);
+
+  --shadow-1: 0 1px 2px rgba(20, 30, 40, 0.07), 0 1px 3px rgba(20, 30, 40, 0.05);
+  --shadow-2: 0 4px 12px rgba(20, 30, 40, 0.09), 0 2px 4px rgba(20, 30, 40, 0.05);
+  --shadow-3: 0 12px 32px rgba(20, 30, 40, 0.13), 0 4px 10px rgba(20, 30, 40, 0.07);
+  --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.65);
+  --shadow-focus: 0 0 0 3px rgba(43, 92, 132, 0.30);
+  --focus-ring: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-accent);
+
+  --camelid-aurora: linear-gradient(120deg, #2b5c84 0%, #6d6347 52%, #96531c 100%);
+  --camelid-aurora-soft: linear-gradient(120deg, rgba(43, 92, 132, 0.12), rgba(109, 99, 71, 0.10), rgba(150, 83, 28, 0.11));
+  --camelid-aurora-glow: radial-gradient(circle, rgba(150, 83, 28, 0.07) 0%, rgba(43, 92, 132, 0.06) 50%, transparent 78%);
+}
+
+/* System preference = light, and no explicit data-theme attribute present. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    color-scheme: light;
+
+    --color-bg: #f6f8fa;
+    --color-bg-elevated: #ffffff;
+    --color-canvas: #f6f8fa;
+    --color-surface: #edf1f5;
+    --color-surface-subtle: #f2f5f8;
+    --color-surface-strong: #e1e8ef;
+    --color-surface-hover: #e7edf3;
+
+    --color-border-soft: rgba(26, 43, 59, 0.12);
+    --color-border-strong: rgba(26, 43, 59, 0.24);
+
+    --color-text: #1b2530;
+    --color-text-muted: #4d5d6d;
+    --color-text-faint: #56656f;
+
+    --color-accent: #2b5c84;
+    --color-accent-hover: #224a6c;
+    --color-accent-soft: rgba(43, 92, 132, 0.10);
+    --color-accent-ink: #ffffff;
+    --color-accent-text: #2b5c84;
+    --color-chip: rgba(43, 92, 132, 0.07);
+
+    --color-verified: #96531c;
+    --color-verified-strong: #7c4413;
+    --color-verified-soft: rgba(150, 83, 28, 0.10);
+    --color-verified-border: rgba(150, 83, 28, 0.38);
+    --color-verified-ink: #ffffff;
+    --color-evidence: #75601a;
+    --color-evidence-soft: rgba(117, 96, 26, 0.10);
+    --color-evidence-border: rgba(117, 96, 26, 0.36);
+    --color-planned: #546576;
+    --color-planned-soft: rgba(84, 101, 118, 0.10);
+    --color-planned-border: rgba(84, 101, 118, 0.30);
+    --color-unsupported: #5a6a79;
+    --color-unsupported-soft: rgba(90, 106, 121, 0.09);
+    --color-unsupported-border: rgba(90, 106, 121, 0.26);
+
+    --color-ready: #20713c;
+    --color-warning: #82610e;
+    --color-error: #b3261e;
+    --color-info: #2b5c84;
+
+    --color-spectrum-blue: #2b5c84;
+    --color-spectrum-green: #20713c;
+    --color-spectrum-yellow: #75601a;
+    --color-spectrum-red: #b3261e;
+
+    --color-user-bubble: #e4ebf2;
+    --color-user-chip: #e4ebf2;
+    --color-assistant-bubble: transparent;
+    --color-assistant-wash: transparent;
+    --color-thread-surface: transparent;
+    --color-sidebar-section: #edf1f5;
+    --color-composer-surface: #ffffff;
+    --color-code-bg: #f3f6f9;
+    --color-code-border: rgba(26, 43, 59, 0.13);
+
+    --color-selected-row: rgba(43, 92, 132, 0.10);
+    --color-selected-row-border: rgba(43, 92, 132, 0.26);
+    --color-overlay: rgba(20, 30, 40, 0.42);
+
+    --color-hero-glow: rgba(43, 92, 132, 0.06);
+    --color-hero-glow-strong: rgba(150, 83, 28, 0.05);
+    --color-glass: rgba(255, 255, 255, 0.84);
+    --color-glass-strong: rgba(246, 248, 250, 0.96);
+
+    --shadow-1: 0 1px 2px rgba(20, 30, 40, 0.07), 0 1px 3px rgba(20, 30, 40, 0.05);
+    --shadow-2: 0 4px 12px rgba(20, 30, 40, 0.09), 0 2px 4px rgba(20, 30, 40, 0.05);
+    --shadow-3: 0 12px 32px rgba(20, 30, 40, 0.13), 0 4px 10px rgba(20, 30, 40, 0.07);
+    --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.65);
+    --shadow-focus: 0 0 0 3px rgba(43, 92, 132, 0.30);
+    --focus-ring: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-accent);
+
+    --camelid-aurora: linear-gradient(120deg, #2b5c84 0%, #6d6347 52%, #96531c 100%);
+    --camelid-aurora-soft: linear-gradient(120deg, rgba(43, 92, 132, 0.12), rgba(109, 99, 71, 0.10), rgba(150, 83, 28, 0.11));
+    --camelid-aurora-glow: radial-gradient(circle, rgba(150, 83, 28, 0.07) 0%, rgba(43, 92, 132, 0.06) 50%, transparent 78%);
+  }
+}
+
+/* ---- Keyframes (restrained brand motion) ---- */
+@keyframes auroraGlow {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+@keyframes camelidLoadingWave {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 200% 50%; }
+}
+@keyframes camelidFadeInUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes camelidFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes camelidDotBounce {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+  40% { transform: scale(1); opacity: 1; }
+}
+@keyframes camelidSpin {
+  to { transform: rotate(360deg); }
+}

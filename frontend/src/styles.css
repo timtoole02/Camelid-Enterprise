@@ -1,0 +1,10 @@
+@import './styles/tokens.css';
+@import './styles/base.css';
+
+/* Modular stylesheets. tokens.css + base.css carry the foundation; the legacy
+   pre-redesign sheets were removed once every live surface (shell + all
+   dashboard views + chat) was confirmed self-sufficient on these. */
+@import './styles/ui.css';
+@import './styles/shell.css';
+@import './styles/chat.css';
+@import './styles/views.css';
