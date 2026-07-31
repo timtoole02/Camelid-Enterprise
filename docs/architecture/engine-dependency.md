@@ -87,11 +87,17 @@ now exist.** `crates/server/src/in_tree.rs` implements health, exact one-model
 discovery, and deterministic non-streaming `/v1/completions` and
 `/v1/chat/completions` behind a backend trait backed by `LoadedModel`. Chat uses
 the GGUF-embedded template with strict Jinja evaluation and explicit
-special-token parsing; a missing or incompatible template is a typed refusal,
-not a generic role-prefixed fallback. Both generation paths share one admission
-slot and fail closed on unsupported request features. The adapter is
-deliberately not composed into the serving binary yet, so no public replica or
-gateway route has changed.
+special-token parsing, plus the pinned engine's compact Llama 3 compatibility
+shape for rows where that engine deliberately does not evaluate the full
+metadata template. A missing or incompatible template is a typed refusal, not
+a generic role-prefixed fallback. Both generation paths share one admission
+slot and fail closed on unsupported request features. A model-backed parity gate
+now compares the exact pinned revision and the in-tree runtime at the prompt-ID,
+generated-ID, decoded-text, finish-reason, and usage boundaries across raw,
+Unicode, single-turn chat, and multi-turn chat prompts. It unloads the pinned
+model before loading the in-tree model so the check stays within hosted-CI
+memory. The adapter is deliberately not composed into the serving binary yet,
+so no public replica or gateway route has changed.
 
 ## 5. The gap, stated plainly
 
@@ -107,8 +113,9 @@ Missing entirely, in rough order of difficulty:
 - the agent workspace subsystem
 
 Loading and owning one immutable model for greedy completion is in-tree, as are
-strict embedded-template rendering and the non-streaming HTTP adapters over it;
-production composition, attribution, streaming, broader template parity, and
+pinned-compatible chat rendering, non-streaming HTTP adapters, and an exact
+real-model generation parity gate over the current migration artifact;
+production composition, attribution, streaming, broader template families, and
 the other model families remain above that boundary.
 
 This is a program of work, not a change. Anyone estimating it from "the server
@@ -138,12 +145,13 @@ first buys most of the safety at a fraction of the cost.
 
 The first slice was intentionally below HTTP: `engine_core::runtime::LoadedModel`
 provides one owned, fail-closed path from a GGUF file to deterministic raw
-completion. The next slices add an isolated server adapter for health, exact
-model discovery, non-streaming raw completion, and strict embedded-template
-chat completion. The pinned router remains the production surface while SSE,
-the remaining handlers, and broader template parity are built and tested
-against that runtime. This keeps the external contract unchanged during the
-port and prevents serving policy from leaking back into the numerics crate.
+completion. The following slices added an isolated server adapter for health,
+exact model discovery, non-streaming raw completion, pinned-compatible chat
+completion, and the real-model token parity gate over both generation routes.
+The pinned router remains the production surface while SSE, the remaining
+handlers, and broader template families are built and tested against that
+runtime. This keeps the external contract unchanged during the port and
+prevents serving policy from leaking back into the numerics crate.
 
 There is still no route-at-a-time cutover path with the API as it stands, and
 the obvious one does not work. This section records why, so the idea is not
