@@ -31,7 +31,7 @@ It runs as a single Rust binary serving an OpenAI-compatible API — the same on
 
 ```console
 $ camelid-enterprise serve --model /srv/models/Llama-3.2-1B-Instruct-Q8_0.gguf
-[lane] deterministic | engine pin b4e3a9056567ed8145fc4fa29850d6f1f261ac2b | config vector sha256 30d77c260803 | admission sha256 45121fb83fef | model sha256 3f8a1c04b7e2 | host macos/aarch64 cores=8 simd=dotprod+i8mm+neon | worker threads 8
+[lane] deterministic | in-tree engine | parity oracle pin b4e3a9056567ed8145fc4fa29850d6f1f261ac2b | config vector sha256 30d77c260803 | admission sha256 45121fb83fef | model sha256 3f8a1c04b7e2 | host macos/aarch64 cores=8 simd=dotprod+i8mm+neon | worker threads 8
 [lane] model /srv/models/Llama-3.2-1B-Instruct-Q8_0.gguf
 [lane] listening on http://127.0.0.1:8181
 [lane] loading model; nothing is served until the load completes
@@ -71,16 +71,16 @@ A replica declares its lane at startup, and every response is attributable to it
 
 ## How the deterministic lane works
 
-- **Pinned engine.** The engine is pinned by exact revision in `Cargo.toml`. What's serving is never "whatever was latest."
+- **Owned engine, pinned oracle.** The serving runtime lives in this workspace. The original engine remains pinned by exact revision only in `dev-dependencies`, where model-backed parity tests use it as a behavioral oracle.
 - **Frozen configuration.** At startup the lane applies a canonical configuration vector — the order-stable CPU forward pass, speculation off, performance tunables at their defaults — then hashes it (SHA-256). The hash travels with every response, so a replica's exact posture is legible from the outside.
 - **Identified weights.** The GGUF is hashed whole before the port is bound, and its digest rides on every response. Two replicas serving different files are told apart from the outside, which the engine's own model *name* cannot do.
 - **One generation at a time.** Requests execute whole-generation serialized, so output never depends on what else is in flight.
-- **A declared surface.** The served routes are an allow list, and it is the contract's own registry rather than a second list this crate keeps privately — so a route the contract does not name, including the engine's model-management and runtime-control routes, is refused rather than served by default. Refused too is a generation request whose `model` field names anything but this replica's own weights: the engine would otherwise load that file on demand and answer from it, over a route the contract requires. The two together are what make the published model digest a claim about the whole process lifetime rather than about its first second.
+- **A declared surface.** The served routes are an allow list, and it is the contract's own registry rather than a second list this crate keeps privately. The in-tree router has no model-management, runtime-control, workspace, or Web UI fallback. The served-model filter also refuses a generation request whose `model` field names anything but this replica's own weights. Together these controls make the published model digest a claim about the whole process lifetime rather than about its first second.
 - **Fail closed.** An unrecognized `CAMELID_*` variable refuses startup; a full queue returns a typed `503` with `Retry-After`. There is no silent fallback to a faster, weaker execution mode.
 
 ## Quick start
 
-> **Before you begin.** Model files are large — roughly 1–8 GB each. Give yourself some free disk space and a few minutes for the first model to download. The first build also fetches and compiles the pinned engine, so it is slower than later builds.
+> **Before you begin.** Model files are large — roughly 1–8 GB each. Give yourself some free disk space and a few minutes for the first model to download. Normal builds compile only the in-tree engine; test builds also fetch the pinned parity oracle.
 
 ```bash
 # Build the serving binary
@@ -94,9 +94,9 @@ cargo run --release --bin camelid-enterprise-gateway -- serve \
   --upstream http://127.0.0.1:8181
 ```
 
-The replica exposes an OpenAI-compatible API on `127.0.0.1:8181` by default, and its served surface is the versioned [Replica HTTP Contract v1](docs/contracts/replica-http-v1.md). Nothing in this repository keeps a second inventory of that surface: the replica's route filter and the gateway's forwarding table both read the dependency-free registry in `crates/replica-contract`, which is the contract's own machine-readable form, so one edit changes what the replica serves, what the gateway forwards and what the contract publishes. The list is `GET /v1/health`, `GET /v1/models`, `GET /v1/models/<id>`, `POST /v1/completions` and `POST /v1/chat/completions`, plus the five compatibility paths the pinned engine answers with a typed `501` — `/v1/embeddings`, `/v1/responses`, `/v1/messages`, `/v1/rerank` and `/v1/reranking` — and `HEAD` and CORS preflight where they apply. Everything else on the engine's router — model load and unload, runtime control, the workspace family, the legacy completion-server routes, and the embedded web UI — answers `403` with `"code":"route_not_served"`.
+The replica exposes an OpenAI-compatible API on `127.0.0.1:8181` by default, and its served surface is the versioned [Replica HTTP Contract v1](docs/contracts/replica-http-v1.md). Nothing in this repository keeps a second inventory of that surface: the replica's route filter and the gateway's forwarding table both read the dependency-free registry in `crates/replica-contract`, which is the contract's own machine-readable form, so one edit changes what the replica serves, what the gateway forwards and what the contract publishes. The list is `GET /v1/health`, `GET /v1/models`, `GET /v1/models/<id>`, `POST /v1/completions` and `POST /v1/chat/completions`, plus five compatibility paths the in-tree server answers with a typed `501` — `/v1/embeddings`, `/v1/responses`, `/v1/messages`, `/v1/rerank` and `/v1/reranking` — and `HEAD` and CORS preflight where they apply. Every path or method outside that contract answers `403` with `"code":"route_not_served"`.
 
-On the two generation routes the `model` field is checked as well as the path, which is a separate control because no route list can stand in for it: the engine resolves that field against the filesystem and loads whatever it names, over a route the contract requires the replica to serve. The field may name this replica's own weights — the id the engine filed them under, the path the replica was started with, or that file's name or stem — or it may be omitted. Anything else answers `404` with `"code":"model_not_served"`, whether or not a file of that name exists on disk.
+On the two generation routes the `model` field is checked as well as the path. It may name this replica's own weights — the GGUF model id, the path the replica was started with, or that file's name or stem — or it may be omitted. Accepted aliases are rewritten to the one loaded model id. Anything else answers `404` with `"code":"model_not_served"`, whether or not a file of that name exists on disk.
 
 The contract document also fixes attribution, health and readiness, typed errors, streaming, receipts, startup and shutdown behaviour, the evidence behind each claim, and what it deliberately leaves unspecified. Its executable conformance tests live in `crates/server`.
 
@@ -292,7 +292,7 @@ Reproducibility holds for greedy decoding (`temperature: 0`), per hardware class
 
 The scope is drawn conservatively on purpose — where the results are known to hold rather than one step past it. Thread count is the honest example: the engine documents its prefill matmul as parallelizing over independent output rows with serial per-row accumulation, so *that kernel* is bit-exact across widths, and the claim is still scoped away from differing widths because the same has not been established for the whole forward pass. A scope is worth something only if it is never widened by assertion.
 
-Five published fields are what make the scope checkable rather than a footnote: the configuration digest for the vector and engine pin, the admission digest for what the replica would have refused, the model digest for the weights, and the host summary and worker width for the machine and the width. A client that cares compares all five.
+Five published fields are what make the scope checkable rather than a footnote: the configuration digest for the vector and parity baseline, the admission digest for what the replica would have refused, the model digest for the weights, and the host summary and worker width for the machine and the width. A client that cares compares all five.
 
 ## Repository layout
 
@@ -320,7 +320,7 @@ docs/contracts/       The versioned replica HTTP contract.
 
 - **Throughput lane** — continuous batching behind the same attribution surface.
 - **Per-tenant lane routing** at the gateway.
-- **Engine port completion** — the forward pass and decode loop, landing subsystem by subsystem behind the pinned engine until the in-tree engine is stream-identical.
+- **Additional model families and request schemas** — embeddings, reranking, and richer compatibility APIs as explicit product slices.
 - **Hardware-class-pinned CI** that verifies reproducible results on every change.
 
 ## License

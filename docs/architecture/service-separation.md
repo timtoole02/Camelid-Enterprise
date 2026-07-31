@@ -65,13 +65,13 @@ docs/
 | Component | Crate / path | Responsibility (as built) |
 |---|---|---|
 | **Serving replica** | `crates/server` (`camelid-enterprise` bin) | CLI (`serve`), binds an HTTP listener, applies the deterministic lane, stamps attribution, loads one model at startup. |
-| **Lane / config freeze** | `crates/server/src/lane.rs` | Applies a canonical env-var configuration vector, fails closed on any override, publishes its SHA-256. Engine pinned by revision (`ENGINE_PIN`). |
+| **Lane / config freeze** | `crates/server/src/lane.rs` | Applies a canonical env-var configuration vector, fails closed on any override, publishes its SHA-256. The migrated behavior remains anchored to the pinned parity oracle (`ENGINE_PIN`). |
 | **Attribution middleware** | `crates/server/src/attribution.rs` | Stamps six headers on every response — `x-camelid-lane`, `-config-sha256`, `-admission-sha256`, `-model-sha256`, `-host`, `-worker-threads` — injects the same facts into completion bodies, and writes optional JSONL serving receipts with the digests at full length, each carrying the gateway-stamped `request_id` when present (`null` for direct-to-replica traffic). |
 | **Public route contract** | `crates/replica-contract`, `crates/server/src/contract.rs`, `docs/contracts/replica-http-v1.md` | The client-facing route set as a dependency-free registry, so replicas and gateways share one inventory without linking the engine — the replica's route filter and the gateway's forwarding table are both built from it. The private pinned-route inventory and its executable conformance stay in the server crate and drive the exact pinned router. |
 | **Served-surface filter** | `crates/server/src/surface.rs` | Refuses anything outside the contract's routes with `403 route_not_served`, deferring to `replica_contract::PUBLIC_ROUTES` rather than declaring a second inventory; and, on the two generation routes, refuses a `model` field naming weights this replica did not hash with `404 model_not_served`. The second check is separate because it has to be: the engine resolves that field against the filesystem, over a route the contract requires and the gateway forwards. |
 | **Gateway / static catalog** | `crates/gateway` (`camelid-enterprise-gateway` bin) | Two mutually exclusive modes. Transparent `--upstream` mode forwards the full `/v1` allowlist derived from `replica_contract::PUBLIC_ROUTES`; static catalog mode maps operator-configured `--model-route <backend-model-id>=<http://origin>` entries to replica pools. Before binding, catalog mode verifies that each configured id is advertised by its mapped pool's `/v1/models`, so it never accepts a public alias then forwards an invalid unchanged request. It serves model discovery locally and routes only completion/chat requests by a bounded JSON `model` selector; all other public routes are refused rather than sent to an arbitrary pool. Selector work has a separate memory-derived semaphore that queues rather than refuses, a bounded body-read deadline that reclaims a stalled slot, and, with identity enabled, a per-organization cap of half the global capacity, so one tenant cannot hold every global selector slot with incomplete bodies. Both modes preserve opaque streaming responses, filter hop-by-hop headers, retry nothing, bound concurrency, and expose no replica control routes. Auth is optional and runs before catalog selection; a selected `model_id` reaches gateway audit/usage records but never a replica. A catalog maps models to pools, not callers to models: every resolved token may use every catalog entry today. Accepted logs drain on clean shutdown within a bounded per-log deadline. |
-| **OpenAI-compatible API** | **external** `camelid::api` (git dep, pinned rev `b4e3a905…`) | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/health`, the engine's typed compatibility replies, and its own control plane (`/api/models/load` and the rest). Provided by the pinned engine crate, **not** by this repo; the replica serves the contract's routes over it and refuses everything else, the control plane included. |
-| **Engine core** | `crates/engine-core` | GGUF container, model config, tensor/forward/tokenizer types. Host-agnostic. |
+| **OpenAI-compatible API** | `crates/server/src/in_tree.rs` | Owns health, exact one-model discovery, raw/chat JSON and SSE generation, bounded admission/cancellation, and explicit compatibility refusals for all ten contract routes. |
+| **Engine core** | `crates/engine-core` | Owns GGUF loading, model config and weights, tokenizer, tensor/forward execution, blocking and incremental greedy generation. Host-agnostic. |
 | **Platform kernels** | `crates/engine-{macos,linux,windows}` | Runtime CPU feature detection (`probe()`), platform kernels. macOS port landing first; Linux/Windows currently capability-detection only. |
 | **Identity primitive** | `crates/identity` | Resolves an opaque bearer token to a principal plus explicitly token-scoped organization, backed by a local SQLite store (hashed tokens only). Operators can create/list organizations, add/remove memberships, and issue an organization-scoped token; removing a membership revokes its scoped tokens. Wired into the gateway as opt-in enforcement; still no RBAC or SSO. |
 | **Deployment assets** | `deploy/` | Dockerfile (model mounted at runtime, not baked); K8s Deployment (Guaranteed QoS, one model per pool, explicit `--threads`, startup/readiness probes on `/v1/health` for `generation_ready`) + Service + a replica ingress NetworkPolicy admitting port 8181 only from gateway-labelled pods; launchd units for bare-metal Apple Silicon. |
@@ -463,23 +463,14 @@ before the corresponding phase starts.
   organizations and tokens stay with identity until that separate question is
   settled — either by migrating it too, or by moving CLI operations onto an
   authenticated gateway admin API so a single process owns the file.
-- **Resolved (scoped, deliberately not started).** The pinned engine
-  (`camelid` @ `b4e3a905`) stays — see `engine-dependency.md`. `crates/server`
-  imports two symbols from it, but they supply the whole HTTP surface: ten
-  contractual `/v1` routes plus private model-lifecycle, telemetry, tokenize,
-  metrics, embeddings, rerank and agent-workspace routes. `engine-core` is
-  ~9,400 lines of numerics that depends only on `serde` and does no HTTP, so
-  the gap is the entire serving layer, not the maths. Crucially, the risks that
-  matter — availability and air-gapped builds — are fixed by **mirroring or
-  vendoring the pinned revision**, not by un-pinning; integrity is already
-  sound because the revision is a SHA recorded in `Cargo.lock`. There is no
-  incremental migration path today: axum's `Router::merge` panics on a
-  duplicate method-and-path pair (`Overlapping method route`, verified against
-  0.7.9), `router_with_state` exposes no way to remove a route, and
-  `contract.rs` states that axum offers no inverse route-tree introspection, so
-  a hybrid router could not be proven exact either. Route-at-a-time needs a
-  prerequisite first — composable route groups from the engine, a proxy
-  fallback, or a wholesale cutover.
+- **Resolved.** Production loading, generation, HTTP routing, SSE, bounded
+  admission, backpressure, and cancellation are owned by this workspace; see
+  `engine-dependency.md`. The original `camelid` revision remains only as a
+  dev-dependency and model-backed parity oracle. Normal dependency trees and
+  release binaries do not compile or link it. The migration used a wholesale
+  router cutover after all ten public paths and pinned-model parity were in
+  place, avoiding axum's duplicate-route merge failure and any unenumerated
+  fallback surface.
 - **Resolved.** Per-request user/tenant context reaches an audit trail without
   the replica learning identity: the gateway mints an opaque, authoritative
   `x-camelid-request-id`, keeps identity in its own append-only audit log, and

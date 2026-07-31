@@ -6,7 +6,7 @@
 //! replica cannot serve fail closed (typed 503 from the bounded engine queue);
 //! there is no silent demotion to any other execution mode.
 
-// What a replica *is* — the engine pin, the lane's configuration vector, the
+// What a replica *is* — the parity baseline, the lane's configuration vector, the
 // attribution stamped on every response, the startup load and the served route
 // surface — lives in this crate's library target, so the contract tests and the
 // conformance harness are written against the same code a served replica is
@@ -134,7 +134,7 @@ async fn serve(
     let model_identity = ModelIdentity::of_file(&model).map_err(std::io::Error::other)?;
 
     eprintln!(
-        "[lane] deterministic | engine pin {} | config vector sha256 {} | admission sha256 {} | \
+        "[lane] deterministic | in-tree engine | parity oracle pin {} | config vector sha256 {} | admission sha256 {} | \
          model sha256 {} | host {} | worker threads {}",
         ENGINE_PIN,
         config.short(),
@@ -144,10 +144,6 @@ async fn serve(
         workers.count()
     );
     eprintln!("[lane] model {}", model.display());
-
-    let state = camelid::api::AppState::with_configured_threads(threads)
-        .with_default_enable_thinking(false)
-        .with_models_dir(None);
 
     // Everything this replica publishes about itself, settled before anything
     // can answer a request. It is handed to `replica_router` rather than applied
@@ -165,12 +161,6 @@ async fn serve(
         receipts: serving_receipts.map(Arc::new),
     };
 
-    // The unfiltered engine router. It exists so the startup load has a door,
-    // and it is never bound to anything; the served view is composed from it
-    // below, after the load, because one of the filters needs a fact only the
-    // load can supply.
-    let engine = camelid::api::router_with_state(state);
-
     // Bound before the load so an address collision fails in milliseconds rather
     // than after a multi-gigabyte read. Nothing is served from it until the load
     // returns: connections sit in the listen backlog, so a probe that connects
@@ -180,10 +170,20 @@ async fn serve(
     eprintln!("[lane] listening on http://{addr}");
     eprintln!("[lane] loading model; nothing is served until the load completes");
 
-    // Load, re-verify the digest, and compose — all of it in the library, so the
-    // stack this process serves is the stack the tests drive. Nothing about the
-    // served surface is decided in this file.
-    let (served, model_id) = replica_router(engine, &model, &requested_model, ctx).await?;
+    // Platform crates may supply an accelerated kernel only through a seam that
+    // is proven bit-identical to the portable implementation. Model ownership
+    // remains in-tree and in-process; no load/unload control-plane router exists.
+    #[cfg(target_os = "macos")]
+    let loaded_model = engine_core::runtime::LoadedModel::load_with_q8_dot(
+        &model,
+        engine_macos::q8_0_dot_rows,
+    )?;
+    #[cfg(not(target_os = "macos"))]
+    let loaded_model = engine_core::runtime::LoadedModel::load(&model)?;
+
+    // Re-verify the digest and compose in the library, so the stack this process
+    // serves is exactly the stack the model-backed contract drives.
+    let (served, model_id) = replica_router(loaded_model, &requested_model, ctx)?;
     eprintln!("[lane] model loaded as '{model_id}'; replica ready");
 
     axum::serve(listener, served)

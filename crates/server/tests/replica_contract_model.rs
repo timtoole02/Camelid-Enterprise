@@ -2,17 +2,12 @@
 //!
 //! This is the only executable check in the workspace that runs the replica with
 //! a GGUF actually loaded, so what it drives matters. It drives
-//! [`replica_router`] — the same composition `serve` uses — and not the bare
-//! attributed router, because the bare router carries neither the served-route
-//! filter nor the generation-body filter: a conformance pass over it would have
-//! said nothing about the surface a client reaches, and would have kept passing
-//! if either filter regressed.
+//! [`replica_router`] — the same in-tree composition `serve` uses — rather than
+//! a test-only router assembled by this file.
 //!
-//! One consequence is visible in the shape of this file: there is no
-//! `POST /api/models/load` step. That route is refused by the served surface, so
-//! the model is loaded exactly the way a real replica loads it — in-process,
-//! through the unfiltered engine router, before the served view is composed. The
-//! refusal is then asserted here rather than worked around.
+//! There is no `POST /api/models/load` step. The model is an owned runtime value
+//! constructed before the served view, and the absent control plane is asserted
+//! here rather than worked around.
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
@@ -298,20 +293,10 @@ async fn real_model_conforms_to_replica_http_v1() {
         workers,
         receipts: None,
     };
-    let state = camelid::api::AppState::with_configured_threads(Some(4))
-        .with_default_enable_thinking(false)
-        .with_models_dir(None);
-    // The load happens in here, through the unfiltered engine router, before the
-    // served view exists — so `app` is the stack a client meets and nothing else
-    // in this file needs the control plane.
-    let (app, model_id) = replica_router(
-        camelid::api::router_with_state(state),
-        &model,
-        &model,
-        identity,
-    )
-    .await
-    .expect("the replica must load the model it was pointed at");
+    let loaded_model = LoadedModel::load(&model)
+        .expect("the in-tree runtime must load the model it was pointed at");
+    let (app, model_id) = replica_router(loaded_model, &model, identity)
+        .expect("the production replica composition must accept the loaded model");
 
     // The route the load used is refused on the surface that is served, which is
     // what makes "loaded in-process" a property rather than a preference. Asserted

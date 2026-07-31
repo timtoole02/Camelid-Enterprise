@@ -1,11 +1,9 @@
-//! In-tree replica HTTP adapter under construction.
+//! In-tree replica HTTP implementation.
 //!
-//! This router is deliberately separate from [`crate::attributed_router`], the
-//! production router backed by the pinned Camelid dependency. It implements the
-//! first self-owned contract slice — health, exact model discovery, and
-//! deterministic text and chat completion, including SSE — so parity can be
-//! proven before a production cutover. It must not be merged with the pinned
-//! router: axum rejects overlapping method/path registrations.
+//! This router owns the complete public route contract: health, exact model
+//! discovery, deterministic raw and chat completion, SSE, and explicit
+//! compatibility refusals. [`crate::replica_router`] composes it with the
+//! served-model filter, route filter, and attribution for production.
 
 mod stream;
 mod worker;
@@ -217,11 +215,11 @@ struct ApiState {
     generation_worker: GenerationWorker,
 }
 
-/// Build the isolated in-tree contract slice.
+/// Build the in-tree public API around one completion backend.
 ///
-/// This function intentionally does not attach lane attribution and is not
-/// called by the serving binary yet. The eventual cutover composes this router
-/// with attribution only after model-backed parity is complete.
+/// This lower-level function intentionally does not attach deployment identity
+/// or surface filters. Production composition belongs to
+/// [`crate::replica_router`]; focused adapter tests use this function directly.
 pub fn router(backend: Arc<dyn CompletionBackend>) -> Router {
     let state = ApiState {
         backend,
@@ -240,7 +238,7 @@ pub fn router(backend: Arc<dyn CompletionBackend>) -> Router {
         .route("/v1/reranking", post(unsupported_reranking))
         // Scope CORS to registered paths. A router-wide layer would also answer
         // OPTIONS for private and nonexistent paths before routing can reject
-        // them, which would enlarge the public surface during cutover.
+        // them, which would enlarge the production public surface.
         .route_layer(CorsLayer::permissive())
         .with_state(state)
 }

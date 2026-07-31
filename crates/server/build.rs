@@ -4,12 +4,12 @@ fn main() {
     println!("cargo:rerun-if-changed={}", manifest_path.display());
     let manifest = std::fs::read_to_string(&manifest_path).unwrap();
     let manifest: toml::Value = toml::from_str(&manifest).unwrap();
-    let revision = manifest["dependencies"]["camelid"]["rev"]
+    let revision = manifest["dev-dependencies"]["camelid"]["rev"]
         .as_str()
-        .expect("dependencies.camelid.rev must pin one engine revision");
+        .expect("dev-dependencies.camelid.rev must pin one parity-oracle revision");
     assert!(
         revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "dependencies.camelid.rev must be a full 40-character hexadecimal commit"
+        "dev-dependencies.camelid.rev must be a full 40-character hexadecimal commit"
     );
     // Deliberately **not** `CAMELID_ENGINE_PIN`, and the prefix is the whole
     // reason. Cargo sets a build script's `rustc-env` variables in the

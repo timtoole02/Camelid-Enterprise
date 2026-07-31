@@ -28,7 +28,10 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 
-/// Exact engine dependency revision, derived from `Cargo.toml` by `build.rs`.
+/// Exact parity-oracle revision, derived from `Cargo.toml` by `build.rs`.
+///
+/// Production uses the in-tree engine. This revision remains in the config
+/// digest as the behavioral baseline against which that engine was migrated.
 ///
 /// The build-time variable is outside the `CAMELID_` namespace on purpose: Cargo
 /// puts a build script's `rustc-env` names into the environment of the binaries
@@ -995,9 +998,9 @@ mod tests {
             .collect();
         assert!(
             manifest.contains(&format!("rev=\"{ENGINE_PIN}\"")),
-            "ENGINE_PIN is {ENGINE_PIN}, which is not the revision the camelid dependency is \
-             pinned to in crates/server/Cargo.toml. The lane would attribute its output to an \
-             engine build it is not running."
+            "ENGINE_PIN is {ENGINE_PIN}, which is not the revision the camelid parity oracle is \
+             pinned to in crates/server/Cargo.toml. The lane's published baseline would no \
+             longer match the model-backed oracle."
         );
     }
 
