@@ -6,6 +6,7 @@
 
 mod attribution;
 pub mod contract;
+pub mod in_tree;
 mod lane;
 
 use attribution::Attribution;
