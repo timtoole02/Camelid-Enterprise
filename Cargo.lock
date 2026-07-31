@@ -263,6 +263,7 @@ dependencies = [
 name = "camelid-enterprise"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "axum",
  "camelid",
  "camelid-enterprise-engine-core",

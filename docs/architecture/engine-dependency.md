@@ -84,14 +84,16 @@ Per-OS kernels live in `engine-{macos,linux,windows}`.
 
 **The numerics, owned completion lifecycle, and first isolated serving slices
 now exist.** `crates/server/src/in_tree.rs` implements health, exact one-model
-discovery, and deterministic non-streaming `/v1/completions` and
-`/v1/chat/completions` behind a backend trait backed by `LoadedModel`. Chat uses
+discovery, and deterministic `/v1/completions` and `/v1/chat/completions`
+behind a backend trait backed by `LoadedModel`. Chat uses
 the GGUF-embedded template with strict Jinja evaluation and explicit
 special-token parsing, plus the pinned engine's compact Llama 3 compatibility
 shape for rows where that engine deliberately does not evaluate the full
 metadata template. A missing or incompatible template is a typed refusal, not
-a generic role-prefixed fallback. Both generation paths share one admission
-slot and fail closed on unsupported request features. A model-backed parity gate
+a generic role-prefixed fallback. Both generation paths support blocking JSON
+and OpenAI-shaped SSE through one bounded, single-consumer worker. A slow client
+can fill only 32 deltas before backpressuring decode; dropping the response
+cancels generation at the next token boundary. A model-backed parity gate
 now compares the exact pinned revision and the in-tree runtime at the prompt-ID,
 generated-ID, decoded-text, finish-reason, and usage boundaries across raw,
 Unicode, single-turn chat, and multi-turn chat prompts. It unloads the pinned
@@ -99,12 +101,11 @@ model before loading the in-tree model so the check stays within hosted-CI
 memory. The adapter is deliberately not composed into the serving binary yet,
 so no public replica or gateway route has changed.
 
-`LoadedModel` also exposes a synchronous incremental generation boundary for
-the next serving slice. It reports each token with only its newly valid UTF-8
-text suffix, keeps partial multi-byte characters buffered across tokens, and
-accepts cancellation before the next forward pass. A consumer cancellation
-returns normally as a distinct outcome rather than detaching inference. This is
-engine capability only: no HTTP handler emits SSE yet.
+`LoadedModel` exposes the synchronous incremental generation boundary used by
+those streams. It reports each token with only its newly valid UTF-8 text
+suffix, keeps partial multi-byte characters buffered across tokens, and accepts
+cancellation before the next forward pass. A consumer cancellation returns
+normally as a distinct outcome rather than detaching inference.
 
 ## 5. The gap, stated plainly
 
@@ -114,16 +115,15 @@ Missing entirely, in rough order of difficulty:
 - the remaining OpenAI request and response schemas beyond deterministic
   string-content completion and chat
 - serving model registry and concurrent load/unload/admission policy
-- SSE streaming for completions and chat
 - embeddings models — a different model family, not a decode loop
 - reranking models — likewise
 - the agent workspace subsystem
 
 Loading and owning one immutable model for greedy completion is in-tree, as are
-pinned-compatible chat rendering, non-streaming HTTP adapters, and an exact
-real-model generation parity gate over the current migration artifact;
-production composition, attribution, streaming, broader template families, and
-the other model families remain above that boundary.
+pinned-compatible chat rendering, blocking and streaming HTTP adapters, and an
+exact real-model generation parity gate over the current migration artifact;
+production composition, attribution, broader template families, and the other
+model families remain above that boundary.
 
 This is a program of work, not a change. Anyone estimating it from "the server
 only imports two symbols" will be wrong by an order of magnitude.
@@ -154,10 +154,11 @@ The first slice was intentionally below HTTP: `engine_core::runtime::LoadedModel
 provides one owned, fail-closed path from a GGUF file to deterministic raw
 completion. The following slices added an isolated server adapter for health,
 exact model discovery, non-streaming raw completion, pinned-compatible chat
-completion, the real-model token parity gate over both generation routes, and a
-cancellable per-token runtime callback with incremental UTF-8 decoding. The
-pinned router remains the production surface while SSE, the remaining handlers,
-and broader template families are built and tested against that runtime. This
+completion, the real-model token parity gate over both generation routes, a
+cancellable per-token runtime callback with incremental UTF-8 decoding, and
+bounded SSE for both generation routes. The pinned router remains the
+production surface while the remaining handlers and broader template families
+are built and tested against that runtime. This
 keeps the external contract unchanged during the port and prevents serving
 policy from leaking back into the numerics crate.
 
