@@ -6,10 +6,12 @@ use axum::routing::{any, post};
 use axum::Router;
 use bytes::Bytes;
 use camelid_enterprise_gateway::{
-    router as gateway_router, router_with_max_in_flight, router_with_options, GatewayAuth,
-    GatewayLog, LogFlush, OrgQuota, UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT,
+    router as gateway_router, router_with_max_in_flight, router_with_model_catalog,
+    router_with_options, GatewayAuth, GatewayLog, LogFlush, ModelCatalog, ModelSelectionLimits,
+    OrgQuota, UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES,
+    DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES,
 };
-use futures_util::stream;
+use futures_util::{stream, StreamExt};
 use http_body_util::BodyExt;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -25,6 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -46,6 +49,33 @@ async fn spawn_server(app: Router) -> TestServer {
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
+    });
+    TestServer { addr, task }
+}
+
+async fn spawn_catalog_connection_dropper(calls: Arc<AtomicUsize>) -> TestServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move {
+                let mut request = [0_u8; 1024];
+                let read = stream.read(&mut request).await.unwrap_or(0);
+                if request[..read].starts_with(b"GET /v1/models ") {
+                    let body = r#"{"object":"list","data":[{"id":"alpha"}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    return;
+                }
+                calls.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            });
+        }
     });
     TestServer { addr, task }
 }
@@ -119,6 +149,65 @@ async fn spawn_gateway_with_options(
         .unwrap();
     });
     TestServer { addr, task }
+}
+
+async fn spawn_catalog_gateway(routes: &[(&str, SocketAddr)]) -> TestServer {
+    spawn_catalog_gateway_with_options(
+        routes,
+        DEFAULT_MAX_IN_FLIGHT,
+        default_selection_limits(),
+        GatewayAuth::Disabled,
+    )
+    .await
+}
+
+async fn spawn_catalog_gateway_with_options(
+    routes: &[(&str, SocketAddr)],
+    max_in_flight: NonZeroUsize,
+    selection_limits: ModelSelectionLimits,
+    auth: GatewayAuth,
+) -> TestServer {
+    spawn_catalog_gateway_with_audit(routes, max_in_flight, selection_limits, auth, None).await
+}
+
+async fn spawn_catalog_gateway_with_audit(
+    routes: &[(&str, SocketAddr)],
+    max_in_flight: NonZeroUsize,
+    selection_limits: ModelSelectionLimits,
+    auth: GatewayAuth,
+    audit: Option<Arc<GatewayLog>>,
+) -> TestServer {
+    let catalog = ModelCatalog::new(routes.iter().map(|(model_id, upstream)| {
+        (
+            (*model_id).to_string(),
+            UpstreamOrigin::parse(&format!("http://{upstream}")).unwrap(),
+        )
+    }))
+    .unwrap();
+    let catalog = catalog.verify_backend_model_ids().await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router =
+        router_with_model_catalog(catalog, max_in_flight, selection_limits, None, auth, audit);
+    let task = tokio::spawn(async move {
+        camelid_enterprise_gateway::serve(
+            listener,
+            router,
+            Duration::from_secs(30),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    });
+    TestServer { addr, task }
+}
+
+fn default_selection_limits() -> ModelSelectionLimits {
+    ModelSelectionLimits::new(
+        DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES,
+        DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES,
+    )
+    .unwrap()
 }
 
 fn gateway_log(path: &Path) -> Arc<GatewayLog> {
@@ -2259,6 +2348,1077 @@ async fn record_method_and_path(
 
 /// Every `(method, path)` an upstream test handler saw the gateway forward.
 type ForwardedRequests = Arc<Mutex<Vec<(Method, String)>>>;
+
+#[derive(Clone)]
+struct CatalogUpstream {
+    name: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+fn catalog_model_list_response(model_id: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "object": "list",
+                "data": [{ "id": model_id }],
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+async fn catalog_upstream(State(state): State<CatalogUpstream>, request: Request) -> Response {
+    if request.method() == Method::GET && request.uri().path() == "/v1/models" {
+        return catalog_model_list_response(state.name);
+    }
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    let body = to_bytes(request.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("x-test-catalog-upstream", state.name)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn catalog_routes_generation_by_json_model_and_preserves_request_bytes() {
+    let alpha_calls = Arc::new(AtomicUsize::new(0));
+    let alpha = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "alpha",
+            calls: Arc::clone(&alpha_calls),
+        },
+    ))
+    .await;
+    let bravo_calls = Arc::new(AtomicUsize::new(0));
+    let bravo = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "bravo",
+            calls: Arc::clone(&bravo_calls),
+        },
+    ))
+    .await;
+    let gateway = spawn_catalog_gateway(&[("alpha", alpha.addr), ("bravo", bravo.addr)]).await;
+
+    // Query parameters are preserved for compatibility, but only the JSON
+    // field selects an origin. A client therefore cannot use `?model=` to
+    // redirect a request around the catalog.
+    let chat_body =
+        r#"{"model":"alpha","messages":[{"role":"user","content":"hello"}],"stream":false}"#;
+    let chat = Request::post(format!(
+        "http://{}/v1/chat/completions?model=bravo",
+        gateway.addr
+    ))
+    .header("content-type", "application/json")
+    .body(Body::from(chat_body))
+    .unwrap();
+    let chat_response = client().request(chat).await.unwrap();
+    assert_eq!(chat_response.status(), StatusCode::OK);
+    assert_eq!(chat_response.headers()["x-test-catalog-upstream"], "alpha");
+    assert_eq!(
+        to_bytes(Body::new(chat_response.into_body()), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+        chat_body
+    );
+
+    // A JSON serializer may escape part of a valid backend id. Selection must
+    // compare the decoded value to the verified catalog id, while forwarding
+    // the original bytes unchanged.
+    let escaped_chat_body = r#"{"model":"alph\u0061","messages":[]}"#;
+    let escaped_chat = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(escaped_chat_body))
+        .unwrap();
+    let escaped_chat_response = client().request(escaped_chat).await.unwrap();
+    assert_eq!(escaped_chat_response.status(), StatusCode::OK);
+    assert_eq!(
+        escaped_chat_response.headers()["x-test-catalog-upstream"],
+        "alpha"
+    );
+    assert_eq!(
+        to_bytes(
+            Body::new(escaped_chat_response.into_body()),
+            4 * 1024 * 1024
+        )
+        .await
+        .unwrap(),
+        escaped_chat_body
+    );
+
+    let completion_body = r#"{"model":"bravo","prompt":"2+2=","max_tokens":4}"#;
+    let completion = Request::post(format!("http://{}/v1/completions", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(completion_body))
+        .unwrap();
+    let completion_response = client().request(completion).await.unwrap();
+    assert_eq!(completion_response.status(), StatusCode::OK);
+    assert_eq!(
+        completion_response.headers()["x-test-catalog-upstream"],
+        "bravo"
+    );
+    assert_eq!(
+        to_bytes(Body::new(completion_response.into_body()), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+        completion_body
+    );
+    assert_eq!(alpha_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(bravo_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn catalog_serves_stable_model_discovery_without_contacting_replicas() {
+    let alpha_calls = Arc::new(AtomicUsize::new(0));
+    let alpha = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "alpha",
+            calls: Arc::clone(&alpha_calls),
+        },
+    ))
+    .await;
+    let bravo_calls = Arc::new(AtomicUsize::new(0));
+    let bravo = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "bravo",
+            calls: Arc::clone(&bravo_calls),
+        },
+    ))
+    .await;
+    // The input order is intentionally reversed. Discovery must not inherit
+    // incidental CLI ordering from a deployment manifest.
+    let gateway = spawn_catalog_gateway(&[("bravo", bravo.addr), ("alpha", alpha.addr)]).await;
+
+    let list = client()
+        .request(
+            Request::get(format!("http://{}/v1/models", gateway.addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let list: serde_json::Value =
+        serde_json::from_slice(&to_bytes(Body::new(list.into_body()), 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(list["object"], "list");
+    assert_eq!(list["data"][0]["id"], "alpha");
+    assert_eq!(list["data"][1]["id"], "bravo");
+
+    let detail = client()
+        .request(
+            Request::get(format!("http://{}/v1/models/alpha", gateway.addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail: serde_json::Value =
+        serde_json::from_slice(&to_bytes(Body::new(detail.into_body()), 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(detail["id"], "alpha");
+    assert_eq!(detail["owned_by"], "camelid");
+
+    let missing = client()
+        .request(
+            Request::get(format!("http://{}/v1/models/not-configured", gateway.addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let missing: serde_json::Value = serde_json::from_slice(
+        &to_bytes(Body::new(missing.into_body()), 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(missing["error"]["code"], "model_not_found");
+    assert_eq!(alpha_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(bravo_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn catalog_verifies_every_configured_id_against_its_pool_before_startup() {
+    let upstream = spawn_server(Router::new().route(
+        "/v1/models",
+        any(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"object":"list","data":[{"id":"Llama 3.2 1B Instruct"}]}"#,
+                ))
+                .unwrap()
+        }),
+    ))
+    .await;
+    let exact = ModelCatalog::new([(
+        "Llama 3.2 1B Instruct".to_string(),
+        UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap(),
+    )])
+    .unwrap();
+    exact.verify_backend_model_ids().await.unwrap();
+
+    let alias = ModelCatalog::new([(
+        "llama-3.2".to_string(),
+        UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap(),
+    )])
+    .unwrap();
+    let error = alias.verify_backend_model_ids().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("catalog model id \"llama-3.2\" is not advertised"),
+        "unexpected catalog preflight error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_rejects_unroutable_or_oversized_requests_without_contacting_replicas() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "alpha",
+            calls: Arc::clone(&calls),
+        },
+    ))
+    .await;
+    let gateway = spawn_catalog_gateway(&[("alpha", upstream.addr)]).await;
+
+    let unknown = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"http://127.0.0.1:9"}"#))
+        .unwrap();
+    let unknown = client().request(unknown).await.unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let unknown: serde_json::Value = serde_json::from_slice(
+        &to_bytes(Body::new(unknown.into_body()), 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(unknown["error"]["code"], "model_not_found");
+
+    let missing = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"messages":[]}"#))
+        .unwrap();
+    let missing = client().request(missing).await.unwrap();
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+    let malformed = Request::post(format!("http://{}/v1/completions", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"alpha""#))
+        .unwrap();
+    let malformed = client().request(malformed).await.unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+    let wrong_type = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("content-type", "text/vendor+json")
+        .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+        .unwrap();
+    let wrong_type = client().request(wrong_type).await.unwrap();
+    assert_eq!(wrong_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let unsupported = Request::post(format!("http://{}/v1/embeddings", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"alpha","input":"test"}"#))
+        .unwrap();
+    let unsupported = client().request(unsupported).await.unwrap();
+    assert_eq!(unsupported.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let limited_gateway = spawn_catalog_gateway_with_options(
+        &[("alpha", upstream.addr)],
+        DEFAULT_MAX_IN_FLIGHT,
+        ModelSelectionLimits::new(
+            NonZeroUsize::new(8).unwrap(),
+            NonZeroUsize::new(16).unwrap(),
+        )
+        .unwrap(),
+        GatewayAuth::Disabled,
+    )
+    .await;
+    let oversized = Request::post(format!(
+        "http://{}/v1/chat/completions",
+        limited_gateway.addr
+    ))
+    .header("content-type", "application/json")
+    .body(Body::from("123456789"))
+    .unwrap();
+    let oversized = client().request(oversized).await.unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn catalog_selector_work_is_bounded_while_a_request_body_stalls() {
+    let upstream_calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(
+        Router::new()
+            .route(
+                "/v1/models",
+                any(|| async { catalog_model_list_response("alpha") }),
+            )
+            .fallback(any({
+                let upstream_calls = Arc::clone(&upstream_calls);
+                move || {
+                    let upstream_calls = Arc::clone(&upstream_calls);
+                    async move {
+                        upstream_calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            })),
+    )
+    .await;
+    let catalog = ModelCatalog::new([(
+        "alpha".to_string(),
+        UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap(),
+    )])
+    .unwrap();
+    let catalog = catalog.verify_backend_model_ids().await.unwrap();
+    let app = router_with_model_catalog(
+        catalog,
+        DEFAULT_MAX_IN_FLIGHT,
+        // One global selector slot, and a wait short enough that the test
+        // observes the shed-load path rather than the production budget.
+        ModelSelectionLimits::new(
+            NonZeroUsize::new(1024).unwrap(),
+            NonZeroUsize::new(2048).unwrap(),
+        )
+        .unwrap()
+        .with_acquire_timeout(Duration::from_millis(100)),
+        None,
+        GatewayAuth::Disabled,
+        None,
+    );
+
+    let selector_started = Arc::new(Notify::new());
+    let wait_for_selector = selector_started.notified();
+    let stalled_body = Body::from_stream(
+        stream::once({
+            let selector_started = Arc::clone(&selector_started);
+            async move {
+                selector_started.notify_one();
+                Ok::<Bytes, Infallible>(Bytes::from_static(b"{\"model\":\"alpha\""))
+            }
+        })
+        .chain(stream::pending::<Result<Bytes, Infallible>>()),
+    );
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(stalled_body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+    wait_for_selector.await;
+
+    let rejected = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let retry_after: u64 = rejected.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=3).contains(&retry_after));
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+
+    first.abort();
+    let _ = first.await;
+    let recovered = app
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::NO_CONTENT);
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn catalog_selector_capacity_is_fair_across_authenticated_organizations() {
+    let upstream_calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(
+        Router::new()
+            .route(
+                "/v1/models",
+                any(|| async { catalog_model_list_response("alpha") }),
+            )
+            .fallback(any({
+                let upstream_calls = Arc::clone(&upstream_calls);
+                move || {
+                    let upstream_calls = Arc::clone(&upstream_calls);
+                    async move {
+                        upstream_calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            })),
+    )
+    .await;
+    let catalog = ModelCatalog::new([(
+        "alpha".to_string(),
+        UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap(),
+    )])
+    .unwrap()
+    .verify_backend_model_ids()
+    .await
+    .unwrap();
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let tenant_a = store.create_user("tenant-a").unwrap();
+    let token_a = store.issue_token(&tenant_a, TokenLifetime::Never).unwrap();
+    let tenant_b = store.create_user("tenant-b").unwrap();
+    let token_b = store.issue_token(&tenant_b, TokenLifetime::Never).unwrap();
+    let app = router_with_model_catalog(
+        catalog,
+        DEFAULT_MAX_IN_FLIGHT,
+        // Two global slots, so the derived per-organization default is one and
+        // tenant A's stalled body exhausts A's own share without touching B's.
+        ModelSelectionLimits::new(
+            NonZeroUsize::new(1024).unwrap(),
+            NonZeroUsize::new(4096).unwrap(),
+        )
+        .unwrap()
+        .with_acquire_timeout(Duration::from_millis(100)),
+        None,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: Some(Arc::new(OrgQuota::new(
+                NonZeroU32::new(1).unwrap(),
+                NonZeroU64::new(60).unwrap(),
+            ))),
+            usage: None,
+        },
+        None,
+    );
+
+    let selector_started = Arc::new(Notify::new());
+    let wait_for_selector = selector_started.notified();
+    let stalled_body = Body::from_stream(
+        stream::once({
+            let selector_started = Arc::clone(&selector_started);
+            async move {
+                selector_started.notify_one();
+                Ok::<Bytes, Infallible>(Bytes::from_static(b"{\"model\":\"alpha\""))
+            }
+        })
+        .chain(stream::pending::<Result<Bytes, Infallible>>()),
+    );
+    let tenant_a_stalled = tokio::spawn({
+        let app = app.clone();
+        let token_a = token_a.clone();
+        async move {
+            app.oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("authorization", format!("Bearer {token_a}"))
+                    .header("content-type", "application/json")
+                    .body(stalled_body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+    wait_for_selector.await;
+
+    let tenant_a_rejected = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("authorization", format!("Bearer {token_a}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tenant_a_rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        to_bytes(Body::new(tenant_a_rejected.into_body()), 1024)
+            .await
+            .unwrap(),
+        r#"{"error":{"message":"gateway organization model selection limit reached","type":"gateway_error"}}"#
+    );
+
+    let tenant_b_accepted = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("authorization", format!("Bearer {token_b}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tenant_b_accepted.status(), StatusCode::NO_CONTENT);
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+
+    // The incomplete selector was intentionally quota-free, but it can no
+    // longer keep tenant A's organization from issuing another request once
+    // its selector slot is released.
+    tenant_a_stalled.abort();
+    let _ = tenant_a_stalled.await;
+    let tenant_a_recovered = app
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("authorization", format!("Bearer {token_a}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tenant_a_recovered.status(), StatusCode::NO_CONTENT);
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 2);
+}
+
+/// Selector capacity is a memory reservation held for milliseconds, so a
+/// request that finds it busy has to wait for it rather than fail on contact.
+///
+/// This is the shape ordinary traffic has and the shape the in-process
+/// single-frame bodies elsewhere in this file cannot produce: real sockets,
+/// bodies large enough to span several reads, and more concurrent requests than
+/// either bound allows at once. Four organizations of eight requests each
+/// exceeds both the per-organization default (four, half the global capacity)
+/// and the global capacity (eight) simultaneously.
+///
+/// With fail-fast admission this loses most of the burst -- measured at 75% of
+/// sixteen same-organization 64 KiB requests, and 84% of sixty-four requests
+/// spread across sixty-four distinct organizations. Every one of them is valid
+/// and would have been served a moment later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_selector_capacity_queues_a_concurrent_burst_instead_of_refusing_it() {
+    const ORGANIZATIONS: usize = 4;
+    const REQUESTS_PER_ORGANIZATION: usize = 8;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "alpha",
+            calls: Arc::clone(&calls),
+        },
+    ))
+    .await;
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let mut tokens = Vec::new();
+    for index in 0..ORGANIZATIONS {
+        let principal = store.create_user(&format!("tenant-{index}")).unwrap();
+        tokens.push(store.issue_token(&principal, TokenLifetime::Never).unwrap());
+    }
+    let gateway = spawn_catalog_gateway_with_options(
+        &[("alpha", upstream.addr)],
+        DEFAULT_MAX_IN_FLIGHT,
+        default_selection_limits(),
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: None,
+        },
+    )
+    .await;
+
+    // Far larger than a socket buffer, so materializing it spans many polls
+    // and concurrent selectors genuinely overlap. A body small enough to
+    // arrive in one read completes without ever yielding, which is why the
+    // single-frame bodies elsewhere in this file cannot show this.
+    let prompt = "x".repeat(512 * 1024);
+    let mut requests = Vec::new();
+    for token in &tokens {
+        for _ in 0..REQUESTS_PER_ORGANIZATION {
+            let token = token.clone();
+            let addr = gateway.addr;
+            let prompt = prompt.clone();
+            requests.push(tokio::spawn(async move {
+                let body = serde_json::json!({
+                    "model": "alpha",
+                    "messages": [{ "role": "user", "content": prompt }],
+                })
+                .to_string();
+                let sent = client()
+                    .request(
+                        Request::post(format!("http://{addr}/v1/chat/completions"))
+                            .header("authorization", format!("Bearer {token}"))
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await;
+                match sent {
+                    Ok(response) => response.status().to_string(),
+                    // Answering before the body finished uploading aborts the
+                    // connection, so a refusal can surface here rather than as
+                    // a status. Both are the burst failing.
+                    Err(error) => format!("transport failure: {error}"),
+                }
+            }));
+        }
+    }
+
+    let mut outcomes = Vec::new();
+    for request in requests {
+        outcomes.push(request.await.unwrap());
+    }
+    let served = StatusCode::OK.to_string();
+    let refused: Vec<&String> = outcomes
+        .iter()
+        .filter(|outcome| **outcome != served)
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "every request in the burst is valid and routable, but {} of {} were not served: {refused:?}",
+        refused.len(),
+        outcomes.len(),
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        ORGANIZATIONS * REQUESTS_PER_ORGANIZATION
+    );
+}
+
+/// Waiting for selector capacity is only safe because holding it is bounded.
+/// Without a read deadline the only limit on how long one slot stays occupied
+/// is the connection cap, so a handful of dribbling clients could exhaust the
+/// budget for minutes and every waiter behind them would time out.
+#[tokio::test]
+async fn catalog_reclaims_selector_capacity_from_a_body_that_misses_the_read_deadline() {
+    let upstream_calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(
+        Router::new()
+            .route(
+                "/v1/models",
+                any(|| async { catalog_model_list_response("alpha") }),
+            )
+            .fallback(any({
+                let upstream_calls = Arc::clone(&upstream_calls);
+                move || {
+                    let upstream_calls = Arc::clone(&upstream_calls);
+                    async move {
+                        upstream_calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            })),
+    )
+    .await;
+    let catalog = ModelCatalog::new([(
+        "alpha".to_string(),
+        UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap(),
+    )])
+    .unwrap()
+    .verify_backend_model_ids()
+    .await
+    .unwrap();
+    let app = router_with_model_catalog(
+        catalog,
+        DEFAULT_MAX_IN_FLIGHT,
+        // One global slot, and a read deadline the stalled body below cannot
+        // meet. The wait for capacity is longer than that deadline, so a
+        // queued request outlives the slot it is waiting for.
+        ModelSelectionLimits::new(
+            NonZeroUsize::new(1024).unwrap(),
+            NonZeroUsize::new(2048).unwrap(),
+        )
+        .unwrap()
+        .with_read_timeout(Duration::from_millis(100))
+        .with_acquire_timeout(Duration::from_secs(5)),
+        None,
+        GatewayAuth::Disabled,
+        None,
+    );
+
+    let selector_started = Arc::new(Notify::new());
+    let wait_for_selector = selector_started.notified();
+    let stalled_body = Body::from_stream(
+        stream::once({
+            let selector_started = Arc::clone(&selector_started);
+            async move {
+                selector_started.notify_one();
+                Ok::<Bytes, Infallible>(Bytes::from_static(b"{\"model\":\"alpha\""))
+            }
+        })
+        .chain(stream::pending::<Result<Bytes, Infallible>>()),
+    );
+    let stalled = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(stalled_body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+    wait_for_selector.await;
+
+    // Queued behind the stalled body rather than refused: it is served once
+    // the deadline reclaims the slot, without the client retrying.
+    let queued = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.status(), StatusCode::NO_CONTENT);
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+
+    let stalled = stalled.await.unwrap();
+    assert_eq!(stalled.status(), StatusCode::REQUEST_TIMEOUT);
+    let stalled: serde_json::Value = serde_json::from_slice(
+        &to_bytes(Body::new(stalled.into_body()), 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stalled["error"]["code"], "request_body_timeout");
+    // The stalled request never named a routable model, so it never reached a
+    // replica: the second call is still the only one.
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+}
+
+/// A request whose declared length already exceeds the selector limit is
+/// refused from its head alone, so it never occupies a slot or the bandwidth
+/// behind one. Proven under exhausted capacity: if the size check ran after
+/// admission it would queue and then time out as a `503` instead.
+#[tokio::test]
+async fn catalog_refuses_an_oversized_declared_body_before_it_spends_selector_capacity() {
+    let upstream = spawn_server(
+        Router::new().fallback(any(|| async { catalog_model_list_response("alpha") })),
+    )
+    .await;
+    let catalog = ModelCatalog::new([(
+        "alpha".to_string(),
+        UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap(),
+    )])
+    .unwrap()
+    .verify_backend_model_ids()
+    .await
+    .unwrap();
+    let app = router_with_model_catalog(
+        catalog,
+        DEFAULT_MAX_IN_FLIGHT,
+        ModelSelectionLimits::new(
+            NonZeroUsize::new(1024).unwrap(),
+            NonZeroUsize::new(2048).unwrap(),
+        )
+        .unwrap()
+        .with_acquire_timeout(Duration::from_millis(100)),
+        None,
+        GatewayAuth::Disabled,
+        None,
+    );
+
+    let selector_started = Arc::new(Notify::new());
+    let wait_for_selector = selector_started.notified();
+    let stalled_body = Body::from_stream(
+        stream::once({
+            let selector_started = Arc::clone(&selector_started);
+            async move {
+                selector_started.notify_one();
+                Ok::<Bytes, Infallible>(Bytes::from_static(b"{\"model\":\"alpha\""))
+            }
+        })
+        .chain(stream::pending::<Result<Bytes, Infallible>>()),
+    );
+    let stalled = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(stalled_body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+    wait_for_selector.await;
+
+    // The control: capacity really is exhausted, so a request that has to read
+    // its body is shed.
+    let within_limit = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("content-length", "31")
+                .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(within_limit.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let oversized = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("content-length", "4096")
+                .body(Body::from("x".repeat(4096)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let oversized: serde_json::Value = serde_json::from_slice(
+        &to_bytes(Body::new(oversized.into_body()), 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(oversized["error"]["code"], "request_too_large");
+
+    stalled.abort();
+    let _ = stalled.await;
+}
+
+/// serde fills a derived struct from a JSON sequence positionally, so a derived
+/// selector reads `["alpha"]` as `{"model":"alpha"}` and routes it. The replica
+/// deserializing the same bytes maps position zero onto the first field of its
+/// own request type, so the two disagree about what the request said while the
+/// gateway records a `model_id` the body never named. Only an object carries a
+/// top-level `model` member, and only an object is accepted.
+#[tokio::test]
+async fn catalog_refuses_a_body_that_is_not_a_json_object() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "alpha",
+            calls: Arc::clone(&calls),
+        },
+    ))
+    .await;
+    let gateway = spawn_catalog_gateway(&[("alpha", upstream.addr)]).await;
+
+    for body in [r#"["alpha"]"#, r#""alpha""#, "null", "[]"] {
+        let response = client()
+            .request(
+                Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{body} is not a JSON object and must not select a pool"
+        );
+        let response: serde_json::Value = serde_json::from_slice(
+            &to_bytes(Body::new(response.into_body()), 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["error"]["code"], "malformed_json");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn catalog_never_retries_a_generation_after_an_upstream_connection_failure() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_catalog_connection_dropper(Arc::clone(&attempts)).await;
+    let gateway = spawn_catalog_gateway(&[("alpha", upstream.addr)]).await;
+    let request = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+        .unwrap();
+
+    let response = client().request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "a failed generation request must not be replayed to its model pool"
+    );
+}
+
+#[tokio::test]
+async fn catalog_authenticates_before_discovery_and_invalid_models_do_not_spend_quota() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_server(Router::new().fallback(any(catalog_upstream)).with_state(
+        CatalogUpstream {
+            name: "alpha",
+            calls: Arc::clone(&calls),
+        },
+    ))
+    .await;
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
+    let gateway = spawn_catalog_gateway_with_options(
+        &[("alpha", upstream.addr)],
+        DEFAULT_MAX_IN_FLIGHT,
+        default_selection_limits(),
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: Some(Arc::new(OrgQuota::new(
+                NonZeroU32::new(1).unwrap(),
+                NonZeroU64::new(60).unwrap(),
+            ))),
+            usage: None,
+        },
+    )
+    .await;
+
+    let anonymous = Request::get(format!("http://{}/v1/models", gateway.addr))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        client().request(anonymous).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let unknown = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"not-configured"}"#))
+        .unwrap();
+    assert_eq!(
+        client().request(unknown).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let request = || {
+        Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+            .unwrap()
+    };
+    assert_eq!(
+        client().request(request()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client().request(request()).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn catalog_records_the_selected_model_in_audit_and_usage_logs() {
+    let upstream = spawn_server(
+        Router::new()
+            .route(
+                "/v1/models",
+                any(|| async { catalog_model_list_response("alpha") }),
+            )
+            .fallback(any(|| async { StatusCode::NO_CONTENT })),
+    )
+    .await;
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let usage_path = dir.path().join("usage.jsonl");
+    let gateway = spawn_catalog_gateway_with_audit(
+        &[("alpha", upstream.addr)],
+        DEFAULT_MAX_IN_FLIGHT,
+        default_selection_limits(),
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: Some(gateway_log(&usage_path)),
+        },
+        Some(gateway_log(&audit_path)),
+    )
+    .await;
+
+    let request = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"alpha","messages":[]}"#))
+        .unwrap();
+    assert_eq!(
+        client().request(request).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let audit = read_audit_records(&audit_path, 1).await;
+    let usage = read_usage_records(&usage_path, 1).await;
+    assert_eq!(audit[0]["model_id"], "alpha");
+    assert_eq!(usage[0]["model_id"], "alpha");
+    assert_eq!(audit[0]["request_id"], usage[0]["request_id"]);
+}
+
+#[tokio::test]
+async fn catalog_streams_replica_responses_after_model_selection() {
+    let release_second = Arc::new(Notify::new());
+    let upstream = spawn_server(
+        Router::new()
+            .route(
+                "/v1/models",
+                any(|| async { catalog_model_list_response("alpha") }),
+            )
+            .route("/v1/chat/completions", any(delayed_sse))
+            .with_state(Arc::clone(&release_second)),
+    )
+    .await;
+    let gateway = spawn_catalog_gateway(&[("alpha", upstream.addr)]).await;
+    let request = Request::post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"alpha","messages":[],"stream":true}"#,
+        ))
+        .unwrap();
+    let response = client().request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("the first streamed event must not wait for completion")
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(first, "data: first\n\n");
+    release_second.notify_one();
+    assert_eq!(
+        body.frame().await.unwrap().unwrap().into_data().unwrap(),
+        "data: second\n\n"
+    );
+}
 
 /// Every `(method, path)` in `replica_contract::PUBLIC_ROUTES` must be forwarded
 /// to the upstream (proved via `probe_path` for the parameterized route). This

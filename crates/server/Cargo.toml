@@ -43,5 +43,6 @@ toml = "0.8"
 # and write receipts to a scratch dir. `tower`'s `ServiceExt` operates on the
 # `tower_service::Service` a `Router` already implements, so no version pinning
 # to axum's internal tower is required.
+http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tempfile.workspace = true

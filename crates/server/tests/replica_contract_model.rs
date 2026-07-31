@@ -1,19 +1,19 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
 use camelid_enterprise::{apply_deterministic, attributed_router};
+use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
 use tower::ServiceExt;
 
 const MODEL_ENV: &str = "CAMELID_ENTERPRISE_TEST_MODEL";
-// The deterministic lane serializes generation, so the queue-saturation test
-// spawns concurrent requests that decode one at a time behind a shared lock.
-// Each task's timeout is measured from spawn, so a task queued behind many
-// slow decodes on constrained CI hardware can wait well past its own decode
-// time. This bound is a hang detector, not a performance target; the CI job's
-// own timeout-minutes remains the real ceiling on total wall-clock time.
-const STEP_TIMEOUT: Duration = Duration::from_secs(900);
+// The deterministic lane serializes generation. The saturation probe below
+// uses streaming requests, which post their engine job and return before the
+// decode runs, so this bound is a hang detector rather than a budget for
+// completed generations; the CI job's own timeout-minutes remains the real
+// ceiling on total wall-clock time.
+const STEP_TIMEOUT: Duration = Duration::from_secs(600);
 
 async fn body_json(response: axum::response::Response) -> Value {
     let bytes = tokio::time::timeout(
@@ -60,6 +60,14 @@ async fn real_model_conforms_to_replica_http_v1() {
     .unwrap_or_else(|error| panic!("could not resolve {MODEL_ENV}: {error}"));
     let config = apply_deterministic().expect("the test process must apply the lane contract");
     let expected_sha = config.sha256.clone();
+    // Nothing here may touch the engine's environment after this point. The
+    // lane's guarantee is stated against a frozen configuration vector, and
+    // `apply_deterministic` refuses to start when a key it excludes -- such as
+    // CAMELID_QUEUE_DEPTH -- is set. Setting one after that check has passed
+    // would run the engine in a configuration the lane forbids while every
+    // response below still carried `expected_sha`, which asserts the opposite.
+    // The queue-saturation probe therefore works against the engine's real
+    // default queue depth.
     let state = camelid::api::AppState::with_configured_threads(Some(4))
         .with_default_enable_thinking(false)
         .with_models_dir(None);
@@ -175,13 +183,15 @@ async fn real_model_conforms_to_replica_http_v1() {
         serde_json::from_str::<Value>(event).expect("every data event before [DONE] is JSON");
     }
 
-    // 12, not 16: this must comfortably exceed the engine's admission
-    // capacity (observed at 9 elsewhere in this suite) so both the accepted
-    // and rejected branches below are exercised, while keeping the total
-    // serialized decode queue as short as the assertions allow. Constrained
-    // CI hardware pays for every admitted request's decode sequentially
-    // (the deterministic lane serializes generation), so queue depth is the
-    // single biggest lever on this test's wall-clock cost.
+    // Above the engine's default admission capacity (a bounded queue of eight
+    // plus the one running job), so both the accepted and rejected branches
+    // below are exercised. Streaming handlers post their decode job before
+    // returning an SSE response and emit the role frame before awaiting any
+    // decode event, so this proves acceptance and typed queue-full rejection
+    // without waiting for completed model generations. Polling each accepted
+    // body's role frame activates its cancellation guard; dropping the bodies
+    // then proves queue-depth recovery without turning this admission test
+    // into a hardware-duration benchmark.
     const CONCURRENT_REQUESTS: usize = 12;
     let mut requests = tokio::task::JoinSet::new();
     for index in 0..CONCURRENT_REQUESTS {
@@ -196,15 +206,14 @@ async fn real_model_conforms_to_replica_http_v1() {
                         "model": model_id,
                         "messages": [{
                             "role": "user",
-                            "content": format!("Count briefly: {index}")
+                            "content": format!("queue admission probe {index}")
                         }],
                         "temperature": 0,
-                        // Minimal: this section only needs to prove
-                        // admission/rejection/attribution/recovery, not
-                        // generation quality. Every extra token here is paid
-                        // for once per admitted request, serialized.
-                        "max_tokens": 2,
-                        "stream": false
+                        // Long enough to keep the first posted decode active
+                        // while the concurrent handlers submit their jobs, but
+                        // this test never waits for generation completion.
+                        "max_tokens": 128,
+                        "stream": true
                     }),
                 ),
             )
@@ -214,13 +223,31 @@ async fn real_model_conforms_to_replica_http_v1() {
 
     let mut accepted = 0;
     let mut rejected = 0;
+    let mut accepted_bodies = Vec::new();
     while let Some(result) = requests.join_next().await {
         let response = result.unwrap();
         assert_attribution(&response, &expected_sha);
         match response.status() {
             StatusCode::OK => {
                 accepted += 1;
-                body_json(response).await;
+                assert!(response.headers()[CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/event-stream"));
+                let mut body = response.into_body();
+                let role = tokio::time::timeout(STEP_TIMEOUT, body.frame())
+                    .await
+                    .expect("SSE role frame exceeded 600 seconds")
+                    .expect("SSE stream ended before its role frame")
+                    .expect("SSE role frame failed")
+                    .into_data()
+                    .expect("SSE role frame must be data");
+                assert!(
+                    String::from_utf8_lossy(&role).contains("assistant"),
+                    "unexpected initial SSE role frame: {:?}",
+                    role
+                );
+                accepted_bodies.push(body);
             }
             StatusCode::SERVICE_UNAVAILABLE => {
                 rejected += 1;
@@ -239,7 +266,25 @@ async fn real_model_conforms_to_replica_http_v1() {
     assert!(rejected > 0);
     assert_eq!(accepted + rejected, CONCURRENT_REQUESTS);
 
-    let recovered = send(app, Request::get("/v1/health").body(Body::empty()).unwrap()).await;
-    assert_eq!(recovered.status(), StatusCode::OK);
-    assert_eq!(body_json(recovered).await["engine_queue_depth"], 0);
+    // Drops fire the per-stream cancellation guards. The engine observes the
+    // token before its next decode step, then drains cancelled queued jobs.
+    drop(accepted_bodies);
+
+    let deadline = std::time::Instant::now() + STEP_TIMEOUT;
+    loop {
+        let recovered = send(
+            app.clone(),
+            Request::get("/v1/health").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        if body_json(recovered).await["engine_queue_depth"] == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "engine queue depth did not recover after cancelling accepted streams"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

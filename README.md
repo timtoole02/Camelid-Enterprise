@@ -86,6 +86,29 @@ cargo run --release --bin camelid-enterprise-gateway -- serve \
 
 The replica exposes the engine's OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, …) on `127.0.0.1:8181` by default. With the gateway running, clients use `127.0.0.1:8080`; it preserves streaming bodies, status codes, and replica attribution without inspecting or retrying inference requests. The gateway exposes only the supported `/v1` inference routes; replica control, model-lifecycle, workspace, and embedded WebUI routes are not forwarded.
 
+### Static model routing
+
+The gateway also supports a static catalog for one pool per model. Choose
+exactly one gateway mode at startup: legacy transparent `--upstream`, or one or
+more `--model-route <model-id>=<http://replica-pool>` entries. A catalog id is
+not an alias: it must exactly equal an id advertised by that pool's
+`/v1/models` endpoint. Catalog startup verifies every mapping before binding.
+
+```bash
+cargo run --release --bin camelid-enterprise-gateway -- serve \
+  --model-route 'Llama 3.2 1B Instruct=http://llama-pool:8181'
+```
+
+In catalog mode, `GET /v1/models` and `GET /v1/models/{model}` are served from
+the configured catalog. `POST /v1/completions` and
+`POST /v1/chat/completions` select their pool from a required JSON `model`
+field; the request bytes are then forwarded unchanged and responses still
+stream. The catalog is immutable until restart. It is an operator inventory,
+not pool readiness: use the replica readiness probes for readiness, and the
+gateway's `/healthz` for gateway liveness. See [deploy/README.md](deploy/README.md)
+for selector memory/concurrency limits, endpoint restrictions, and the security
+model.
+
 The versioned [Replica HTTP Contract v1](docs/contracts/replica-http-v1.md)
 defines the public route surface, attribution, health/readiness, typed errors,
 streaming, receipts, startup/shutdown behavior, evidence levels, and deliberately
