@@ -1,6 +1,8 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
-use camelid_enterprise::{apply_deterministic, attributed_router};
+use camelid_enterprise::{
+    apply_deterministic, attributed_router, Attribution, ModelIdentity, WorkerThreads,
+};
 use camelid_enterprise_gateway::{
     router_with_model_catalog, GatewayAuth, GatewayLog, ModelCatalog, ModelSelectionLimits,
     UpstreamOrigin, DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES,
@@ -12,6 +14,7 @@ use hyper_util::rt::TokioExecutor;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
@@ -103,13 +106,20 @@ async fn real_model_routes_through_a_verified_static_catalog() {
     let expected_sha = config.sha256.clone();
     let dir = tempfile::tempdir().unwrap();
     let receipt_path = dir.path().join("replica-receipts.jsonl");
+    let identity = Attribution {
+        lane: "deterministic",
+        config_sha256: Arc::new(config.sha256),
+        admission_sha256: Arc::new(config.admission_sha256),
+        model: ModelIdentity::of_file(&model).expect("the model file must be readable"),
+        host: Arc::new("gateway-catalog-model-test/host".to_string()),
+        workers: WorkerThreads::resolved(rayon::current_num_threads()),
+        receipts: Some(Arc::new(receipt_path.clone())),
+    };
     let replica = spawn_router(attributed_router(
         camelid::api::AppState::with_configured_threads(Some(4))
             .with_default_enable_thinking(false)
             .with_models_dir(None),
-        config.sha256,
-        "gateway-catalog-model-test/host".to_string(),
-        Some(receipt_path.clone()),
+        identity,
     ))
     .await;
 

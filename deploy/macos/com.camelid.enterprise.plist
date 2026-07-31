@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Deterministic-lane replica, as a launchd system daemon.
+
+  A LaunchDaemon and not a LaunchAgent: an agent needs a user session, and a
+  racked machine has none after an unattended reboot, which is the one case this
+  unit exists for. The usual reason to prefer an agent — daemons get no
+  window-server session and so have restricted GPU access — does not apply,
+  because the deterministic lane is CPU-only by construction. A future
+  accelerated lane would have to revisit that.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.camelid.enterprise</string>
+
+  <!-- Every setting is an argv flag, never an environment variable. The replica
+       refuses to start on any CAMELID_* variable it does not recognize, and the
+       shortest way never to trip that is to hand its startup scan nothing to
+       classify.
+
+       --threads is not decoration. It sizes this process's data-parallel worker
+       pool, the width the pool actually comes up at is read back and published
+       on every response as x-camelid-worker-threads, and the configuration
+       digest deliberately does not cover a width — so the number has to be
+       identical on every replica in a pool or the pool is really several pools
+       wearing one address. 8 is a placeholder: set it to the width this
+       hardware class serves at.
+
+       --addr stays on loopback whenever the gateway unit runs on this box. Set
+       it to a routable address only when nothing fronts the replica, and read
+       the Exposure section of README.md first: the served route list bounds
+       what a caller may ask for, never who may ask. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/camelid-enterprise</string>
+    <string>serve</string>
+    <string>--model</string>
+    <string>/usr/local/var/camelid-enterprise/models/model.gguf</string>
+    <string>--addr</string>
+    <string>127.0.0.1:8181</string>
+    <string>--lane</string>
+    <string>deterministic</string>
+    <string>--threads</string>
+    <string>8</string>
+    <string>--serving-receipts</string>
+    <string>/usr/local/var/camelid-enterprise/receipts/serving.jsonl</string>
+  </array>
+
+  <!-- Never root. The replica needs read on one GGUF, append on one receipt
+       file, and one listening socket above 1024. -->
+  <key>UserName</key>
+  <string>_camelid</string>
+  <key>GroupName</key>
+  <string>_camelid</string>
+  <key>InitGroups</key>
+  <true/>
+
+  <key>WorkingDirectory</key>
+  <string>/usr/local/var/camelid-enterprise</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Come back from a crash; stay down after a clean exit. The only clean exit
+       is a drained stop, which is an operator decision launchd should not undo.
+       A fail-closed startup — a stray CAMELID_* variable, a missing model, a
+       pool that cannot be sized — therefore retries at ThrottleInterval until a
+       human fixes it. That loop is the intended behaviour and not a bug: the
+       replica is saying its configuration is wrong, and the alternative is
+       serving under one it cannot vouch for. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- Default is 10s. Every restart re-reads and re-hashes a multi-gigabyte
+       GGUF before it binds, so a tight loop thrashes the page cache long before
+       anyone reads the log. -->
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+
+  <!-- launchd SIGKILLs at ExitTimeOut, whose default (20s) is far shorter than
+       one generation. This is a BACKSTOP, not the drain. The drain is:
+       deregister at whatever fronts the fleet, poll engine_queue_depth to zero,
+       stop the gateway if this box runs one, then stop this unit — see
+       README.md.
+
+       900s is one generation's wall-clock ceiling, and drain time is the SUM of
+       every accepted generation rather than the longest one: the engine runs
+       one at a time, a posted job cannot be aborted, and the bounded queue
+       holds 8 waiting plus 1 running, so a full replica can owe 9 x 15 minutes.
+       Reaching this timeout therefore does NOT mean one generation overran — it
+       means the queue was not empty when the stop was issued, and launchd is
+       about to SIGKILL with generations still on the engine thread, their
+       clients truncated and their receipts unwritten. No honest value covers
+       the worst case, and 0 (infinity) would stall system shutdown, which is
+       exactly why the queue-drain step exists. -->
+  <key>ExitTimeOut</key>
+  <integer>900</integer>
+
+  <!-- Unset means "light resource limits": throttled CPU and I/O bandwidth,
+       which is precisely wrong for a decode loop meant to saturate its core
+       group for the length of a request. -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>/usr/local/var/log/camelid-enterprise/lane.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/usr/local/var/log/camelid-enterprise/lane.err.log</string>
+
+  <!-- Receipts and launchd's own stdio are audit evidence naming what this
+       replica served, so they must not be world-readable. launchd creates the
+       StandardOutPath/StandardErrorPath files itself and the replica creates
+       the receipt file, both under this umask. 23 is decimal for 0o027. -->
+  <key>Umask</key>
+  <integer>23</integer>
+
+  <!-- No CAMELID_* key of any kind, engine or enterprise. The strongest posture
+       an operator can hand the replica is one where its startup scan finds
+       nothing at all to classify.
+
+       VECLIB_MAXIMUM_THREADS is absent for a stronger reason: the replica
+       refuses to start on it, despite its being outside the namespace the scan
+       claims. It resizes Accelerate's internal BLAS pool; the engine calls into
+       Accelerate on this platform, including from a tensor matmul path with no
+       size floor and no flag in front of it; and vecLib's documented response
+       is to change how it blocks and parallelizes those calls, which moves f32
+       summation order. Nothing this replica publishes reports vecLib's pool
+       width, so a replica running under it would look identical to one that is
+       not.
+
+       RAYON_NUM_THREADS and RAYON_RS_NUM_CPUS are refused for a different
+       reason: both size the same pool --threads owns, the second being the
+       deprecated spelling the pinned rayon-core still falls through to. The
+       width they set is published, so this is a one-writer rule rather than a
+       visibility one — but a list that named one spelling and not the other
+       would be bypassable by a synonym, so both are named. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUST_LOG</key>
+    <string>info</string>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>

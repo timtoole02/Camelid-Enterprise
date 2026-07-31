@@ -26,6 +26,36 @@ sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# The startup model load is posted into the engine's own router in-process
+# (`ServiceExt::oneshot`), so the control plane never reaches a socket. `tower`'s
+# `ServiceExt` operates on the `tower_service::Service` a `Router` already
+# implements, so no version pinning to axum's internal tower is required.
+tower = { version = "0.5", features = ["util"] }
+
+# Sizes the process-global data-parallel worker pool, whose resolved width this
+# replica publishes. Deliberately a bare "1": the width is only truthful if this
+# crate and the engine share one pool, and a tighter requirement that resolved a
+# second copy of rayon would size a pool nobody reads and then report that
+# unread pool's width with no error anywhere.
+rayon = "1"
+
+# The model digest is a full read of a multi-gigabyte GGUF at every start, so
+# the hash rate is startup latency. On aarch64, sha2 0.10.9 uses its pure-Rust
+# backend unless `asm` is set, and only then selects a runtime-detected ARMv8
+# crypto path — so one binary still runs on hosts without the extension.
+# Measured here at 0.43 GB/s without it and 2.03 GB/s with, which on a 5 GB model
+# is roughly twelve seconds of startup against two and a half.
+#
+# Target-gated rather than global because it only pays on this arch: on x86-64
+# the default backend already runtime-detects SHA-NI, so the feature would swap
+# only the fallback while adding a dependency to the container builds. Feature
+# unification hands `asm` to the engine's copy of sha2 on this target too; that
+# is an implementation swap and not a behavior change, and the digest test pins
+# the output against a value produced by `shasum -a 256` so a backend that
+# disagreed would fail the build rather than publish a wrong identity.
+[target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 engine-macos.workspace = true
 
@@ -39,10 +69,9 @@ engine-windows.workspace = true
 toml = "0.8"
 
 [dev-dependencies]
-# Drive the attribution middleware through a real router (`ServiceExt::oneshot`)
-# and write receipts to a scratch dir. `tower`'s `ServiceExt` operates on the
-# `tower_service::Service` a `Router` already implements, so no version pinning
-# to axum's internal tower is required.
+# Receipts are written to a scratch dir rather than anywhere in the tree. The
+# middleware and the served-route filter are driven through real routers with
+# `tower::ServiceExt::oneshot`, which is a normal dependency above because the
+# startup loader uses it too.
 http-body-util = "0.1"
-tower = { version = "0.5", features = ["util"] }
 tempfile.workspace = true

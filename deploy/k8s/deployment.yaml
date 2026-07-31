@@ -7,6 +7,14 @@
 # behavior is scoped to a hardware class, so replicas should not float across
 # heterogeneous nodes or get throttled unpredictably. Pin node selection to
 # one instance type per pool.
+#
+# A replica is an internal service. It has no authentication and no tenant
+# identity, so client traffic must enter through the gateway and the replica
+# port must not be reachable from ordinary workloads. The `app`/`lane` labels
+# below are what `replica-network-policy.yaml` selects on; apply that policy
+# with this Deployment, on a CNI that enforces NetworkPolicy. The replica's own
+# route contract and generation-body model check are defence in depth on top of
+# that isolation, not a substitute for it.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,6 +34,26 @@ spec:
         app: camelid-enterprise
         lane: deterministic
     spec:
+      # REQUIRED, not a preference — the replica does not start without it after
+      # the first rollout.
+      #
+      # Kubernetes derives legacy Docker-link variables from Service names and
+      # injects them into every pod scheduled *after* the Service exists. This
+      # repository ships two Services whose names begin with the prefix the
+      # replica's startup admission scan claims, so a pod gets sixteen
+      # CAMELID_-prefixed variables it never asked for, and the scan refuses to
+      # start under variables it cannot classify.
+      #
+      # The timing is what makes this expensive to discover: the first rollout's
+      # pods precede the Services, so it comes up clean, and every rollout after
+      # it fails. The replica's refusal message recognizes the shape and names
+      # this setting, so the same failure on a Service you add yourself is
+      # self-diagnosing — but it should never have to fire here.
+      #
+      # The gateway Deployment deliberately does not set this: the gateway runs
+      # no admission scan, and adding it there for symmetry would imply the
+      # setting is cosmetic.
+      enableServiceLinks: false
       # The server drains active generations on SIGTERM. Keep this at least as
       # long as the gateway drain window so a coordinated rollout cannot kill
       # the upstream half of an otherwise draining client stream.
@@ -41,8 +69,26 @@ spec:
           type: RuntimeDefault
       containers:
         - name: server
+          # The release tag is used here for readability. Production automation
+          # must replace it with the published image digest
+          # (`camelid-enterprise@sha256:...`) so a rollout cannot change bytes
+          # under one tag.
           image: camelid-enterprise:0.1.0
-          args: ["--model", "/models/model.gguf", "--serving-receipts", "/receipts/serving.jsonl"]
+          # --threads is passed explicitly and must stay in step with the cpu
+          # request/limit below. Left unset, the replica takes rayon's default,
+          # which on Linux is derived from the cgroup quota and the affinity
+          # mask — so editing the cpu limit, or scheduling onto a node with a
+          # different mask, would silently change the served width with no diff
+          # in this manifest and no change to config_sha256 or
+          # admission_sha256. The lane's output guarantee is scoped per width,
+          # and every replica behind one Service has to come up at the same one.
+          args:
+            - "--model"
+            - "/models/model.gguf"
+            - "--threads"
+            - "8"
+            - "--serving-receipts"
+            - "/receipts/serving.jsonl"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -61,16 +107,22 @@ spec:
             limits:
               cpu: "8"
               memory: 6Gi
-          # Listening is not readiness: the model loads after bind, so probe
-          # for a non-empty model list before admitting traffic.
+          # Listening is not readiness: the model loads after the port is bound,
+          # so admit traffic only once the replica says it can generate.
+          #
+          # /v1/health, not /v1/models: a model whose runtime could not be built
+          # is still listed by /v1/models, so a probe that greps for an id
+          # admits a pod that fails every generation request. generation_ready
+          # additionally requires a live runtime. grep, not jq: the image ships
+          # no jq, and grep does not care what order the engine emits fields in.
           startupProbe:
             exec:
-              command: ["sh", "-c", "curl -sf http://127.0.0.1:8181/v1/models | grep -q '\"id\"'"]
+              command: ["sh", "-c", "curl -sf http://127.0.0.1:8181/v1/health | grep -q '\"generation_ready\":true'"]
             periodSeconds: 5
             failureThreshold: 60
           readinessProbe:
             exec:
-              command: ["sh", "-c", "curl -sf http://127.0.0.1:8181/v1/models | grep -q '\"id\"'"]
+              command: ["sh", "-c", "curl -sf http://127.0.0.1:8181/v1/health | grep -q '\"generation_ready\":true'"]
             periodSeconds: 10
           livenessProbe:
             httpGet:

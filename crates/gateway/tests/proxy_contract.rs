@@ -915,6 +915,78 @@ async fn forwards_requests_carrying_a_valid_bearer_token() {
     assert!(captured.lock().unwrap().is_some());
 }
 
+/// The gateway forwards exactly the published contract, read from the registry
+/// rather than written out again.
+///
+/// This is the check that was missing while the gateway kept its own axum route
+/// table. Adding an eleventh route to `replica_contract::PUBLIC_ROUTES` used to
+/// fail four tests in the replica crate and none here, because no gateway target
+/// linked the registry at all — so a route the contract promised and the replica
+/// served would have been `404`ed at the component the deployment documents as
+/// the trust boundary. The drift direction was availability rather than breach,
+/// which is why it could have shipped unnoticed.
+///
+/// Both halves matter. Every declared method/path reaching the upstream is what
+/// catches a registry route the gateway cannot express — an axum pattern it does
+/// not accept, or a method the mapping drops. The recorded set being *exactly*
+/// the declared set is what catches the other direction: a route forwarded here
+/// that the contract does not name.
+#[tokio::test]
+async fn the_gateway_forwards_exactly_the_published_contract() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_server(Router::new().fallback(any({
+        let seen = Arc::clone(&seen);
+        move |request: Request| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().unwrap().push((
+                    request.method().to_string(),
+                    request.uri().path().to_string(),
+                ));
+                StatusCode::NO_CONTENT
+            }
+        }
+    })))
+    .await;
+    let app = gateway_router(UpstreamOrigin::parse(&format!("http://{}", upstream.addr)).unwrap());
+
+    let mut expected = Vec::new();
+    for route in replica_contract::PUBLIC_ROUTES {
+        for method in route.methods {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.as_str())
+                        .uri(route.probe_path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NO_CONTENT,
+                "{} {} is in the published contract and the gateway did not forward it",
+                method.as_str(),
+                route.path
+            );
+            expected.push((method.as_str().to_string(), route.probe_path.to_string()));
+        }
+    }
+
+    // Reached the replica, and nothing else did: `/healthz` is answered locally
+    // and never appears here.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    assert_eq!(*seen.lock().unwrap(), expected);
+}
+
 #[tokio::test]
 async fn quota_rejects_a_request_once_the_organization_exceeds_its_limit() {
     let store = SqliteIdentityStore::open_in_memory().unwrap();

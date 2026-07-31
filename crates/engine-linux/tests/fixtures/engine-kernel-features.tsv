@@ -1,0 +1,121 @@
+# Runtime CPU features the pinned engine detects, at revision
+# b4e3a9056567ed8145fc4fa29850d6f1f261ac2b, and what a conforming platform
+# probe must do about each one.
+#
+# This table, not any one crate's constant, is the declaration of the reported
+# feature vocabulary. Both the Linux and the Windows probe assert their lists
+# against it, which is what keeps two platform crates on the same architecture
+# from drifting apart without a shared constant to hold them together. It lives
+# under engine-linux/tests because that is where the coverage test runs; its
+# subject is the engine, not Linux.
+#
+# COLUMNS
+#   arch       the architecture whose vocabulary the row constrains
+#   feature    the name as it appears in the engine's detection call
+#   routing    what the engine does with the answer:
+#                routes_by_default                selects a different kernel,
+#                                                 with no environment key in
+#                                                 the predicate, so a replica
+#                                                 of this distribution can and
+#                                                 does take both arms
+#                routes_only_under_a_refused_key  selects a different kernel,
+#                                                 but only when an environment
+#                                                 key is set that the startup
+#                                                 admission scan refuses AND
+#                                                 that the engine's own
+#                                                 execution planner does not
+#                                                 write for itself at model
+#                                                 load. Both halves are load-
+#                                                 bearing: the planner sets and
+#                                                 removes several dozen managed
+#                                                 keys from detected host
+#                                                 features long after the scan
+#                                                 has run, so a key being
+#                                                 refused to an operator says
+#                                                 nothing on its own about
+#                                                 whether a replica reaches the
+#                                                 branch. No row is in this
+#                                                 class at the current pin; the
+#                                                 note on i8mm below is why the
+#                                                 one that was is not.
+#                reporting_only                   detected to be described, not
+#                                                 to be branched on
+#   published  what a probe must do:
+#                required  MUST appear in that architecture's vocabulary
+#                optional  MAY appear; recorded so a name that is published
+#                          without a live gate carries its reason
+#                no        MUST NOT appear
+#   site       one representative source location at the pin, engine-relative.
+#              Representative, not exhaustive: avx512bw alone is detected at six
+#              sites in the engine's inference module, and a table citing one
+#              site per feature reads as a smaller claim than it is making.
+#
+# The invariant tying the last two columns together is asserted, not assumed:
+# routing=routes_by_default and published=required are the same set. Without
+# that, a routed feature could be quietly demoted to `optional` to make the
+# coverage assertion pass, which is the one edit that would make this file
+# worse than no file.
+#
+# WHY `optional` EXISTS AT ALL. neon is published today and has no live gate:
+# the engine detects it only to describe the host. Dropping it would shrink a
+# string replicas already publish, retiring a live identity to tidy a list. It
+# stays, with the reason in the table instead of in someone's memory, and if a
+# pin bump gives it a live gate the routing column moves and the invariant above
+# promotes it to required.
+#
+# WHY i8mm IS NOT `optional`. It was, and the classification was false. The gate
+# at the site below is `env_flag_enabled("CAMELID_MAC_Q8_PREFILL_I8MM") &&
+# is_aarch64_feature_detected!("i8mm")`, and the startup admission scan does
+# refuse that key to an operator — but the engine's execution planner writes it
+# "on" itself, from the same detected feature, whenever it plans a supported
+# Apple-silicon Q8_0 row (engine src/execution_plan.rs:470-472, applied at
+# src/api/mod.rs:6847). That write happens at model load, after the scan, which
+# the lane's `apply_deterministic` documentation names as a structural limit of
+# the startup gate rather than a gap to be closed there. So a stock replica does
+# take the branch: two hosts differing only in i8mm run different prefill
+# kernels once the row threshold is met, and under the old classification no
+# probe was required to publish the name that tells them apart. Any future row
+# whose predicate names an environment key has to be classified against the
+# engine's managed-key list, not against this distribution's allow list alone.
+#
+# The routing column describes the engine, not any one platform crate's build.
+# The i8mm gate is compiled only into the macOS aarch64 build, so a Linux or
+# Windows aarch64 host does not reach it; this table is keyed by architecture,
+# so `required` asks every aarch64 probe for the name anyway. That is the
+# conservative direction. A probe that publishes a name nothing routes on where
+# it runs costs one name in a string; a probe that omits one that does route
+# costs the identity its whole purpose.
+#
+# The amx and avx_vnni rows are `no` for a different reason worth keeping
+# visible: the engine reads them from the kernel's CPU flag file rather than
+# from cpuid, and uses them only to describe the execution plan. They are in
+# this table so that adding one to a probe fails a test that explains why,
+# rather than silently widening the published identity with a name no kernel
+# branches on.
+#
+# Regenerate at every engine pin bump by sweeping the engine tree for runtime
+# feature-detection calls and classifying each site by what consumes it — the
+# routing column cannot be derived from the call site alone, because the
+# environment gate that makes a branch unreachable usually sits in the same
+# predicate and the reporting-only calls look identical to the routing ones.
+# Against a stale file the coverage test asserts about an engine nobody runs.
+#
+# arch	feature	routing	published	site
+x86_64	avx	routes_by_default	required	src/inference/kv_f16.rs:133
+x86_64	avx2	routes_by_default	required	src/inference.rs:13670
+x86_64	avx512bw	routes_by_default	required	src/inference.rs:13289
+x86_64	avx512f	routes_by_default	required	src/inference.rs:13288
+x86_64	avx512vnni	routes_by_default	required	src/inference.rs:13290
+x86_64	f16c	routes_by_default	required	src/inference/kv_f16.rs:133
+x86_64	fma	routes_by_default	required	src/inference/attn_f32_dot.rs:191
+x86_64	amx_int8	reporting_only	no	src/execution_plan.rs:1107
+x86_64	amx_tile	reporting_only	no	src/execution_plan.rs:1104
+x86_64	avx_vnni	reporting_only	no	src/execution_plan.rs:1098
+x86_64	avx512bf16	reporting_only	no	src/gait/mod.rs:325
+x86_64	avx512cd	reporting_only	no	src/gait/mod.rs:316
+x86_64	avx512dq	reporting_only	no	src/gait/mod.rs:313
+x86_64	avx512vbmi	reporting_only	no	src/gait/mod.rs:319
+x86_64	avx512vl	reporting_only	no	src/gait/mod.rs:310
+aarch64	dotprod	routes_by_default	required	src/inference/cpu_neon.rs:434
+aarch64	i8mm	routes_by_default	required	src/inference.rs:21785
+aarch64	neon	reporting_only	optional	src/gait/mod.rs:335

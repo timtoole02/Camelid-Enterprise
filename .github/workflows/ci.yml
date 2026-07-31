@@ -27,11 +27,45 @@ jobs:
       - run: cargo clippy --workspace -- -D warnings
         continue-on-error: true # informational until the port stabilizes
 
+  # The only job that builds for Windows at all. Without it the server crate's
+  # `#[cfg(windows)]` arms — the case-insensitive environment scan in the lane —
+  # were compiled by nothing, and engine-windows's probe, which compiles
+  # anywhere but only resolves through the Windows detection backend here, was
+  # never once run against that backend.
+  windows-check:
+    runs-on: windows-latest
+    # The pinned engine contains evidence paths that reach 262 characters under
+    # the runner's default C:\Users\runneradmin\.cargo checkout root. Keep the
+    # dependency cache on a short drive-root path so Cargo can fetch it before
+    # this job reaches any of our Windows code.
+    env:
+      CARGO_HOME: D:\c
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Allow the pinned engine's long evidence paths
+        run: git config --global core.longpaths true
+      - uses: Swatinem/rust-cache@v2
+      # engine-windows's tests are not gated on `target_os`, so they also run on
+      # the two runners above. Running them here is what makes them mean
+      # something: this is the only place `probe` resolves its features through
+      # the Windows detection backend rather than through HWCAP or Apple's.
+      - run: cargo test -p camelid-enterprise-engine-windows
+      # The server crate has Windows-only code and, before this job, no target
+      # that compiled it. `--all-targets` so the test files compile too.
+      # Checked and not tested deliberately: this project does not yet assert
+      # that the workspace suite passes on Windows, and `cargo test` here would
+      # be asserting it. Compilation is the claim this job is entitled to make.
+      - run: cargo check -p camelid-enterprise --all-targets
+
   # The aarch64 feature-detection branches are #[cfg]-gated out of the x86_64
   # test runners above, so they never compile there. Cross-check them so the
   # ARM paths can't rot silently. `cargo check` does not link, so a target's
-  # prebuilt std (via rustup) is sufficient — no full cross toolchain needed.
-  # (macOS aarch64 is already exercised natively by the macos-latest runner.)
+  # prebuilt std (via rustup) is sufficient for these two crates — neither has
+  # a dependency with a C build script, which is the thing rustup's std does
+  # not substitute for. (macOS aarch64 is already exercised natively by the
+  # macos-latest runner.)
   aarch64-cross-check:
     runs-on: ubuntu-latest
     steps:
@@ -40,8 +74,38 @@ jobs:
         with:
           targets: aarch64-pc-windows-msvc, aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p camelid-enterprise-engine-windows --target aarch64-pc-windows-msvc
-      - run: cargo check -p camelid-enterprise-engine-linux --target aarch64-unknown-linux-gnu
+      # `--all-targets` so the `#[cfg(test)]` modules compile for these targets
+      # too. Without it a test module can stop compiling on the one leg no
+      # runner executes, and nothing anywhere says so.
+      - run: cargo check -p camelid-enterprise-engine-windows --all-targets --target aarch64-pc-windows-msvc
+      - run: cargo check -p camelid-enterprise-engine-linux --all-targets --target aarch64-unknown-linux-gnu
+
+      # The server crate cannot be cross-checked for aarch64-pc-windows-msvc
+      # from here: a transitive C dependency's build script needs an MSVC
+      # toolchain that rustup's prebuilt std does not supply, so the build fails
+      # before it reaches any Rust of ours. What is checkable without a
+      # toolchain is the resolved dependency graph — and one edge in it makes
+      # that target unbuildable on any host.
+      #
+      # sha2's `asm` feature pulls in sha2-asm, whose build script assembles
+      # GNU-syntax `.S` sources with `-march=`; there is no MASM/armasm64 path
+      # in that crate, and cc-rs routes *-pc-windows-msvc to cl.exe/lib.exe. On
+      # aarch64 sha2 never calls into it — it routes to intrinsics plus the soft
+      # backend — so the edge buys nothing there and costs the target entirely.
+      - name: sha2's assembly helper stays out of the Windows dependency graph
+        run: |
+          set -euo pipefail
+          graph=$(cargo tree -p camelid-enterprise --target aarch64-pc-windows-msvc -i sha2-asm 2>/dev/null)
+          if printf '%s\n' "$graph" | grep -q '^sha2-asm'; then
+            echo "sha2-asm resolved into the aarch64-pc-windows-msvc graph of crates/server:"
+            printf '%s\n' "$graph"
+            echo
+            echo "That target cannot be built while it is there, on any host. Narrow the"
+            echo "target cfg that turns on sha2's 'asm' feature in crates/server/Cargo.toml"
+            echo "so it excludes the MSVC environment; the feature is a no-op on aarch64"
+            echo "beyond adding this build-script dependency."
+            exit 1
+          fi
 
   # `broken_intra_doc_links` is a rustdoc lint, so neither `cargo test` nor
   # `cargo clippy` evaluates it: a rename that orphans a doc link still

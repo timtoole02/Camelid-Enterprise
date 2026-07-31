@@ -494,7 +494,7 @@ fn tensor_nbytes(name: &str, dimensions: &[u64], tensor_type: TensorType) -> Res
         ))
     })?;
     let first_dim = *dimensions.first().unwrap_or(&1);
-    if first_dim % block_size != 0 {
+    if !first_dim.is_multiple_of(block_size) {
         return Err(EngineError::InvalidGguf(format!(
             "tensor {name} first dimension {first_dim} is not divisible by block size {block_size}"
         )));

@@ -299,14 +299,22 @@ fn all_routes() -> impl Iterator<Item = &'static RouteSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attribution::{Attribution, ModelIdentity, WorkerThreads};
     use axum::body::{to_bytes, Body};
     use axum::http::header::ALLOW;
     use axum::http::{Method, Request, StatusCode};
     use axum::Router;
+    use std::path::Path;
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     const TEST_SHA: &str = "30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7";
+    /// Distinct from every other digest here, so no assertion can pass by
+    /// reading a neighbouring field.
+    const TEST_ADMISSION_SHA: &str =
+        "45121fb83fef631f8464c32dada6100b23f0a0af80347031f812803ee9ec2a09";
     const TEST_HOST: &str = "linux/x86_64 cores=8 simd=avx2+fma";
+    const TEST_THREADS: usize = 6;
 
     fn trace(path: &str) -> Request<Body> {
         Request::builder()
@@ -325,13 +333,25 @@ mod tests {
         methods
     }
 
+    /// The identity these tests publish. The model digest is a real digest of a
+    /// real file — this crate's own manifest — because [`ModelIdentity`] has no
+    /// constructor that invents one, which is the point: a replica cannot
+    /// publish a model digest it did not compute from bytes it read.
+    fn test_identity() -> Attribution {
+        Attribution {
+            lane: "deterministic",
+            config_sha256: Arc::new(TEST_SHA.to_string()),
+            admission_sha256: Arc::new(TEST_ADMISSION_SHA.to_string()),
+            model: ModelIdentity::of_file(Path::new("Cargo.toml"))
+                .expect("this crate's own manifest is readable"),
+            host: Arc::new(TEST_HOST.to_string()),
+            workers: WorkerThreads::resolved(TEST_THREADS),
+            receipts: None,
+        }
+    }
+
     fn attributed_no_model_router() -> Router {
-        crate::attributed_router(
-            camelid::api::AppState::default(),
-            TEST_SHA.to_string(),
-            TEST_HOST.to_string(),
-            None,
-        )
+        crate::attributed_router(camelid::api::AppState::default(), test_identity())
     }
 
     async fn json(response: axum::response::Response) -> serde_json::Value {
@@ -339,13 +359,37 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    /// Every identity field, on every response these tests drive.
+    ///
+    /// All six and not the first three, and the omission this repairs was not
+    /// cosmetic. `attributed_router` is the composition this file and the
+    /// model-backed conformance harness both run, and it is the only place the
+    /// admission digest, the model digest and the worker width are published
+    /// without a served-surface filter in front of them. While those three went
+    /// unasserted here, a replica could publish a fabricated admission digest, a
+    /// digest of a file that is not its weights, and a hardcoded thread count,
+    /// and the whole suite stayed green — which is precisely the guarantee this
+    /// crate exists to make checkable.
     fn assert_attribution(response: &axum::response::Response) {
+        let identity = test_identity();
         assert_eq!(response.headers()["x-camelid-lane"], "deterministic");
         assert_eq!(
             response.headers()["x-camelid-config-sha256"],
             &TEST_SHA[..12]
         );
+        assert_eq!(
+            response.headers()["x-camelid-admission-sha256"],
+            &TEST_ADMISSION_SHA[..12]
+        );
+        assert_eq!(
+            response.headers()["x-camelid-model-sha256"],
+            identity.model.short()
+        );
         assert_eq!(response.headers()["x-camelid-host"], TEST_HOST);
+        assert_eq!(
+            response.headers()["x-camelid-worker-threads"],
+            TEST_THREADS.to_string()
+        );
     }
 
     #[test]
