@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::forward::Decoder;
+use crate::forward::{DecodeControl, DecodeStopReason, Decoder};
 use crate::gguf::read_metadata;
 use crate::model::{
     expand_fused_dense_tensors, LlamaModelConfig, LlamaTensorBinding, LlamaWeights,
@@ -35,6 +35,32 @@ pub struct Completion {
     /// Generated ids decoded with special/control tokens removed.
     pub text: String,
     pub finish_reason: FinishReason,
+}
+
+/// One token and the newly decodable text it contributes to an incremental
+/// generation. `text` can be empty for control tokens or an incomplete UTF-8
+/// byte sequence; concatenating every delta from a completed generation equals
+/// [`Completion::text`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenDelta {
+    pub token_id: TokenId,
+    pub text: String,
+}
+
+/// Instruction returned by an incremental generation consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationControl {
+    Continue,
+    Cancel,
+}
+
+/// Terminal state of an incremental generation call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncrementalGeneration {
+    Completed(Completion),
+    /// The consumer cancelled after receiving a token. No further forward pass
+    /// ran after that callback returned [`GenerationControl::Cancel`].
+    Cancelled,
 }
 
 /// One loaded dense-decoder model using the in-tree engine.
@@ -171,6 +197,60 @@ impl LoadedModel {
     /// This check happens before allocating a KV cache or beginning inference,
     /// so an oversized request fails closed without partial work.
     pub fn generate(&self, prompt_tokens: &[TokenId], max_new_tokens: usize) -> Result<Completion> {
+        self.validate_generation_request(prompt_tokens, max_new_tokens)?;
+
+        let mut decoder = Decoder::with_q8_dot(&self.config, &self.weights, self.q8_dot)?;
+        let generated_tokens = decoder.generate_until(prompt_tokens, max_new_tokens, |token| {
+            self.tokenizer.special.eog.contains(&token)
+        })?;
+        self.completed_generation(prompt_tokens, generated_tokens)
+    }
+
+    /// Generate from already-tokenized input and report each token before the
+    /// next forward pass begins.
+    ///
+    /// Returning [`GenerationControl::Cancel`] stops synchronously at that
+    /// token boundary. This is the cancellation seam used by serving code: no
+    /// decode task is detached and request admission can be released as soon as
+    /// this call returns.
+    pub fn generate_incremental<F>(
+        &self,
+        prompt_tokens: &[TokenId],
+        max_new_tokens: usize,
+        mut on_token: F,
+    ) -> Result<IncrementalGeneration>
+    where
+        F: FnMut(TokenDelta) -> GenerationControl,
+    {
+        self.validate_generation_request(prompt_tokens, max_new_tokens)?;
+
+        let mut text_decoder = self.tokenizer.incremental_decoder(true);
+        let mut decoder = Decoder::with_q8_dot(&self.config, &self.weights, self.q8_dot)?;
+        let output = decoder.generate_until_with_callback(
+            prompt_tokens,
+            max_new_tokens,
+            |token| self.tokenizer.special.eog.contains(&token),
+            |token_id| {
+                let text = text_decoder.push(token_id)?;
+                Ok(match on_token(TokenDelta { token_id, text }) {
+                    GenerationControl::Continue => DecodeControl::Continue,
+                    GenerationControl::Cancel => DecodeControl::Stop,
+                })
+            },
+        )?;
+        if output.stop_reason == DecodeStopReason::Consumer {
+            return Ok(IncrementalGeneration::Cancelled);
+        }
+        Ok(IncrementalGeneration::Completed(
+            self.completed_generation(prompt_tokens, output.token_ids)?,
+        ))
+    }
+
+    fn validate_generation_request(
+        &self,
+        prompt_tokens: &[TokenId],
+        max_new_tokens: usize,
+    ) -> Result<()> {
         if prompt_tokens.is_empty() {
             return Err(EngineError::ShapeMismatch(
                 "generation requires a non-empty prompt".to_string(),
@@ -192,10 +272,14 @@ impl LoadedModel {
             )));
         }
 
-        let mut decoder = Decoder::with_q8_dot(&self.config, &self.weights, self.q8_dot)?;
-        let generated_tokens = decoder.generate_until(prompt_tokens, max_new_tokens, |token| {
-            self.tokenizer.special.eog.contains(&token)
-        })?;
+        Ok(())
+    }
+
+    fn completed_generation(
+        &self,
+        prompt_tokens: &[TokenId],
+        generated_tokens: Vec<TokenId>,
+    ) -> Result<Completion> {
         let finish_reason = if generated_tokens
             .last()
             .is_some_and(|token| self.tokenizer.special.eog.contains(token))
@@ -219,6 +303,20 @@ impl LoadedModel {
         self.generate(&prompt_tokens, max_new_tokens)
     }
 
+    /// Tokenize and incrementally complete a raw-text prompt.
+    pub fn complete_incremental<F>(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        on_token: F,
+    ) -> Result<IncrementalGeneration>
+    where
+        F: FnMut(TokenDelta) -> GenerationControl,
+    {
+        let prompt_tokens = self.encode_completion(prompt)?;
+        self.generate_incremental(&prompt_tokens, max_new_tokens, on_token)
+    }
+
     /// Complete an already-rendered prompt using explicit tokenizer framing.
     pub fn complete_prompt(
         &self,
@@ -229,6 +327,23 @@ impl LoadedModel {
     ) -> Result<Completion> {
         let prompt_tokens = self.encode_prompt(prompt, add_special, parse_special)?;
         self.generate(&prompt_tokens, max_new_tokens)
+    }
+
+    /// Incrementally complete an already-rendered prompt using explicit
+    /// tokenizer framing.
+    pub fn complete_prompt_incremental<F>(
+        &self,
+        prompt: &str,
+        add_special: bool,
+        parse_special: bool,
+        max_new_tokens: usize,
+        on_token: F,
+    ) -> Result<IncrementalGeneration>
+    where
+        F: FnMut(TokenDelta) -> GenerationControl,
+    {
+        let prompt_tokens = self.encode_prompt(prompt, add_special, parse_special)?;
+        self.generate_incremental(&prompt_tokens, max_new_tokens, on_token)
     }
 }
 
@@ -349,6 +464,57 @@ mod tests {
         assert_eq!(completion.generated_tokens, vec![0]);
         assert_eq!(completion.text, "");
         assert_eq!(completion.finish_reason, FinishReason::EndOfGeneration);
+    }
+
+    #[test]
+    fn incremental_completion_matches_the_blocking_result() {
+        let model = synthetic_model();
+        let expected = model.complete("a", 4).unwrap();
+        let mut deltas = Vec::new();
+
+        let outcome = model
+            .complete_incremental("a", 4, |delta| {
+                deltas.push(delta);
+                GenerationControl::Continue
+            })
+            .unwrap();
+
+        assert_eq!(outcome, IncrementalGeneration::Completed(expected.clone()));
+        assert_eq!(
+            deltas,
+            vec![TokenDelta {
+                token_id: 0,
+                text: String::new(),
+            }]
+        );
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|delta| delta.text.as_str())
+                .collect::<String>(),
+            expected.text
+        );
+    }
+
+    #[test]
+    fn incremental_cancellation_stops_before_another_forward_pass() {
+        let mut model = synthetic_model();
+        model.tokenizer.special.eog.clear();
+        let mut seen = Vec::new();
+
+        let outcome = model
+            .complete_incremental("a", 4, |delta| {
+                seen.push(delta.token_id);
+                if seen.len() == 2 {
+                    GenerationControl::Cancel
+                } else {
+                    GenerationControl::Continue
+                }
+            })
+            .unwrap();
+
+        assert_eq!(outcome, IncrementalGeneration::Cancelled);
+        assert_eq!(seen, vec![0, 0]);
     }
 
     #[test]

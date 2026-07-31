@@ -76,6 +76,31 @@ fn linear_row(weight: &CpuTensor, input: &[f32], q8_dot: Q8DotRows) -> Result<Ve
     }
 }
 
+/// Instruction returned by an incremental decode consumer after each token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeControl {
+    Continue,
+    Stop,
+}
+
+/// Why an incremental greedy decode stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeStopReason {
+    /// The caller-provided token predicate accepted the last emitted token.
+    TokenPredicate,
+    /// The requested token budget was exhausted.
+    Length,
+    /// The incremental consumer requested an early stop.
+    Consumer,
+}
+
+/// Tokens and terminal state from an incremental greedy decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeOutput {
+    pub token_ids: Vec<u32>,
+    pub stop_reason: DecodeStopReason,
+}
+
 /// The dense decoder, holding the materialized weights, the config, and the KV
 /// cache. Tokens are fed through [`Self::forward_token`]; the cache advances one
 /// position per token.
@@ -191,10 +216,35 @@ impl<'w> Decoder<'w> {
         &mut self,
         prompt: &[u32],
         max_new: usize,
-        mut should_stop: F,
+        should_stop: F,
     ) -> Result<Vec<u32>>
     where
         F: FnMut(u32) -> bool,
+    {
+        Ok(self
+            .generate_until_with_callback(prompt, max_new, should_stop, |_| {
+                Ok(DecodeControl::Continue)
+            })?
+            .token_ids)
+    }
+
+    /// Greedily decode while reporting every emitted token to `on_token`.
+    ///
+    /// The callback runs after a token is chosen and before the next forward
+    /// pass. Returning [`DecodeControl::Stop`] therefore bounds cancellation
+    /// latency to one completed token without abandoning compute in another
+    /// thread. Token-predicate stops take precedence when the same token also
+    /// makes the consumer stop, so an emitted EOG remains a completed decode.
+    pub fn generate_until_with_callback<F, C>(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        mut should_stop: F,
+        mut on_token: C,
+    ) -> Result<DecodeOutput>
+    where
+        F: FnMut(u32) -> bool,
+        C: FnMut(u32) -> Result<DecodeControl>,
     {
         if prompt.is_empty() {
             return Err(EngineError::ShapeMismatch(
@@ -202,7 +252,10 @@ impl<'w> Decoder<'w> {
             ));
         }
         if max_new == 0 {
-            return Ok(Vec::new());
+            return Ok(DecodeOutput {
+                token_ids: Vec::new(),
+                stop_reason: DecodeStopReason::Length,
+            });
         }
         for &token in &prompt[..prompt.len() - 1] {
             self.forward_token(token, false)?;
@@ -214,8 +267,25 @@ impl<'w> Decoder<'w> {
         loop {
             let next = argmax(&logits)?;
             generated.push(next);
-            if should_stop(next) || generated.len() == max_new {
-                return Ok(generated);
+            let predicate_stopped = should_stop(next);
+            let consumer_control = on_token(next)?;
+            if predicate_stopped {
+                return Ok(DecodeOutput {
+                    token_ids: generated,
+                    stop_reason: DecodeStopReason::TokenPredicate,
+                });
+            }
+            if consumer_control == DecodeControl::Stop {
+                return Ok(DecodeOutput {
+                    token_ids: generated,
+                    stop_reason: DecodeStopReason::Consumer,
+                });
+            }
+            if generated.len() == max_new {
+                return Ok(DecodeOutput {
+                    token_ids: generated,
+                    stop_reason: DecodeStopReason::Length,
+                });
             }
             logits = self
                 .forward_token(next, true)?
