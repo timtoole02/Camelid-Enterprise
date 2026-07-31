@@ -105,7 +105,17 @@ mod tests {
         while jobs.join_next().await.is_some() {}
 
         assert_eq!(maximum.load(Ordering::SeqCst), 1);
-        assert_eq!(worker.depth(), 0);
+        // `run` resolves from inside the job closure, one statement before the
+        // worker loop decrements the depth, so a caller can observe its own
+        // completion while the slot it occupied is still counted. Asserting
+        // zero the instant the last await resolves is a race the worker thread
+        // usually wins and a loaded runner does not. Waiting for the depth to
+        // recover is the claim this test is entitled to make.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while worker.depth() != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     #[tokio::test]
