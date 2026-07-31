@@ -67,6 +67,15 @@ jobs:
           real_model_conforms_to_in_tree_nonstreaming_slice
           -- --ignored --exact --nocapture --test-threads=1
 
+      - name: Run pinned-to-in-tree generation parity gate
+        env:
+          CAMELID_ENTERPRISE_TEST_MODEL: ${{ runner.temp }}/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+        run: >-
+          cargo test --locked -p camelid-enterprise
+          --test replica_contract_model
+          in_tree_generation_matches_pinned_engine
+          -- --ignored --exact --nocapture --test-threads=1
+
       - name: Run model-backed replica contract
         env:
           CAMELID_ENTERPRISE_TEST_MODEL: ${{ runner.temp }}/Llama-3.2-1B-Instruct-Q4_K_M.gguf

@@ -18,7 +18,8 @@ use axum::body::{to_bytes, Body};
 use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
 use camelid_enterprise::in_tree::{router as in_tree_router, LoadedModelBackend};
 use camelid_enterprise::{
-    apply_deterministic, replica_router, Attribution, ModelIdentity, WorkerThreads,
+    apply_deterministic, load_startup_model, replica_router, Attribution, ModelIdentity,
+    WorkerThreads,
 };
 use engine_core::runtime::LoadedModel;
 use http_body_util::BodyExt;
@@ -121,6 +122,140 @@ async fn send(app: axum::Router, request: Request<Body>) -> axum::response::Resp
         .await
         .expect("replica contract HTTP step exceeded 900 seconds")
         .unwrap()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GenerationSnapshot {
+    prompt_token_ids: Vec<u32>,
+    generated_token_ids: Vec<u32>,
+    text: String,
+    finish_reason: String,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+}
+
+impl GenerationSnapshot {
+    fn from_response(body: &Value, chat: bool) -> Self {
+        let token_ids = |field: &str| {
+            body["camelid"][field]
+                .as_array()
+                .unwrap_or_else(|| panic!("camelid.{field} must be an array: {body}"))
+                .iter()
+                .map(|token| {
+                    token
+                        .as_u64()
+                        .and_then(|token| u32::try_from(token).ok())
+                        .unwrap_or_else(|| panic!("camelid.{field} contains a non-u32: {body}"))
+                })
+                .collect()
+        };
+        let text = if chat {
+            &body["choices"][0]["message"]["content"]
+        } else {
+            &body["choices"][0]["text"]
+        };
+        Self {
+            prompt_token_ids: token_ids("prompt_token_ids"),
+            generated_token_ids: token_ids("generated_token_ids"),
+            text: text
+                .as_str()
+                .unwrap_or_else(|| panic!("completion text must be a string: {body}"))
+                .to_string(),
+            finish_reason: body["choices"][0]["finish_reason"]
+                .as_str()
+                .unwrap_or_else(|| panic!("finish_reason must be a string: {body}"))
+                .to_string(),
+            prompt_tokens: body["usage"]["prompt_tokens"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("prompt_tokens must be a u64: {body}")),
+            completion_tokens: body["usage"]["completion_tokens"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("completion_tokens must be a u64: {body}")),
+            total_tokens: body["usage"]["total_tokens"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("total_tokens must be a u64: {body}")),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ParityCase {
+    name: &'static str,
+    path: &'static str,
+    request: Value,
+    chat: bool,
+}
+
+fn generation_parity_cases(model_id: &str) -> Vec<ParityCase> {
+    vec![
+        ParityCase {
+            name: "raw-short",
+            path: "/v1/completions",
+            request: json!({
+                "model": model_id,
+                "prompt": "Complete this sentence: The capital of France is",
+                "temperature": 0,
+                "max_tokens": 4,
+                "stream": false
+            }),
+            chat: false,
+        },
+        ParityCase {
+            name: "raw-unicode",
+            path: "/v1/completions",
+            request: json!({
+                "model": model_id,
+                "prompt": "Unicode fidelity: café, 東京, 🦙 —",
+                "temperature": 0,
+                "max_tokens": 2,
+                "stream": false
+            }),
+            chat: false,
+        },
+        ParityCase {
+            name: "chat-single-turn",
+            path: "/v1/chat/completions",
+            request: json!({
+                "model": model_id,
+                "messages": [{"role":"user","content":"Reply with one word: blue."}],
+                "temperature": 0,
+                "max_tokens": 4,
+                "stream": false
+            }),
+            chat: true,
+        },
+        ParityCase {
+            name: "chat-multi-turn-unicode",
+            path: "/v1/chat/completions",
+            request: json!({
+                "model": model_id,
+                "messages": [
+                    {"role":"system","content":"Answer tersely."},
+                    {"role":"user","content":"Say café."},
+                    {"role":"assistant","content":"café"},
+                    {"role":"user","content":"Now say 東京."}
+                ],
+                "temperature": 0,
+                "max_tokens": 2,
+                "stream": false
+            }),
+            chat: true,
+        },
+    ]
+}
+
+async fn capture_generation(app: axum::Router, case: &ParityCase) -> GenerationSnapshot {
+    let response = send(app, post_json(case.path, case.request.clone())).await;
+    let status = response.status();
+    let body = body_json(response).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{} generation must succeed: {body}",
+        case.name,
+    );
+    GenerationSnapshot::from_response(&body, case.chat)
 }
 
 #[tokio::test]
@@ -454,6 +589,56 @@ async fn real_model_conforms_to_replica_http_v1() {
             "engine queue depth did not recover after cancelling accepted streams"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Compare the owned runtime to the exact pinned engine revision at the token
+/// boundary. The two engines are loaded sequentially: the pinned router is
+/// explicitly unloaded and dropped before `engine-core` reads the same GGUF,
+/// keeping this gate viable on ordinary hosted CI memory limits.
+#[tokio::test]
+#[ignore = "requires CAMELID_ENTERPRISE_TEST_MODEL to name a compatible local GGUF"]
+async fn in_tree_generation_matches_pinned_engine() {
+    let model = test_model_path();
+
+    let pinned = camelid::api::router_with_state(
+        camelid::api::AppState::with_configured_threads(Some(4))
+            .with_default_enable_thinking(false)
+            .with_models_dir(None),
+    );
+    let model_id = load_startup_model(pinned.clone(), &model)
+        .await
+        .expect("the pinned engine must load the parity model");
+    let cases = generation_parity_cases(&model_id);
+    let mut expected = Vec::with_capacity(cases.len());
+    for case in &cases {
+        expected.push(capture_generation(pinned.clone(), case).await);
+    }
+
+    let unload = send(
+        pinned.clone(),
+        post_json("/api/models/unload", json!({"id": model_id})),
+    )
+    .await;
+    assert_eq!(
+        unload.status(),
+        StatusCode::NO_CONTENT,
+        "the pinned model must unload before the in-tree runtime is loaded"
+    );
+    drop(pinned);
+
+    let loaded = LoadedModel::load(&model).expect("the in-tree runtime must load the parity model");
+    let backend = LoadedModelBackend::new(model_id, loaded)
+        .expect("the pinned engine's model id is a valid in-tree discovery id");
+    let in_tree = in_tree_router(Arc::new(backend));
+
+    for (case, expected) in cases.iter().zip(expected) {
+        let actual = capture_generation(in_tree.clone(), case).await;
+        assert_eq!(
+            actual, expected,
+            "{} diverged from pinned engine token generation",
+            case.name
+        );
     }
 }
 

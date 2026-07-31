@@ -575,7 +575,7 @@ async fn chat_completions(
             Some("messages"),
         );
     };
-    let rendered = match render_chat_template(&messages, &template) {
+    let rendered = match render_chat_prompt(&messages, &template, &descriptor.id) {
         Ok(rendered) => rendered,
         Err(error) => {
             return api_error(
@@ -586,7 +586,6 @@ async fn chat_completions(
             )
         }
     };
-    let add_special = template.bos_token.is_empty() || !rendered.starts_with(&template.bos_token);
     let max_new_tokens = request
         .max_tokens
         .map_or(DEFAULT_MAX_TOKENS, |value| value as usize);
@@ -594,9 +593,9 @@ async fn chat_completions(
     let completion = match run_generation(
         &state,
         GenerationInput::RenderedChat {
-            prompt: rendered,
-            add_special,
-            parse_special: true,
+            prompt: rendered.text,
+            add_special: rendered.add_special,
+            parse_special: rendered.parse_special,
         },
         max_new_tokens,
     )
@@ -644,7 +643,81 @@ struct ChatTemplateMessage<'a> {
     content: &'a str,
 }
 
-fn render_chat_template(
+struct RenderedChatPrompt {
+    text: String,
+    add_special: bool,
+    parse_special: bool,
+}
+
+fn render_chat_prompt(
+    messages: &[ChatMessage],
+    template: &ChatTemplate,
+    model_id: &str,
+) -> Result<RenderedChatPrompt, minijinja::Error> {
+    // The pinned engine deliberately uses its compact Llama 3 renderer for
+    // non-Q8_0 rows. The full metadata template otherwise injects a dated
+    // default system preamble, changing both prompt tokens and generation.
+    // Keep that compatibility behavior until the production pin is retired;
+    // the embedded template remains the authority that identifies the format.
+    if is_llama3_instruct_template(&template.source)
+        && !is_llama32_metadata_jinja_exact_row_model_id(model_id)
+    {
+        return Ok(RenderedChatPrompt {
+            text: render_llama3_instruct_prompt(messages),
+            add_special: true,
+            parse_special: true,
+        });
+    }
+
+    let rendered = render_metadata_chat_template(messages, template)?;
+    let add_special = template.bos_token.is_empty() || !rendered.starts_with(&template.bos_token);
+    Ok(RenderedChatPrompt {
+        text: rendered,
+        add_special,
+        parse_special: true,
+    })
+}
+
+fn is_llama3_instruct_template(template: &str) -> bool {
+    template.contains("<|start_header_id|>")
+        && template.contains("<|end_header_id|>")
+        && template.contains("<|eot_id|>")
+}
+
+fn is_llama32_metadata_jinja_exact_row_model_id(model_id: &str) -> bool {
+    let normalized = model_id
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|character| match character {
+            '-' | '.' | ' ' => '_',
+            character => character,
+        })
+        .collect::<String>();
+    normalized.contains("llama32_1b_instruct_q8_0")
+        || normalized.contains("llama_3_2_1b_instruct_q8_0")
+        || normalized.contains("llama32_3b_instruct_q8_0")
+        || normalized.contains("llama_3_2_3b_instruct_q8_0")
+}
+
+fn render_llama3_instruct_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        prompt.push_str("<|start_header_id|>");
+        prompt.push_str(message.role.trim());
+        prompt.push_str("<|end_header_id|>\n\n");
+        prompt.push_str(&message.content);
+        prompt.push_str("<|eot_id|>");
+    }
+    if messages
+        .last()
+        .is_none_or(|message| message.role.trim() != "assistant")
+    {
+        prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    }
+    prompt
+}
+
+fn render_metadata_chat_template(
     messages: &[ChatMessage],
     template: &ChatTemplate,
 ) -> Result<String, minijinja::Error> {
@@ -1176,6 +1249,54 @@ mod tests {
                 true,
             ))
         );
+    }
+
+    #[test]
+    fn llama3_chat_uses_the_pinned_compact_prompt_shape() {
+        let template = ChatTemplate {
+            source: concat!(
+                "{{ bos_token }}",
+                "<|start_header_id|>system<|end_header_id|>",
+                "default system preamble<|eot_id|>"
+            )
+            .to_string(),
+            bos_token: "<|begin_of_text|>".to_string(),
+            eos_token: "<|end_of_text|>".to_string(),
+            eot_token: "<|eot_id|>".to_string(),
+            eom_token: "<|eom_id|>".to_string(),
+            unk_token: String::new(),
+        };
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Reply with one word: blue.".to_string(),
+        }];
+
+        let rendered = render_chat_prompt(&messages, &template, "Llama-3.2-1B-Q4_K_M").unwrap();
+
+        assert_eq!(
+            rendered.text,
+            concat!(
+                "<|start_header_id|>user<|end_header_id|>\n\n",
+                "Reply with one word: blue.<|eot_id|>",
+                "<|start_header_id|>assistant<|end_header_id|>\n\n"
+            )
+        );
+        assert!(rendered.add_special);
+        assert!(rendered.parse_special);
+        assert!(!rendered.text.contains("default system preamble"));
+
+        let exact_q8 =
+            render_chat_prompt(&messages, &template, "Llama-3.2-1B-Instruct-Q8_0").unwrap();
+        assert_eq!(
+            exact_q8.text,
+            concat!(
+                "<|begin_of_text|>",
+                "<|start_header_id|>system<|end_header_id|>",
+                "default system preamble<|eot_id|>"
+            )
+        );
+        assert!(!exact_q8.add_special);
+        assert!(exact_q8.parse_special);
     }
 
     #[tokio::test]
