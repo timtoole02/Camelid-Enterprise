@@ -16,9 +16,11 @@
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
+use camelid_enterprise::in_tree::{router as in_tree_router, LoadedModelBackend};
 use camelid_enterprise::{
     apply_deterministic, replica_router, Attribution, ModelIdentity, WorkerThreads,
 };
+use engine_core::runtime::LoadedModel;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -51,6 +53,15 @@ const MODEL_SHA_ENV: &str = "ENTERPRISE_TEST_MODEL_SHA256";
 const STEP_TIMEOUT: Duration = Duration::from_secs(900);
 
 const TEST_HOST: &str = "contract-test/host";
+
+fn test_model_path() -> PathBuf {
+    PathBuf::from(
+        std::env::var(MODEL_ENV)
+            .unwrap_or_else(|_| panic!("{MODEL_ENV} must name a compatible local GGUF")),
+    )
+    .canonicalize()
+    .unwrap_or_else(|error| panic!("could not resolve {MODEL_ENV}: {error}"))
+}
 
 /// Every identity field this replica publishes, as this run resolved them.
 struct Published {
@@ -115,12 +126,7 @@ async fn send(app: axum::Router, request: Request<Body>) -> axum::response::Resp
 #[tokio::test]
 #[ignore = "requires CAMELID_ENTERPRISE_TEST_MODEL to name a compatible local GGUF"]
 async fn real_model_conforms_to_replica_http_v1() {
-    let model = PathBuf::from(
-        std::env::var(MODEL_ENV)
-            .unwrap_or_else(|_| panic!("{MODEL_ENV} must name a compatible local GGUF")),
-    )
-    .canonicalize()
-    .unwrap_or_else(|error| panic!("could not resolve {MODEL_ENV}: {error}"));
+    let model = test_model_path();
     let config = apply_deterministic().expect("the test process must apply the lane contract");
 
     // Read back from the pool rather than chosen, exactly as `serve` does: a
@@ -178,7 +184,10 @@ async fn real_model_conforms_to_replica_http_v1() {
     // let a client swap them.
     let control_plane = send(
         app.clone(),
-        post_json("/api/models/load", json!({ "path": model.to_string_lossy() })),
+        post_json(
+            "/api/models/load",
+            json!({ "path": model.to_string_lossy() }),
+        ),
     )
     .await;
     assert_eq!(control_plane.status(), StatusCode::FORBIDDEN);
@@ -445,5 +454,137 @@ async fn real_model_conforms_to_replica_http_v1() {
             "engine queue depth did not recover after cancelling accepted streams"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The isolated in-tree router is intentionally not the production surface
+/// yet, so the production conformance test above cannot exercise it. This leg
+/// loads the same independently verified GGUF through `engine-core` and proves
+/// the non-streaming adapter's real model discovery, raw-tokenization, embedded
+/// chat-template rendering, special-token parsing, context admission, and
+/// fail-closed surface. A zero generation budget keeps this a contract test,
+/// not a second multi-minute inference benchmark; numerics remain covered by
+/// the engine's deterministic forward fixtures.
+#[tokio::test]
+#[ignore = "requires CAMELID_ENTERPRISE_TEST_MODEL to name a compatible local GGUF"]
+async fn real_model_conforms_to_in_tree_nonstreaming_slice() {
+    let model = test_model_path();
+    let loaded = LoadedModel::load(&model).expect("the in-tree runtime must load the pinned GGUF");
+    let context_length = loaded.config().context_length;
+    let model_id = model.file_name().unwrap().to_string_lossy().into_owned();
+    let backend = LoadedModelBackend::new(model_id.clone(), loaded)
+        .expect("the model filename is a valid discovery id");
+    let app = in_tree_router(Arc::new(backend));
+
+    let health = send(
+        app.clone(),
+        Request::get("/v1/health").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(health.status(), StatusCode::OK);
+    let health = body_json(health).await;
+    assert_eq!(health["backend"], "engine-core");
+    assert_eq!(health["generation_ready"], true);
+    assert_eq!(health["active_model_id"], model_id);
+
+    let models = send(
+        app.clone(),
+        Request::get("/v1/models").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(models.status(), StatusCode::OK);
+    let models = body_json(models).await;
+    assert_eq!(models["data"].as_array().unwrap().len(), 1);
+    assert_eq!(models["data"][0]["id"], model_id);
+    assert_eq!(models["data"][0]["meta"]["n_ctx_train"], context_length);
+
+    let raw = send(
+        app.clone(),
+        post_json(
+            "/v1/completions",
+            json!({
+                "model": model_id,
+                "prompt": "Complete briefly:",
+                "temperature": 0,
+                "max_tokens": 0,
+                "stream": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(raw.status(), StatusCode::OK);
+    let raw = body_json(raw).await;
+    assert_eq!(raw["object"], "text_completion");
+    assert_eq!(raw["choices"][0]["text"], "");
+    assert_eq!(raw["choices"][0]["finish_reason"], "length");
+    assert!(raw["camelid"]["prompt_token_ids"]
+        .as_array()
+        .is_some_and(|tokens| !tokens.is_empty()));
+    assert_eq!(raw["camelid"]["generated_token_ids"], json!([]));
+
+    let chat = send(
+        app.clone(),
+        post_json(
+            "/v1/chat/completions",
+            json!({
+                "model": model_id,
+                "messages": [{"role":"user","content":"Reply briefly."}],
+                "temperature": 0,
+                "max_tokens": 0,
+                "stream": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(chat.status(), StatusCode::OK);
+    let chat = body_json(chat).await;
+    assert_eq!(chat["object"], "chat.completion");
+    assert_eq!(chat["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(chat["choices"][0]["message"]["content"], "");
+    assert_eq!(chat["choices"][0]["finish_reason"], "length");
+    assert!(chat["camelid"]["prompt_token_ids"]
+        .as_array()
+        .is_some_and(|tokens| !tokens.is_empty()));
+    assert_eq!(chat["camelid"]["generated_token_ids"], json!([]));
+
+    let overflow = send(
+        app.clone(),
+        post_json(
+            "/v1/chat/completions",
+            json!({
+                "model": model_id,
+                "messages": [{"role":"user","content":"Reply briefly."}],
+                "max_tokens": context_length
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(overflow.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(overflow).await["error"]["code"],
+        "context_length_exceeded"
+    );
+
+    let streaming = send(
+        app.clone(),
+        post_json(
+            "/v1/chat/completions",
+            json!({
+                "model": model_id,
+                "messages": [{"role":"user","content":"Reply briefly."}],
+                "stream": true
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(streaming.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        body_json(streaming).await["error"]["code"],
+        "unsupported_streaming"
+    );
+
+    for path in ["/api/models/load", "/v1/embeddings"] {
+        let response = send(app.clone(), post_json(path, json!({}))).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
     }
 }

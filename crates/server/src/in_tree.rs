@@ -3,9 +3,9 @@
 //! This router is deliberately separate from [`crate::attributed_router`], the
 //! production router backed by the pinned Camelid dependency. It implements the
 //! first self-owned contract slice — health, exact model discovery, and
-//! deterministic non-streaming text completion — so parity can be proven
-//! before a production cutover. It must not be merged with the pinned router:
-//! axum rejects overlapping method/path registrations.
+//! deterministic non-streaming text and chat completion — so parity can be
+//! proven before a production cutover. It must not be merged with the pinned
+//! router: axum rejects overlapping method/path registrations.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,10 +20,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use engine_core::runtime::{Completion, FinishReason, LoadedModel};
 use engine_core::{EngineError, Result as EngineResult};
+use minijinja::{context, Environment, ErrorKind as MiniJinjaErrorKind, UndefinedBehavior};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 const DEFAULT_MAX_TOKENS: usize = 16;
+const CHAT_TEMPLATE_NAME: &str = "embedded_chat_template";
 
 /// Contract paths currently implemented by [`router`]. This is a strict subset
 /// of `replica_contract::PUBLIC_ROUTES`; tests keep that relationship explicit.
@@ -32,6 +34,7 @@ pub const IMPLEMENTED_ROUTE_PATHS: &[&str] = &[
     "/v1/models",
     "/v1/models/:model",
     "/v1/completions",
+    "/v1/chat/completions",
 ];
 
 /// Stable model facts needed by discovery and completion handlers.
@@ -46,6 +49,18 @@ pub struct ModelDescriptor {
     pub size_bytes: Option<u64>,
 }
 
+/// The embedded template and tokenizer token texts required to render chat in
+/// the server without coupling HTTP schemas into the engine crate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatTemplate {
+    pub source: String,
+    pub bos_token: String,
+    pub eos_token: String,
+    pub eot_token: String,
+    pub eom_token: String,
+    pub unk_token: String,
+}
+
 /// Synchronous model boundary used by the HTTP adapter.
 ///
 /// Implementations run on Tokio's blocking pool. Production admission policy
@@ -53,6 +68,14 @@ pub struct ModelDescriptor {
 pub trait CompletionBackend: Send + Sync + 'static {
     fn descriptor(&self) -> &ModelDescriptor;
     fn complete(&self, prompt: &str, max_new_tokens: usize) -> EngineResult<Completion>;
+    fn chat_template(&self) -> Option<ChatTemplate>;
+    fn complete_prompt(
+        &self,
+        prompt: &str,
+        add_special: bool,
+        parse_special: bool,
+        max_new_tokens: usize,
+    ) -> EngineResult<Completion>;
 }
 
 /// Adapter from the in-tree engine runtime to [`CompletionBackend`].
@@ -93,6 +116,44 @@ impl CompletionBackend for LoadedModelBackend {
     fn complete(&self, prompt: &str, max_new_tokens: usize) -> EngineResult<Completion> {
         self.model.complete(prompt, max_new_tokens)
     }
+
+    fn chat_template(&self) -> Option<ChatTemplate> {
+        let tokenizer = self.model.tokenizer();
+        tokenizer.chat_template.as_ref().map(|source| ChatTemplate {
+            source: source.clone(),
+            bos_token: tokenizer
+                .token_text(tokenizer.special.bos)
+                .unwrap_or("")
+                .to_string(),
+            eos_token: tokenizer
+                .token_text(tokenizer.special.eos)
+                .unwrap_or("")
+                .to_string(),
+            eot_token: tokenizer
+                .token_text(tokenizer.special.eot)
+                .unwrap_or("")
+                .to_string(),
+            eom_token: tokenizer
+                .token_text(tokenizer.special.eom)
+                .unwrap_or("")
+                .to_string(),
+            unk_token: tokenizer
+                .token_text(tokenizer.special.unk)
+                .unwrap_or("")
+                .to_string(),
+        })
+    }
+
+    fn complete_prompt(
+        &self,
+        prompt: &str,
+        add_special: bool,
+        parse_special: bool,
+        max_new_tokens: usize,
+    ) -> EngineResult<Completion> {
+        self.model
+            .complete_prompt(prompt, add_special, parse_special, max_new_tokens)
+    }
 }
 
 #[derive(Clone)]
@@ -119,6 +180,7 @@ pub fn router(backend: Arc<dyn CompletionBackend>) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/models/:model", get(model))
         .route("/v1/completions", post(completions))
+        .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
 }
 
@@ -328,39 +390,16 @@ async fn completions(
     let max_new_tokens = request
         .max_tokens
         .map_or(DEFAULT_MAX_TOKENS, |value| value as usize);
-    let permit = match Arc::clone(&state.generation_slot).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            let mut response = api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "engine_queue_full",
-                "the deterministic generation slot is busy".to_string(),
-                None,
-            );
-            response
-                .headers_mut()
-                .insert("retry-after", HeaderValue::from_static("1"));
-            return response;
-        }
-    };
-
-    let backend = Arc::clone(&state.backend);
-    let result = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        backend.complete(&prompt, max_new_tokens)
-    })
-    .await;
-    let completion = match result {
-        Ok(Ok(completion)) => completion,
-        Ok(Err(error)) => return engine_error(error),
-        Err(error) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "generation_task_failed",
-                format!("generation task failed: {error}"),
-                None,
-            )
-        }
+    let model_id = descriptor.id.clone();
+    let completion = match run_generation(
+        &state,
+        GenerationInput::RawCompletion(prompt),
+        max_new_tokens,
+    )
+    .await
+    {
+        Ok(completion) => completion,
+        Err(response) => return response,
     };
 
     let prompt_tokens = completion.prompt_tokens.len();
@@ -373,7 +412,7 @@ async fn completions(
         id: next_completion_id(),
         object: "text_completion",
         created: unix_seconds(),
-        model: descriptor.id.clone(),
+        model: model_id,
         choices: vec![CompletionChoice {
             index: 0,
             text: completion.text,
@@ -390,6 +429,313 @@ async fn completions(
         },
     })
     .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionRequest {
+    model: Option<String>,
+    messages: Option<Vec<ChatMessage>>,
+    stream: Option<bool>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    #[serde(flatten)]
+    unsupported_fields: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct ChatCompletionResponse {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<ChatCompletionChoice>,
+    usage: CompletionUsage,
+    camelid: CompletionDiagnostics,
+}
+
+#[derive(Serialize)]
+struct ChatCompletionChoice {
+    index: u32,
+    message: ChatCompletionMessage,
+    finish_reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct ChatCompletionMessage {
+    role: &'static str,
+    content: String,
+}
+
+async fn chat_completions(
+    State(state): State<ApiState>,
+    payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "malformed_json",
+                error.to_string(),
+                None,
+            )
+        }
+    };
+
+    if !request.unsupported_fields.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            format!(
+                "unsupported chat completion field(s): {}",
+                request
+                    .unsupported_fields
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Some("body"),
+        );
+    }
+
+    let descriptor = state.backend.descriptor();
+    if request
+        .model
+        .as_deref()
+        .is_some_and(|model| model != descriptor.id)
+    {
+        let requested = request.model.as_deref().unwrap_or_default();
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "model_not_found",
+            format!("model '{requested}' is not loaded"),
+            Some("model"),
+        );
+    }
+    let Some(messages) = request.messages else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "missing_required_parameter",
+            "messages is required".to_string(),
+            Some("messages"),
+        );
+    };
+    if messages.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_messages",
+            "messages must contain at least one chat message".to_string(),
+            Some("messages"),
+        );
+    }
+    if let Some((index, role)) = messages.iter().enumerate().find_map(|(index, message)| {
+        let role = message.role.trim();
+        (!matches!(role, "system" | "user" | "assistant")).then_some((index, role))
+    }) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_message_role",
+            format!("messages[{index}] has unsupported role '{role}'"),
+            Some("messages"),
+        );
+    }
+    if request.stream.unwrap_or(false) {
+        return api_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "unsupported_streaming",
+            "the in-tree chat adapter does not implement stream:true yet".to_string(),
+            Some("stream"),
+        );
+    }
+    if request
+        .temperature
+        .is_some_and(|temperature| temperature != 0.0)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_sampling",
+            "the deterministic lane accepts only temperature:0".to_string(),
+            Some("temperature"),
+        );
+    }
+
+    let Some(template) = state.backend.chat_template() else {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_chat_template",
+            "the loaded tokenizer has no embedded chat template; chat fails closed".to_string(),
+            Some("messages"),
+        );
+    };
+    let rendered = match render_chat_template(&messages, &template) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_chat_template",
+                format!("the embedded chat template could not render this request: {error}"),
+                Some("messages"),
+            )
+        }
+    };
+    let add_special = template.bos_token.is_empty() || !rendered.starts_with(&template.bos_token);
+    let max_new_tokens = request
+        .max_tokens
+        .map_or(DEFAULT_MAX_TOKENS, |value| value as usize);
+    let model_id = descriptor.id.clone();
+    let completion = match run_generation(
+        &state,
+        GenerationInput::RenderedChat {
+            prompt: rendered,
+            add_special,
+            parse_special: true,
+        },
+        max_new_tokens,
+    )
+    .await
+    {
+        Ok(completion) => completion,
+        Err(response) => return response,
+    };
+
+    let prompt_tokens = completion.prompt_tokens.len();
+    let completion_tokens = completion.generated_tokens.len();
+    let finish_reason = match completion.finish_reason {
+        FinishReason::EndOfGeneration => "stop",
+        FinishReason::Length => "length",
+    };
+    Json(ChatCompletionResponse {
+        id: next_chat_completion_id(),
+        object: "chat.completion",
+        created: unix_seconds(),
+        model: model_id,
+        choices: vec![ChatCompletionChoice {
+            index: 0,
+            message: ChatCompletionMessage {
+                role: "assistant",
+                content: completion.text,
+            },
+            finish_reason,
+        }],
+        usage: CompletionUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        },
+        camelid: CompletionDiagnostics {
+            prompt_token_ids: completion.prompt_tokens,
+            generated_token_ids: completion.generated_tokens,
+        },
+    })
+    .into_response()
+}
+
+#[derive(Serialize)]
+struct ChatTemplateMessage<'a> {
+    role: &'a str,
+    content: &'a str,
+}
+
+fn render_chat_template(
+    messages: &[ChatMessage],
+    template: &ChatTemplate,
+) -> Result<String, minijinja::Error> {
+    let template_messages = messages
+        .iter()
+        .map(|message| ChatTemplateMessage {
+            role: message.role.trim(),
+            content: message.content.as_str(),
+        })
+        .collect::<Vec<_>>();
+    let mut environment = Environment::new();
+    environment.set_undefined_behavior(UndefinedBehavior::Strict);
+    environment.add_function(
+        "raise_exception",
+        |message: String| -> Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                message,
+            ))
+        },
+    );
+    environment.add_template(CHAT_TEMPLATE_NAME, &template.source)?;
+    environment
+        .get_template(CHAT_TEMPLATE_NAME)?
+        .render(context! {
+            messages => template_messages,
+            bos_token => template.bos_token.as_str(),
+            eos_token => template.eos_token.as_str(),
+            eot_token => template.eot_token.as_str(),
+            eom_token => template.eom_token.as_str(),
+            unk_token => template.unk_token.as_str(),
+            add_generation_prompt => true,
+            tools => Option::<Vec<serde_json::Value>>::None,
+            custom_tools => Option::<Vec<serde_json::Value>>::None,
+        })
+}
+
+enum GenerationInput {
+    RawCompletion(String),
+    RenderedChat {
+        prompt: String,
+        add_special: bool,
+        parse_special: bool,
+    },
+}
+
+async fn run_generation(
+    state: &ApiState,
+    input: GenerationInput,
+    max_new_tokens: usize,
+) -> Result<Completion, Response> {
+    let permit = match Arc::clone(&state.generation_slot).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let mut response = api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "engine_queue_full",
+                "the deterministic generation slot is busy".to_string(),
+                None,
+            );
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("1"));
+            return Err(response);
+        }
+    };
+
+    let backend = Arc::clone(&state.backend);
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        match input {
+            GenerationInput::RawCompletion(prompt) => backend.complete(&prompt, max_new_tokens),
+            GenerationInput::RenderedChat {
+                prompt,
+                add_special,
+                parse_special,
+            } => backend.complete_prompt(&prompt, add_special, parse_special, max_new_tokens),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(completion)) => Ok(completion),
+        Ok(Err(error)) => Err(engine_error(error)),
+        Err(error) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "generation_task_failed",
+            format!("generation task failed: {error}"),
+            None,
+        )),
+    }
 }
 
 fn engine_error(error: EngineError) -> Response {
@@ -461,6 +807,14 @@ fn next_completion_id() -> String {
     format!("cmpl-in-tree-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+fn next_chat_completion_id() -> String {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "chatcmpl-in-tree-{}",
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,7 +822,7 @@ mod tests {
     use axum::http::header::CONTENT_TYPE;
     use axum::http::Request;
     use serde_json::{json, Value};
-    use std::sync::Barrier;
+    use std::sync::{Barrier, Mutex};
     use tower::ServiceExt;
 
     struct FakeBackend {
@@ -506,12 +860,69 @@ mod tests {
                 },
             })
         }
+
+        fn chat_template(&self) -> Option<ChatTemplate> {
+            Some(ChatTemplate {
+                source: concat!(
+                    "{% for message in messages %}",
+                    "{% if loop.first %}{{ bos_token }}{% endif %}",
+                    "<|{{ message.role }}|>{{ message.content }}{{ eos_token }}",
+                    "{% endfor %}",
+                    "{% if add_generation_prompt %}<|assistant|>{% endif %}"
+                )
+                .to_string(),
+                bos_token: "<s>".to_string(),
+                eos_token: "</s>".to_string(),
+                eot_token: String::new(),
+                eom_token: String::new(),
+                unk_token: "<unk>".to_string(),
+            })
+        }
+
+        fn complete_prompt(
+            &self,
+            prompt: &str,
+            _add_special: bool,
+            _parse_special: bool,
+            max_new_tokens: usize,
+        ) -> EngineResult<Completion> {
+            self.complete(prompt, max_new_tokens)
+        }
     }
 
     struct BlockingBackend {
         descriptor: ModelDescriptor,
         started: Arc<Barrier>,
         release: Arc<Barrier>,
+    }
+
+    struct TemplateBackend {
+        descriptor: ModelDescriptor,
+        template: Option<ChatTemplate>,
+    }
+
+    impl CompletionBackend for TemplateBackend {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn complete(&self, _prompt: &str, _max_new_tokens: usize) -> EngineResult<Completion> {
+            unreachable!("template refusal tests must stop before generation")
+        }
+
+        fn chat_template(&self) -> Option<ChatTemplate> {
+            self.template.clone()
+        }
+
+        fn complete_prompt(
+            &self,
+            _prompt: &str,
+            _add_special: bool,
+            _parse_special: bool,
+            _max_new_tokens: usize,
+        ) -> EngineResult<Completion> {
+            unreachable!("template refusal tests must stop before generation")
+        }
     }
 
     impl CompletionBackend for BlockingBackend {
@@ -529,20 +940,38 @@ mod tests {
                 finish_reason: FinishReason::Length,
             })
         }
+
+        fn chat_template(&self) -> Option<ChatTemplate> {
+            None
+        }
+
+        fn complete_prompt(
+            &self,
+            prompt: &str,
+            _add_special: bool,
+            _parse_special: bool,
+            max_new_tokens: usize,
+        ) -> EngineResult<Completion> {
+            self.complete(prompt, max_new_tokens)
+        }
     }
 
     fn app() -> Router {
         router(Arc::new(FakeBackend {
-            descriptor: ModelDescriptor {
-                id: "test-model".to_string(),
-                architecture: "llama".to_string(),
-                context_length: 8,
-                embedding_length: 2,
-                vocab_size: 32,
-                file_type: Some(7),
-                size_bytes: Some(1024),
-            },
+            descriptor: test_descriptor(),
         }))
+    }
+
+    fn test_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            id: "test-model".to_string(),
+            architecture: "llama".to_string(),
+            context_length: 8,
+            embedding_length: 2,
+            vocab_size: 32,
+            file_type: Some(7),
+            size_bytes: Some(1024),
+        }
     }
 
     async fn send(request: Request<Body>) -> (StatusCode, axum::http::HeaderMap, Value) {
@@ -556,6 +985,13 @@ mod tests {
 
     fn post(body: Value) -> Request<Body> {
         Request::post("/v1/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn post_chat(body: Value) -> Request<Body> {
+        Request::post("/v1/chat/completions")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
@@ -648,6 +1084,170 @@ mod tests {
         assert_eq!(body["choices"][0]["finish_reason"], "stop");
         assert_eq!(body["usage"]["completion_tokens"], 1);
         assert_eq!(body["camelid"]["generated_token_ids"], json!([0]));
+    }
+
+    #[tokio::test]
+    async fn chat_completion_uses_the_embedded_template_and_openai_shape() {
+        struct RecordingBackend {
+            descriptor: ModelDescriptor,
+            prompt: Arc<Mutex<Option<(String, bool, bool)>>>,
+        }
+
+        impl CompletionBackend for RecordingBackend {
+            fn descriptor(&self) -> &ModelDescriptor {
+                &self.descriptor
+            }
+
+            fn complete(&self, _prompt: &str, _max_new_tokens: usize) -> EngineResult<Completion> {
+                unreachable!("the chat route must use complete_prompt")
+            }
+
+            fn chat_template(&self) -> Option<ChatTemplate> {
+                FakeBackend {
+                    descriptor: self.descriptor.clone(),
+                }
+                .chat_template()
+            }
+
+            fn complete_prompt(
+                &self,
+                prompt: &str,
+                add_special: bool,
+                parse_special: bool,
+                _max_new_tokens: usize,
+            ) -> EngineResult<Completion> {
+                *self.prompt.lock().unwrap() =
+                    Some((prompt.to_string(), add_special, parse_special));
+                Ok(Completion {
+                    prompt_tokens: vec![1, 2, 3],
+                    generated_tokens: vec![4],
+                    text: "answer".to_string(),
+                    finish_reason: FinishReason::EndOfGeneration,
+                })
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let backend = Arc::new(RecordingBackend {
+            descriptor: ModelDescriptor {
+                id: "test-model".to_string(),
+                architecture: "llama".to_string(),
+                context_length: 8,
+                embedding_length: 2,
+                vocab_size: 32,
+                file_type: None,
+                size_bytes: None,
+            },
+            prompt: Arc::clone(&captured),
+        });
+        let response = router(backend)
+            .oneshot(post_chat(json!({
+                "model": "test-model",
+                "messages": [
+                    {"role":"system","content":"rules"},
+                    {"role":"user","content":"hello"}
+                ],
+                "temperature": 0,
+                "max_tokens": 2
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["model"], "test-model");
+        assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(body["choices"][0]["message"]["content"], "answer");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["prompt_tokens"], 3);
+        assert_eq!(body["usage"]["completion_tokens"], 1);
+        assert_eq!(body["usage"]["total_tokens"], 4);
+        assert!(body["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("chatcmpl-in-tree-"));
+
+        assert_eq!(
+            captured.lock().unwrap().as_ref(),
+            Some(&(
+                "<s><|system|>rules</s><|user|>hello</s><|assistant|>".to_string(),
+                false,
+                true,
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_chat_shapes_fail_closed() {
+        let cases = [
+            (
+                json!({"messages":[{"role":"user","content":"hi"}],"stream":true}),
+                StatusCode::NOT_IMPLEMENTED,
+                "unsupported_streaming",
+            ),
+            (
+                json!({"messages":[{"role":"user","content":"hi"}],"temperature":0.5}),
+                StatusCode::BAD_REQUEST,
+                "unsupported_sampling",
+            ),
+            (
+                json!({"messages":[{"role":"tool","content":"hi"}]}),
+                StatusCode::BAD_REQUEST,
+                "unsupported_message_role",
+            ),
+            (
+                json!({"messages":[{"role":"user","content":"hi"}],"tools":[]}),
+                StatusCode::BAD_REQUEST,
+                "unsupported_parameter",
+            ),
+            (
+                json!({"messages":[]}),
+                StatusCode::BAD_REQUEST,
+                "invalid_messages",
+            ),
+            (
+                json!({"model":"other","messages":[{"role":"user","content":"hi"}]}),
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+            ),
+        ];
+        for (request, expected_status, expected_code) in cases {
+            let (status, _, body) = send(post_chat(request)).await;
+            assert_eq!(status, expected_status);
+            assert_eq!(body["error"]["code"], expected_code);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_and_invalid_chat_templates_are_typed_refusals() {
+        for template in [
+            None,
+            Some(ChatTemplate {
+                source: "{{ undefined_template_value }}".to_string(),
+                bos_token: String::new(),
+                eos_token: String::new(),
+                eot_token: String::new(),
+                eom_token: String::new(),
+                unk_token: String::new(),
+            }),
+        ] {
+            let app = router(Arc::new(TemplateBackend {
+                descriptor: test_descriptor(),
+                template,
+            }));
+            let response = app
+                .oneshot(post_chat(json!({
+                    "messages":[{"role":"user","content":"hi"}]
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["code"], "unsupported_chat_template");
+            assert_eq!(body["error"]["param"], "messages");
+        }
     }
 
     #[tokio::test]
@@ -755,7 +1355,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_and_unimplemented_routes_are_not_exposed() {
-        for path in ["/api/models/load", "/v1/chat/completions"] {
+        for path in ["/api/models/load", "/v1/embeddings"] {
             let response = app()
                 .oneshot(Request::post(path).body(Body::empty()).unwrap())
                 .await
