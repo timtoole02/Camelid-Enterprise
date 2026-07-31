@@ -1,7 +1,8 @@
 # The pinned engine dependency
 
-**Status:** scoped, not started. Records what "un-pin the engine" actually
-requires, because the phrase is short and the work is not.
+**Status:** migration started behind an internal runtime boundary; the serving
+binary still uses the pin. Records what "un-pin the engine" actually requires,
+because the phrase is short and the work is not.
 
 `crates/server` depends on the inference engine by git revision:
 
@@ -60,9 +61,8 @@ subsystem.
 
 ## 4. What is already in-tree
 
-`crates/engine-core` is roughly 9,400 lines (about 8,700 excluding blanks) and
-depends on **`serde` alone** — it does no HTTP at all. It is a numerics
-library, and a substantial one:
+`crates/engine-core` is a substantial numerics and model-lifecycle library and
+depends on **`serde` alone** — it does no HTTP at all:
 
 | Area | Lines |
 |---|---|
@@ -71,13 +71,19 @@ library, and a substantial one:
 | `gguf.rs` | 832 |
 | `forward/` (compute, rope, kv_cache, mod) | ~1,510 |
 | `model/` (binding, weights, config, mod) | ~1,230 |
+| `runtime.rs` (owned load + raw completion) | ~340 |
 
-`forward::compute` exposes `Decoder::generate(prompt, max_new)` and `argmax`,
-so greedy decoding exists. Because the deterministic lane *is* greedy, the
-absence of temperature and top-p sampling is not a gap for the lane this
-product ships. Per-OS kernels live in `engine-{macos,linux,windows}`.
+`runtime::LoadedModel` now owns the complete in-tree load path: GGUF parsing,
+tokenizer construction, configuration, tensor binding, materialized weights,
+context admission, and EOG-aware greedy raw completion. It creates a fresh
+decoder and KV cache per generation and accepts the per-platform Q8_0 kernel at
+one explicit seam. Because the deterministic lane *is* greedy, the absence of
+temperature and top-p sampling is not a gap for the lane this product ships.
+Per-OS kernels live in `engine-{macos,linux,windows}`.
 
-**The numerics are largely solved. The serving layer does not exist.**
+**The numerics and owned raw-completion lifecycle are largely solved. The
+in-tree serving layer does not exist.** No public route uses `LoadedModel` yet,
+so this changes no replica or gateway contract.
 
 ## 5. The gap, stated plainly
 
@@ -85,12 +91,15 @@ Missing entirely, in rough order of difficulty:
 
 - the HTTP layer — every route above
 - OpenAI request and response schemas
-- model registry, load and lifecycle management
+- serving model registry and concurrent load/unload/admission policy
 - SSE streaming for completions and chat
 - chat templating
 - embeddings models — a different model family, not a decode loop
 - reranking models — likewise
 - the agent workspace subsystem
+
+Loading and owning one immutable model for raw greedy completion is in-tree;
+the missing lifecycle work is deliberately above that boundary.
 
 This is a program of work, not a change. Anyone estimating it from "the server
 only imports two symbols" will be wrong by an order of magnitude.
@@ -115,11 +124,18 @@ much larger effort motivated by ownership rather than by risk.
 That distinction is the main point of this document. Doing the cheap thing
 first buys most of the safety at a fraction of the cost.
 
-## 7. If and when the migration happens
+## 7. How the migration proceeds
 
-There is no incremental path with the API as it stands, and the obvious one
-does not work. This section records why, so the idea is not rediscovered and
-tried.
+The first slice is intentionally below HTTP: `engine_core::runtime::LoadedModel`
+provides one owned, fail-closed path from a GGUF file to deterministic raw
+completion. The pinned router remains the production surface while in-tree
+request schemas, handlers, streaming, and chat templating are built and tested
+against that runtime. This keeps the external contract unchanged during the
+port and prevents serving policy from leaking back into the numerics crate.
+
+There is still no route-at-a-time cutover path with the API as it stands, and
+the obvious one does not work. This section records why, so the idea is not
+rediscovered and tried.
 
 **`Router::merge` cannot layer an in-tree route over a pinned one.** Axum
 rejects a duplicate method-and-path pair by panicking rather than letting the
@@ -156,23 +172,26 @@ yet. Roughly by how invasive they are:
 3. **Replace the router wholesale** at a single cutover. Forfeits
    incrementality, but is honest that the surface is one unit.
 
-If a migration ever starts, the least-risky order is still easiest and most
+The least-risky route implementation order is still easiest and most
 load-bearing first — `/v1/health`, then `/v1/models`, then `/v1/completions`,
 then `/v1/chat/completions` with templating and SSE, then a deliberate decision
 about `/v1/embeddings` and the rerank pair, which are different model families
 and may not belong in this product's surface at all. None of that sequencing is
-reachable until one of the three prerequisites above is in place.
+eligible for production cutover until one of the three prerequisites above is
+in place.
 
 ## 8. Recommendation
 
-**Do not start the migration now.** Do these instead, in order:
+Continue the migration without weakening the pinned production contract:
 
-1. **Mirror or vendor the pinned revision.** Small, contained, and it removes
-   the only risk here that can strand an operator who already deployed.
-2. **Leave the pin in place.** It is a correct contract anchor and there is no
-   defect motivating its removal.
-3. **Revisit un-pinning when a route needs to change** — when the contract has
-   to gain or alter behavior the pinned engine cannot provide. That is the
-   point at which owning the surface starts paying for itself. Migration still
-   does not begin there: it begins after one of §7's prerequisites has been
-   chosen and built, because until then there is no incremental path to take.
+1. **Keep the server pin in place during the port.** It remains the contract
+   anchor until an in-tree surface passes the same model-backed contract.
+2. **Build upward from `runtime::LoadedModel`.** Raw completion is the first
+   owned lifecycle; request schemas, model discovery, chat templating, and SSE
+   follow without coupling HTTP into `engine-core`.
+3. **Choose a §7 cutover prerequisite before switching any route.** Route-group
+   composition or a wholesale router replacement can make the transition
+   explicit; overlapping `Router::merge` cannot.
+4. **Mirror or vendor the pin independently if air-gapped availability becomes
+   urgent.** That mitigates supply availability but is not a substitute for the
+   in-tree refactor.

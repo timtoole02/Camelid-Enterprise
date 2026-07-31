@@ -300,8 +300,8 @@ The engine is being brought in-tree so platform code never mixes — each platfo
 
 ```
 crates/
-├── engine-core/      Platform-neutral: GGUF parsing, tokenizer, quant/tensor
-│                     kernels, the order-stable reference math. No host code.
+├── engine-core/      Platform-neutral: GGUF/model lifecycle, tokenizer,
+│                     quant/tensor kernels, deterministic decode. No host code.
 ├── engine-macos/     Apple Silicon backend — NEON / dot-product kernels.
 ├── engine-linux/     Linux backend — x86 AVX/VNNI and CUDA (in progress).
 ├── engine-windows/   Windows backend (in progress).

@@ -177,25 +177,44 @@ impl<'w> Decoder<'w> {
     /// not including the prompt. Decoding is greedy and carries no sampling
     /// state, so the result is a pure function of the prompt and the weights.
     pub fn generate(&mut self, prompt: &[u32], max_new: usize) -> Result<Vec<u32>> {
+        self.generate_until(prompt, max_new, |_| false)
+    }
+
+    /// Greedily decode until `max_new` tokens have been emitted or `should_stop`
+    /// accepts an emitted token.
+    ///
+    /// The stop token is included in the returned ids. Keeping it in the token
+    /// stream lets the caller distinguish an end-of-generation stop from a
+    /// length stop while [`crate::tokenizer::Tokenizer::decode`] can still hide
+    /// control tokens from user-visible text.
+    pub fn generate_until<F>(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        mut should_stop: F,
+    ) -> Result<Vec<u32>>
+    where
+        F: FnMut(u32) -> bool,
+    {
         if prompt.is_empty() {
             return Err(EngineError::ShapeMismatch(
                 "generate requires a non-empty prompt".to_string(),
             ));
         }
+        if max_new == 0 {
+            return Ok(Vec::new());
+        }
         for &token in &prompt[..prompt.len() - 1] {
             self.forward_token(token, false)?;
         }
         let mut generated = Vec::with_capacity(max_new);
-        if max_new == 0 {
-            return Ok(generated);
-        }
         let mut logits = self
             .forward_token(prompt[prompt.len() - 1], true)?
             .expect("logits requested on the final prompt token");
         loop {
             let next = argmax(&logits)?;
             generated.push(next);
-            if generated.len() == max_new {
+            if should_stop(next) || generated.len() == max_new {
                 return Ok(generated);
             }
             logits = self
