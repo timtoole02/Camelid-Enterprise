@@ -323,8 +323,8 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
- "camelid",
  "camelid-enterprise",
+ "camelid-enterprise-engine-core",
  "camelid-enterprise-identity",
  "camelid-enterprise-replica-contract",
  "clap",

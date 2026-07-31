@@ -11,10 +11,6 @@ name = "camelid-enterprise"
 path = "src/main.rs"
 
 [dependencies]
-# The engine. Pinned by revision: the deterministic lane's behavior is stated
-# against exactly this engine version, so the pin is part of the contract.
-camelid = { git = "https://github.com/timtoole02/Camelid", rev = "b4e3a9056567ed8145fc4fa29850d6f1f261ac2b" }
-
 async-stream = "0.3"
 engine-core.workspace = true
 minijinja.workspace = true
@@ -73,6 +69,10 @@ engine-windows.workspace = true
 toml = "0.8"
 
 [dev-dependencies]
+# Exact behavioral oracle retained only for parity and legacy-contract tests.
+# Production generation and HTTP routing are owned by this workspace.
+camelid = { git = "https://github.com/timtoole02/Camelid", rev = "b4e3a9056567ed8145fc4fa29850d6f1f261ac2b" }
+
 # Receipts are written to a scratch dir rather than anywhere in the tree. The
 # middleware and the served-route filter are driven through real routers with
 # `tower::ServiceExt::oneshot`, which is a normal dependency above because the

@@ -1,7 +1,7 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
 use camelid_enterprise::{
-    apply_deterministic, attributed_router, Attribution, ModelIdentity, WorkerThreads,
+    apply_deterministic, replica_router, Attribution, ModelIdentity, WorkerThreads,
 };
 use camelid_enterprise_gateway::{
     router_with_model_catalog, GatewayAuth, GatewayLog, ModelCatalog, ModelSelectionLimits,
@@ -11,6 +11,7 @@ use camelid_enterprise_gateway::{
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use engine_core::runtime::LoadedModel;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -115,23 +116,11 @@ async fn real_model_routes_through_a_verified_static_catalog() {
         workers: WorkerThreads::resolved(rayon::current_num_threads()),
         receipts: Some(Arc::new(receipt_path.clone())),
     };
-    let replica = spawn_router(attributed_router(
-        camelid::api::AppState::with_configured_threads(Some(4))
-            .with_default_enable_thinking(false)
-            .with_models_dir(None),
-        identity,
-    ))
-    .await;
-
-    let load = send(
-        Request::post(format!("http://{}/api/models/load", replica.addr))
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(json!({ "path": model }).to_string()))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(load.status(), StatusCode::OK);
-    response_json(load).await;
+    let loaded_model = LoadedModel::load(&model)
+        .expect("the in-tree runtime must load the catalog test model");
+    let (replica, expected_model_id) = replica_router(loaded_model, &model, identity)
+        .expect("the production replica composition must accept the catalog test model");
+    let replica = spawn_router(replica).await;
 
     let discovery = send(
         Request::get(format!("http://{}/v1/models", replica.addr))
@@ -147,6 +136,7 @@ async fn real_model_routes_through_a_verified_static_catalog() {
         .and_then(|model| model["id"].as_str())
         .expect("the loaded replica must advertise exactly one model id")
         .to_string();
+    assert_eq!(model_id, expected_model_id);
 
     let catalog = ModelCatalog::new([(
         model_id.clone(),

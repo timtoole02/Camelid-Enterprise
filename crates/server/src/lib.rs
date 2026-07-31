@@ -1,8 +1,8 @@
 //! Camelid Enterprise deterministic replica composition.
 //!
-//! The pinned Camelid engine owns request and response schemas. This crate owns
-//! the deployment contract around that engine: the exact revision, the declared
-//! route surface, deterministic-lane configuration, and response attribution.
+//! The in-tree engine owns generation and the public request/response schemas.
+//! This crate owns the deployment contract around it: the declared route
+//! surface, deterministic-lane configuration, and response attribution.
 //!
 //! Everything a replica *is* lives here rather than in the binary, so the
 //! contract tests and the model-backed conformance harness are written against
@@ -21,6 +21,7 @@ pub mod surface;
 
 use axum::middleware;
 use axum::Router;
+use engine_core::runtime::LoadedModel;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -28,27 +29,66 @@ pub use attribution::{Attribution, ModelIdentity, WorkerThreads};
 pub use lane::{apply_deterministic, ConfigVector, ENGINE_PIN};
 pub use surface::ServedModel;
 
-/// Load the weights this replica was started with, then compose the router it
-/// serves from. Returns that router and the key the engine filed the weights
-/// under.
+/// Compose the production replica around one model already loaded by the
+/// in-tree engine. Returns the served router and the model id clients must use.
 ///
-/// This is the single composition point for the surface a client meets, and the
-/// order of the three steps is the design rather than convenience.
-///
-/// The load goes through the **unfiltered** `engine` router, because the route
-/// it uses is one [`surface::serve_only_the_lane`] refuses — if it were not, the
-/// filter would have a hole exactly where the control plane is. The engine
-/// exposes model loading over HTTP and nowhere else, so this is an HTTP request;
-/// it is not a request over a socket. See [`load_startup_model`].
-///
-/// The digest is re-verified between the load and the composition, because the
-/// engine loads by path string rather than by handle and this replica is about
-/// to publish a digest for the bytes it hashed.
-///
-/// The served view is composed only after the load returns, because the body
-/// filter is written against the key the load reports — a value this
-/// distribution reads back from the engine rather than predicts.
-pub async fn replica_router(
+/// Model ownership is the control plane: there is no HTTP load/unload route and
+/// no second model registry. The identity computed before loading is rechecked
+/// against the loaded model's source before the listener serves this router.
+pub fn replica_router(
+    model: LoadedModel,
+    requested: &Path,
+    identity: Attribution,
+) -> Result<(Router, String), Box<dyn std::error::Error>> {
+    identity
+        .model
+        .verify_unchanged(model.source())
+        .map_err(std::io::Error::other)?;
+    let model_id = model
+        .name()
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            model
+                .source()
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| !stem.is_empty())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the loaded model at {} has neither general.name metadata nor a UTF-8 file stem",
+                    model.source().display()
+                ),
+            )
+        })?;
+    let canonical = model.source().to_path_buf();
+    let backend = in_tree::LoadedModelBackend::new(model_id.clone(), model)
+        .map_err(std::io::Error::other)?;
+    let served_model = Arc::new(ServedModel::new(
+        model_id.clone(),
+        &canonical,
+        requested,
+    ));
+    let served = in_tree::router(Arc::new(backend))
+        .layer(middleware::from_fn_with_state(
+            served_model,
+            surface::pin_generation_to_the_served_model,
+        ))
+        .layer(middleware::from_fn(surface::serve_only_the_lane))
+        .layer(middleware::from_fn_with_state(
+            identity,
+            attribution::attribute,
+        ));
+    Ok((served, model_id))
+}
+
+/// Compose the pinned dependency's served router for the parity oracle and its
+/// legacy contract tests. Production calls [`replica_router`] instead.
+pub async fn pinned_replica_router(
     engine: Router,
     canonical: &Path,
     requested: &Path,
@@ -77,10 +117,8 @@ pub async fn replica_router(
 ///     which weights. A client that gets a `403` from a pool has to be able to
 ///     tell which replica refused it.
 ///
-/// Split out from [`replica_router`] so a test can drive the exact production
-/// stack against a `ServedModel` it constructs, without a multi-gigabyte load.
-/// Nothing else in this workspace may restate this layering: a second copy is a
-/// composition the tests pin and production does not use.
+/// Retained for tests of the pinned parity oracle's legacy served stack. The
+/// production composition is [`replica_router`].
 pub fn served_router(
     engine: Router,
     served_model: Arc<ServedModel>,
@@ -112,6 +150,7 @@ pub fn served_router(
 ///
 /// It carries no `ServedModel`, so a generation request reaching it is resolved
 /// by the engine on the engine's own terms. Nothing serves this to a client.
+#[cfg(test)]
 pub fn attributed_router(state: camelid::api::AppState, identity: Attribution) -> Router {
     camelid::api::router_with_state(state).layer(middleware::from_fn_with_state(
         identity,
