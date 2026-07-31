@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Transparent gateway, as a launchd system daemon. OPTIONAL, and off by default.
+
+  Install this only on a Mac that serves clients directly with no load balancer
+  in front of it, so the box has one entry point and the replica can stay on
+  loopback. Behind a load balancer it earns nothing: it forwards to one fixed
+  origin, so a gateway per replica balances nothing the balancer is not already
+  doing, and it costs a second process whose shutdown window has to be sized to
+  a generation — see ExitTimeOut.
+
+  launchd expresses no ordering between jobs, and none is needed at boot: while
+  the replica is starting the gateway answers 502, which is the correct answer.
+  Ordering matters at STOP, in the other direction — see README.md.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.camelid.enterprise.gateway</string>
+
+  <!-- Flags, not environment, so both units on this box obey one rule rather
+       than one rule with an exception. --upstream is the replica's loopback
+       address: the gateway is the only thing that talks to it, which is what
+       lets the replica keep --addr 127.0.0.1. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/camelid-enterprise-gateway</string>
+    <string>serve</string>
+    <string>--upstream</string>
+    <string>http://127.0.0.1:8181</string>
+    <string>--addr</string>
+    <string>0.0.0.0:8080</string>
+  </array>
+
+  <key>UserName</key>
+  <string>_camelid</string>
+  <key>GroupName</key>
+  <string>_camelid</string>
+  <key>InitGroups</key>
+  <true/>
+
+  <key>WorkingDirectory</key>
+  <string>/usr/local/var/camelid-enterprise</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- The gateway holds no model and re-reads nothing at start, so a restart is
+       cheap and this can be far shorter than the replica's. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <!-- The same 900s as the replica, for a reason that is easy to get wrong. The
+       gateway owns no queue, so it looks like it should stop in milliseconds —
+       but it forwards response bodies as opaque streams and waits for in-flight
+       requests at shutdown, so a generation is in flight HERE for its entire
+       duration. A short timeout SIGKILLs the proxy mid-stream and truncates a
+       client the replica is still generating for, which is worse than either
+       process draining alone. Stop the gateway before the replica, after the
+       queue is already empty; then this value is never reached. -->
+  <key>ExitTimeOut</key>
+  <integer>900</integer>
+
+  <!-- Not Interactive. That class exists to keep launchd's CPU and I/O throttle
+       off the decode loop; granting the same exemption to a process that only
+       copies bytes puts it in equal standing with the thing that needs it. -->
+  <key>ProcessType</key>
+  <string>Adaptive</string>
+
+  <key>StandardOutPath</key>
+  <string>/usr/local/var/log/camelid-enterprise/gateway.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/usr/local/var/log/camelid-enterprise/gateway.err.log</string>
+
+  <key>Umask</key>
+  <integer>23</integer>
+
+  <!-- The gateway reads CAMELID_GATEWAY_ADDR and CAMELID_GATEWAY_UPSTREAM and
+       runs no admission scan — it is not the replica, and nothing here would be
+       refused. They are passed as flags above anyway, so this unit and the
+       replica's obey the same rule. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUST_LOG</key>
+    <string>info</string>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>

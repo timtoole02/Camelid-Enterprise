@@ -1,0 +1,360 @@
+# Environment keys the pinned engine touches, at revision b4e3a9056567ed8145fc4fa29850d6f1f261ac2b.
+#
+# WHY THIS FILE EXISTS. The lane admits environment variables by allow list, so
+# exhaustiveness is structural and this table is not what makes the lane safe --
+# a key missing from here is still refused. Its job is narrower and it is the
+# only thing that does it: it is the record that lets a test prove no PERMITTED
+# entry in lane.rs names a key the engine itself reads or writes. A permit rule
+# that overlaps an engine key silently hands an operator a knob on the forward
+# pass while the replica keeps publishing the same configuration digest, which
+# is precisely the failure the allow list exists to prevent.
+#
+# Derived by sweeping the engine tree at the pin for CAMELID_* string literals.
+# It is a snapshot of one revision, not a live view: it is correct only for the
+# ENGINE_PIN above and must be regenerated in the same change that bumps it.
+#
+# WHAT THIS FILE CANNOT SEE, AND WHY IT MATTERS. Every row here is a CAMELID_
+# name, so every test built on it reasons inside one namespace. A lever the
+# engine reaches through somebody else's crate -- the data-parallel pool's own
+# variables, the platform BLAS pool's -- is not in this corpus and cannot be, so
+# no assertion against it will ever surface one. That is not a gap to close by
+# widening the sweep: the set of environment names an arbitrary dependency reads
+# is not enumerable from this tree, and a corpus that pretended otherwise would
+# be worse than one whose boundary is written down. It is written down because
+# it already cost something. RAYON_NUM_THREADS was refused while its live
+# deprecated alias RAYON_RS_NUM_CPUS was not, and the whole suite stayed green
+# over the gap for exactly this reason. lane.rs's REFUSED_FOREIGN rows are
+# established by reading the crate that honours the name, at the version this
+# workspace pins, and re-read whenever that pin moves. Nothing mechanical here
+# substitutes for that.
+#
+# columns: key, class, first_site, site_count
+#   class      READ         read at least once by engine code
+#              WRITE_ONLY   only written by engine code (see execution_plan.rs,
+#                           whose planner set_var/remove_var's its managed keys
+#                           at model load -- after the lane's startup scan)
+#              MENTION_ONLY appears only in a string or a computed key fragment
+#              DOC_ONLY     appears only in prose
+#   first_site  engine-relative path:line of the first occurrence
+#   site_count  number of read sites (0 for the non-READ classes)
+#
+# Class is deliberately coarse. Anything other than DOC_ONLY means the name is
+# spoken for by the engine and must not appear on the lane's allow list.
+#
+# CLASS IS SWEPT, THEN CORRECTED BY HAND. The sweep classifies by what sits next
+# to the literal, so it scores a key as unread whenever the engine reaches the
+# read through a helper -- a name returned from a function, or one assembled at
+# runtime from a role string. Seventeen rows were corrected that way and they
+# point first_site at the read, not at the literal the sweep found.
+#
+# The first ten: CAMELID_APPLE_ACCELERATE (read behind a flag helper), the two
+# CAMELID_ZERO_*_DELTA keys (names returned from a match, then read), and the
+# seven CAMELID_RECTANGULAR_LINEAR_LAYOUT* keys (the per-role names are built
+# with format! and read through the built string, which is exactly why an
+# exact-name ban list could never have covered this family).
+#
+# Seven more, found by re-checking the classes rather than the names, all of
+# them read through one of the engine's boolean-flag helpers -- which take the
+# key as an argument, so the literal at the call site does not sit next to an
+# env::var and the sweep scored it WRITE_ONLY or MENTION_ONLY with site_count 0:
+# CAMELID_BENCH_UNCACHED_RUNTIME_PLAN, CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED
+# and the three CAMELID_X86_Q8_MATMUL_OWNER_{AVX2,VNNI,4X8} keys (all through
+# the q8 flag helpers in inference/q8_runtime.rs); CAMELID_Q8_SCHED_TELEMETRY
+# and CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES, which reach their reads
+# through a named const rather than the literal.
+#
+# Those seven were WRITE_ONLY or MENTION_ONLY, not DOC_ONLY, so no assertion was
+# wrong while they sat that way: the overlap guard filters DOC_ONLY only. They
+# were corrected because the OTHER guard, every_canonical_key_is_read_by_the
+# _engine, selects on class == "READ" -- so a canonical key misfiled the same way
+# would make that test pass while proving nothing, which is the same failure
+# mode, one class over.
+#
+# After those corrections no row is DOC_ONLY. That matters more than it looks:
+# DOC_ONLY is the one class the overlap guard filters out, so a key misfiled
+# there would have been invisible to the very test this table exists to back --
+# and the misfiled one was the flag gating the Accelerate route that the lane's
+# single foreign refusal is about.
+key	class	first_site	site_count
+CAMELID_3B_GGUF	READ	inference/tests.rs:13230	1
+CAMELID_AARCH64_DOTPROD	READ	inference/cpu_neon.rs:433	1
+CAMELID_ADDR	MENTION_ONLY	main.rs:319	0
+CAMELID_ALLOC_GATE_TRACE_MIN	READ	alloc_gate.rs:137	1
+CAMELID_ALLOC_GATE_TRACE_SKIP	READ	alloc_gate.rs:142	1
+CAMELID_APPLE_ACCELERATE	READ	inference.rs:20993	1
+CAMELID_APPLE_ACCELERATE_MIN_ELEMENTS	READ	main.rs:6260	2
+CAMELID_ATTENTION_DECODE_PARALLEL	READ	inference.rs:23762	2
+CAMELID_ATTENTION_DECODE_PARALLEL_MIN_POSITIONS	READ	inference.rs:23781	1
+CAMELID_ATTENTION_F32_BLOCKED_DOT	READ	inference.rs:23733	2
+CAMELID_ATTENTION_SCORE_SCALE	READ	inference/diagnostic_config.rs:231	1
+CAMELID_ATTN_COALESCED	READ	cuda_resident.rs:3216	1
+CAMELID_AUDIT_WEBHOOK	READ	chat/audit.rs:227	1
+CAMELID_BENCH_UNCACHED_RUNTIME_PLAN	READ	inference/q8_runtime.rs:137	1
+CAMELID_COMMIT	READ	main.rs:4084	3
+CAMELID_CUDA_DEVICE	READ	cuda.rs:147	1
+CAMELID_CUDA_GRAPHS	READ	cuda_resident.rs:5568	1
+CAMELID_CUDA_Q8	READ	cuda.rs:58	1
+CAMELID_CUDA_RESIDENT_DECODE	READ	execution_plan.rs:241	2
+CAMELID_CUDA_RESIDENT_HEADROOM_MB	READ	inference.rs:11422	1
+CAMELID_CUDA_RESIDENT_MAX_CONTEXT	READ	inference.rs:11756	1
+CAMELID_CUDA_RESIDENT_PREFILL	READ	inference.rs:2342	1
+CAMELID_CUDA_RESIDENT_PREFILL_BATCHED	READ	inference.rs:2462	1
+CAMELID_CUDA_STREAMS	READ	cuda_resident.rs:5582	1
+CAMELID_CUDA_TRACE	READ	cuda.rs:566	2
+CAMELID_DEBUG_DISABLE_QK_NORM	READ	inference.rs:611	1
+CAMELID_DECODE_POOL_DEDICATED	READ	inference.rs:5068	1
+CAMELID_DECODE_THREADS	READ	inference.rs:5067	1
+CAMELID_DECODE_TIME	READ	main.rs:3739	1
+CAMELID_DECODE_TIMINGS	READ	inference.rs:4670	2
+CAMELID_DETERMINISTIC	READ	execution_plan.rs:238	2
+CAMELID_DEVICE_DECODE_CHUNK	READ	runnable/model.rs:1464	1
+CAMELID_DG_CUDA	READ	diffusion_gemma/cuda.rs:1214	1
+CAMELID_DG_CUDA_LMHEAD	READ	diffusion_gemma.rs:72	1
+CAMELID_DG_CUDA_SC	READ	diffusion_gemma/cuda.rs:1338	2
+CAMELID_DG_EB_CAP	READ	diffusion_gemma.rs:2811	1
+CAMELID_DG_EMB_GGUF	READ	diffusion_gemma.rs:3085	1
+CAMELID_DG_EMB_IDS	READ	diffusion_gemma.rs:3086	1
+CAMELID_DG_EMB_REF	READ	diffusion_gemma.rs:3087	1
+CAMELID_DG_EXPERT_VRAM_MB	READ	diffusion_gemma/cuda.rs:1181	1
+CAMELID_DG_F16_REF	READ	diffusion_gemma/reff16.rs:196	1
+CAMELID_DG_FAST	READ	diffusion_gemma.rs:187	1
+CAMELID_DG_HOST_POOL_MB	READ	diffusion_gemma/cuda.rs:1933	1
+CAMELID_DG_LIVE	READ	main.rs:2058	1
+CAMELID_DG_MAX_BLOCKS	READ	api/mod.rs:6299	1
+CAMELID_DG_MAX_STEPS	READ	api/mod.rs:6290	1
+CAMELID_DG_SC_DUMP_DIR	READ	diffusion_gemma.rs:1929	1
+CAMELID_DG_SERVE	READ	api/mod.rs:6275	1
+CAMELID_DG_STAGE_TIMINGS	READ	diffusion_gemma.rs:237	4
+CAMELID_DG_VEC_REF	READ	diffusion_gemma/refmath.rs:894	1
+CAMELID_DISTRIBUTED_TRACE	READ	main.rs:5493	2
+CAMELID_ENABLE_THINKING	MENTION_ONLY	main.rs:375	0
+CAMELID_EVAL_CASE	READ	chat/agent_eval.rs:173	1
+CAMELID_FFN_GATE_UP_ORDER	READ	inference/diagnostic_config.rs:275	1
+CAMELID_FIT_DIMS_CACHE	READ	fit_dims.rs:469	1
+CAMELID_FLASH_PREFILL	READ	cuda_resident.rs:4762	1
+CAMELID_FORWARD_MEMORY_TRACE	READ	inference.rs:4625	1
+CAMELID_FORWARD_RSS_TIMINGS	READ	inference.rs:4637	2
+CAMELID_GAIT	READ	gait/mod.rs:49	1
+CAMELID_GEMMA4_CPU_TIMING	READ	gemma4_runtime.rs:969	1
+CAMELID_GEMMA4_CUDA	READ	api/mod.rs:4621	1
+CAMELID_GEMMA4_DUMP_ATTN	READ	gemma4_runtime.rs:1956	1
+CAMELID_GEMMA4_DUMP_LAYERS	READ	gemma4_runtime.rs:2093	1
+CAMELID_GEMMA4_DUMP_PROMPT_TOKENS	READ	gemma4_runtime.rs:2143	2
+CAMELID_GEMMA4_EXPERT_PACK_MIB	READ	gemma4_runtime.rs:873	1
+CAMELID_GEMMA4_GGUF	READ	gemma4_runtime.rs:5065	1
+CAMELID_GEMMA4_GPU	READ	metal.rs:13611	1
+CAMELID_GEMMA4_GPU_TIMING	READ	gemma4_runtime.rs:2828	2
+CAMELID_GEMMA4_NO_PREFIX_CACHE	READ	gemma4_runtime.rs:4933	1
+CAMELID_GEMMA4_Q4_GGUF	READ	gemma4_runtime.rs:5126	1
+CAMELID_GEMMA4_ROUTE_TRACE	READ	gemma4_runtime.rs:1772	2
+CAMELID_GEMMA4_SERVE	READ	api/mod.rs:4610	1
+CAMELID_GEMMA4_SPEC_DECODE	READ	gemma4_runtime.rs:2156	1
+CAMELID_GEMMA4_SPEC_DRAFT_TOKENS	READ	gemma4_runtime.rs:2326	1
+CAMELID_GEMMA4_SPEC_TIMING	READ	gemma4_runtime.rs:2340	1
+CAMELID_GEMMA4_SPLIT	READ	api/mod.rs:5224	1
+CAMELID_GEMMA4_WORKER	READ	api/mod.rs:5223	1
+CAMELID_GENERATION_TIMEOUT_MS	READ	api/mod.rs:10781	1
+CAMELID_GIT_COMMIT	MENTION_ONLY	receipt/mod.rs:287	0
+CAMELID_GIT_DESCRIBE	MENTION_ONLY	main.rs:44	0
+CAMELID_GPU_RUNNABLE_TIER	READ	execution_plan.rs:338	1
+CAMELID_GPU_TEMP_SAMPLING	READ	inference.rs:11681	1
+CAMELID_GQA_HEAD_MAPPING	READ	inference/diagnostic_config.rs:203	1
+CAMELID_HYBRID_Q8_GPU_PERCENT	READ	main.rs:6281	3
+CAMELID_HYBRID_Q8_GPU_ROWS	READ	inference.rs:11806	2
+CAMELID_HYBRID_Q8_RETAINED	READ	main.rs:6277	3
+CAMELID_IQ4XS_GGUF	READ	inference/tests.rs:12464	1
+CAMELID_KV_CACHE_GROW_TOKENS	READ	inference/kv_cache.rs:660	1
+CAMELID_KV_F16	READ	inference/kv_cache.rs:184	1
+CAMELID_KV_LAYOUT_HEAD_MAJOR	READ	inference/kv_cache.rs:164	1
+CAMELID_LAZY_Q8_0_LINEAR	READ	inference.rs:11827	3
+CAMELID_LINEAR_ACCUMULATION	READ	inference/diagnostic_config.rs:245	1
+CAMELID_LLAMA3_MISSING_PRE_GGUF	READ	tokenizer/mod.rs:1410	1
+CAMELID_LLAMA3_REFERENCE_GGUF	READ	tokenizer/mod.rs:1412	1
+CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER	READ	execution_plan.rs:454	2
+CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK	READ	inference.rs:13164	1
+CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING	READ	inference.rs:13154	1
+CAMELID_MAC_Q8_FFN_DOWN_SINGLE_PROJECTION_COUNTERS	READ	inference.rs:13189	1
+CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER	READ	execution_plan.rs:462	1
+CAMELID_MAC_Q8_I8MM_SMALL_M_MAX_ROWS	READ	inference.rs:22082	1
+CAMELID_MAC_Q8_METAL_PLAN	READ	execution_plan.rs:422	1
+CAMELID_MAC_Q8_PREFILL_I8MM	READ	execution_plan.rs:470	3
+CAMELID_MAC_Q8_REPACK	READ	execution_plan.rs:406	2
+CAMELID_MAC_Q8_SCHED	READ	inference.rs:21795	1
+CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES	READ	api/mod.rs:9139	1
+CAMELID_MAX_KV_CACHE_BYTES	READ	inference/kv_cache.rs:689	1
+CAMELID_METADATA_CHAT_TEMPLATE	READ	api/mod.rs:13142	1
+CAMELID_METAL_ATTN2	READ	metal.rs:9089	1
+CAMELID_METAL_ATTN_MM_CAP_MB	READ	metal.rs:7858	1
+CAMELID_METAL_ATTN_SPLITK	READ	metal.rs:9080	1
+CAMELID_METAL_ATTN_SPLITK_KV16	READ	metal.rs:9445	2
+CAMELID_METAL_F32Y	READ	metal.rs:7748	1
+CAMELID_METAL_FLASH_PREFILL	READ	metal.rs:12178	1
+CAMELID_METAL_KSPLIT	READ	metal.rs:7737	1
+CAMELID_METAL_KV16	READ	metal.rs:9068	1
+CAMELID_METAL_LINEAR	READ	main.rs:6265	3
+CAMELID_METAL_MM	READ	metal.rs:7885	1
+CAMELID_METAL_NOCOPY	READ	main.rs:5283	2
+CAMELID_METAL_Q8	READ	main.rs:6269	3
+CAMELID_METAL_Q8_RETAINED	READ	main.rs:6273	3
+CAMELID_METAL_RESIDENT_DECODE	READ	execution_plan.rs:421	2
+CAMELID_METAL_RESIDENT_PREFILL	READ	inference/metal_resident.rs:34	1
+CAMELID_METAL_WIRE	READ	metal.rs:7823	1
+CAMELID_METAL_WIRE_NSG8	READ	metal.rs:9099	1
+CAMELID_MIN_VRAM_HEADROOM_MIB	READ	cuda_vram.rs:35	1
+CAMELID_MODEL	READ	main.rs:68	1
+CAMELID_MODELS_DIR	READ	main.rs:81	1
+CAMELID_NO_GPU_SAMPLE	READ	main.rs:3749	1
+CAMELID_NO_OPEN	MENTION_ONLY	main.rs:360	0
+CAMELID_NO_REMOTE_DIMS	READ	fit_dims.rs:121	1
+CAMELID_OFFLOAD_BUFFERS	READ	inference.rs:11459	2
+CAMELID_OFFLOAD_FORCE_LAYERS	READ	inference.rs:11472	1
+CAMELID_OFFLOAD_PCIE_PROBE	READ	inference.rs:11642	1
+CAMELID_ORNITH_GGUF	READ	runnable/smoke.rs:416	12
+CAMELID_OUTPUT_PROJECTION_LAYOUT	READ	inference/diagnostic_config.rs:320	1
+CAMELID_PARALLEL_LINEAR	READ	inference.rs:21329	2
+CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS	READ	main.rs:6256	3
+CAMELID_PARITY_NPREDICT	READ	runnable/smoke.rs:520	1
+CAMELID_PARITY_PROMPTS	READ	runnable/smoke.rs:492	1
+CAMELID_PARITY_TOKENS	READ	runnable/smoke.rs:517	1
+CAMELID_PREFILL_CHUNK_TOKENS	READ	inference.rs:4845	1
+CAMELID_PREFILL_LAYER_MAJOR	READ	inference.rs:4870	1
+CAMELID_PREFILL_LAYER_MAJOR_ATTRIBUTION	READ	inference.rs:4655	1
+CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS	READ	inference.rs:4838	1
+CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES	READ	inference.rs:4708	2
+CAMELID_PREFILL_THREADS	READ	inference.rs:4915	1
+CAMELID_PREFILL_TIME	READ	metal.rs:12547	2
+CAMELID_PREFILL_TRACE	READ	metal.rs:11775	1
+CAMELID_PRODUCTION	READ	chat/agent.rs:182	1
+CAMELID_PROFILE	READ	execution_plan.rs:912	1
+CAMELID_Q5KM_GGUF	READ	inference/tests.rs:12388	1
+CAMELID_Q8_0_BLOCK_DOT	READ	inference.rs:10874	3
+CAMELID_Q8_0_FILE_CACHE_BYTES	READ	api/mod.rs:9176	3
+CAMELID_Q8_0_FILE_READER_BLOCK_DOT	READ	inference.rs:10883	2
+CAMELID_Q8_0_FILE_READER_CHUNK_BYTES	READ	inference.rs:21391	1
+CAMELID_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES	READ	inference.rs:21362	2
+CAMELID_Q8_0_FILE_READER_RETAINED_SCRATCH_BYTES	READ	inference.rs:21239	1
+CAMELID_Q8_0_PACKED_4X4_DOT	READ	inference.rs:21650	2
+CAMELID_Q8_0_PACKED_4X8_DOT	READ	inference.rs:21662	2
+CAMELID_Q8_0_PACK_TRACE	READ	tensor/mod.rs:667	1
+CAMELID_Q8_ROW_DISPATCH	READ	inference.rs:16976	3
+CAMELID_Q8_SCHED_TELEMETRY	READ	inference/q8_telemetry.rs:195	2
+CAMELID_QUEUE_DEPTH	READ	api/engine.rs:63	1
+CAMELID_QWEN35_CUDA	READ	runnable/model.rs:1155	2
+CAMELID_QWEN35_CUDA_MAXPOS	READ	runnable/model.rs:1177	2
+CAMELID_RECTANGULAR_LINEAR_LAYOUT	READ	inference/diagnostic_config.rs:352	1
+CAMELID_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_K	READ	inference/diagnostic_config.rs:386	1
+CAMELID_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_Q	READ	inference/diagnostic_config.rs:386	1
+CAMELID_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_V	READ	inference/diagnostic_config.rs:386	1
+CAMELID_RECTANGULAR_LINEAR_LAYOUT_FFN_DOWN	READ	inference/diagnostic_config.rs:386	1
+CAMELID_RECTANGULAR_LINEAR_LAYOUT_FFN_GATE	READ	inference/diagnostic_config.rs:386	1
+CAMELID_RECTANGULAR_LINEAR_LAYOUT_FFN_UP	READ	inference/diagnostic_config.rs:386	1
+CAMELID_REQUIRE_METAL_TESTS	READ	metal.rs:14444	2
+CAMELID_RESIDENT_NO_FUSION	READ	cuda_resident.rs:5594	1
+CAMELID_RESIDENT_TRACE	READ	metal.rs:11170	16
+CAMELID_RETAIN_Q8_0_BLOCKS	READ	api/mod.rs:9155	2
+CAMELID_RMS_NORM_EPSILON	READ	inference/diagnostic_config.rs:412	1
+CAMELID_ROPE_DIRECTION	READ	inference/rope.rs:107	1
+CAMELID_ROPE_PAIRING	READ	inference/rope.rs:63	2
+CAMELID_ROPE_POSITION_MODE	READ	inference/rope.rs:135	1
+CAMELID_RUNNABLE_SERVE	READ	api/mod.rs:5560	1
+CAMELID_RUNTIME_PROFILE	WRITE_ONLY	inference/tests.rs:1833	0
+CAMELID_SEARCH_URL	READ	chat/tools.rs:2073	1
+CAMELID_SHOT_PATH	MENTION_ONLY	chat/win_uia.rs:171	0
+CAMELID_SKIP_FIT_CHECK	READ	api/mod.rs:4375	1
+CAMELID_SPEC_COEXIST_HEADROOM_MB	READ	inference.rs:11376	1
+CAMELID_SPEC_COEXIST_SPILL_MB	READ	inference.rs:11384	1
+CAMELID_SPEC_CPU_VERIFY	READ	main.rs:4446	1
+CAMELID_SPEC_DECODE	READ	api/mod.rs:1496	1
+CAMELID_SPEC_DRAFT_CONTEXT	READ	inference.rs:11186	1
+CAMELID_SPEC_DRAFT_MODEL	READ	api/mod.rs:9927	2
+CAMELID_SPEC_DRAFT_RESERVE_MB	READ	inference.rs:1946	1
+CAMELID_SPEC_DRAFT_TOKENS	READ	api/mod.rs:1516	1
+CAMELID_SPEC_GPU	READ	main.rs:6227	2
+CAMELID_SPEC_NGRAM	READ	main.rs:3751	1
+CAMELID_SPEC_TREE	READ	main.rs:4388	1
+CAMELID_SPEC_TREE_GATE	READ	main.rs:4437	1
+CAMELID_SPEC_TREE_TRACE	READ	main.rs:4486	1
+CAMELID_SPEC_VERIFY_TIMINGS	READ	main.rs:4589	1
+CAMELID_SPEC_VERIFY_TRACE	READ	inference/metal_resident.rs:600	2
+CAMELID_SQUARE_LINEAR_LAYOUT	READ	inference/diagnostic_config.rs:336	1
+CAMELID_SSER_CACHE	READ	gemma4_runtime.rs:3553	1
+CAMELID_SSER_CACHE_EXPERTS	READ	gemma4_runtime.rs:3583	1
+CAMELID_SSER_CACHE_RESERVE_MIB	READ	gemma4_runtime.rs:3575	1
+CAMELID_SSER_PROFILE	READ	gemma4_runtime.rs:3679	3
+CAMELID_STAGE_TIMINGS	READ	main.rs:3743	2
+CAMELID_STREAM_FILE	READ	runnable/smoke.rs:540	2
+CAMELID_STREAM_POLL_YIELD	READ	api/mod.rs:11995	1
+CAMELID_STREAM_TIMING_DIAGNOSTICS	READ	api/mod.rs:11988	1
+CAMELID_SUBAGENT_DEPTH	READ	chat/subagent.rs:181	1
+CAMELID_SUBAGENT_FORCE_CANNED	READ	chat/subagent.rs:279	1
+CAMELID_TEST_GENERATION_STEP_SLEEP_MS	READ	api/mod.rs:10723	1
+CAMELID_TEST_GGUF	READ	metal.rs:14473	1
+CAMELID_TEST_REMOTE_DIMS	READ	fit_dims.rs:826	1
+CAMELID_THREADS	READ	inference.rs:4916	2
+CAMELID_TRACE_Q8_METAL	READ	inference.rs:11776	1
+CAMELID_UIA_NAME	MENTION_ONLY	chat/win_uia.rs:159	0
+CAMELID_UIA_WINDOW	MENTION_ONLY	chat/win_uia.rs:150	0
+CAMELID_VERIFY_PREFIX	READ	runnable/smoke.rs:571	1
+CAMELID_WIN_PIN	READ	inference/win_pin.rs:45	1
+CAMELID_WORKSPACE_MEMORY_DB	READ	chat/workspace_memory.rs:967	1
+CAMELID_X86_KQUANT_MATMUL_OWNER	READ	inference.rs:18026	3
+CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8	READ	inference.rs:18057	3
+CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI	READ	inference.rs:18170	2
+CAMELID_X86_KQUANT_REPACK8_BUDGET_MIB	READ	inference.rs:18080	1
+CAMELID_X86_PREFETCH	READ	inference.rs:14644	1
+CAMELID_X86_Q4K_DECODE	READ	inference.rs:17886	2
+CAMELID_X86_Q6K_AVX2	READ	inference.rs:19311	1
+CAMELID_X86_Q8_AMX_REPACK	READ	tensor/mod.rs:709	1
+CAMELID_X86_Q8_ATTENTION_OUTPUT_DECODE_CONSUMER	READ	execution_plan.rs:2420	1
+CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL	READ	execution_plan.rs:2421	1
+CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER	READ	execution_plan.rs:2419	1
+CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER	READ	execution_plan.rs:2422	1
+CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK	READ	execution_plan.rs:2424	3
+CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING	READ	execution_plan.rs:2423	2
+CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL	READ	execution_plan.rs:2425	1
+CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER	READ	inference.rs:12053	2
+CAMELID_X86_Q8_FFN_DECODE_CHAIN	READ	execution_plan.rs:642	3
+CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL	READ	execution_plan.rs:2444	1
+CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER	READ	execution_plan.rs:678	3
+CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK	READ	inference.rs:13228	1
+CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING	READ	inference.rs:13218	1
+CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER	WRITE_ONLY	execution_plan.rs:44	0
+CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2	READ	execution_plan.rs:2443	1
+CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL	READ	execution_plan.rs:2439	1
+CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS	READ	execution_plan.rs:2441	4
+CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED	READ	execution_plan.rs:2440	1
+CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL	READ	execution_plan.rs:2437	2
+CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER	READ	execution_plan.rs:2445	1
+CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE	READ	execution_plan.rs:2446	2
+CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR	READ	execution_plan.rs:2447	2
+CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER	READ	execution_plan.rs:644	3
+CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED	READ	inference/q8_runtime.rs:245	1
+CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION	READ	execution_plan.rs:2431	1
+CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK	READ	execution_plan.rs:2430	3
+CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING	READ	execution_plan.rs:2429	1
+CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT	READ	execution_plan.rs:2432	1
+CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL	READ	execution_plan.rs:2434	1
+CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER	READ	execution_plan.rs:2435	1
+CAMELID_X86_Q8_KERNEL	READ	execution_plan.rs:552	5
+CAMELID_X86_Q8_MATMUL_OWNER	READ	inference/q8_runtime.rs:23	1
+CAMELID_X86_Q8_MATMUL_OWNER_4X8	READ	inference/q8_runtime.rs:314	1
+CAMELID_X86_Q8_MATMUL_OWNER_AVX2	READ	inference/q8_runtime.rs:308	1
+CAMELID_X86_Q8_MATMUL_OWNER_VNNI	READ	inference/q8_runtime.rs:311	1
+CAMELID_X86_Q8_OUTPUT_AMX_PREFILL	READ	execution_plan.rs:2427	1
+CAMELID_X86_Q8_OUTPUT_DECODE_OWNER	READ	execution_plan.rs:2448	1
+CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL	READ	execution_plan.rs:2426	1
+CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT	READ	inference.rs:20612	2
+CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST	READ	inference.rs:20693	2
+CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST	READ	inference.rs:20671	2
+CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPBUSD_DOT	READ	inference.rs:20650	2
+CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT	READ	inference.rs:20627	2
+CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2	READ	inference.rs:13897	2
+CAMELID_X86_Q8_PACKED_ROWS4_MATMUL	READ	execution_plan.rs:2438	2
+CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK	READ	execution_plan.rs:2442	4
+CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE	READ	execution_plan.rs:626	3
+CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE	READ	execution_plan.rs:2450	3
+CAMELID_X86_Q8_QKV_GQA_PARALLEL_DECODE	READ	inference.rs:13139	2
+CAMELID_X86_Q8_REPACK	READ	execution_plan.rs:552	3
+CAMELID_X86_Q8_SCHED_BENCH_ITERS	READ	inference/tests.rs:6039	2
+CAMELID_ZERO_ATTENTION_DELTA	READ	inference/diagnostic_config.rs:120	2
+CAMELID_ZERO_FFN_DELTA	READ	inference/diagnostic_config.rs:120	2
