@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use self::worker::{GenerationWorker, PostError};
 use self::stream::stream_generation;
+use self::worker::{GenerationWorker, PostError};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderValue, StatusCode};
@@ -29,18 +29,25 @@ use engine_core::runtime::{
 use engine_core::{EngineError, Result as EngineResult};
 use minijinja::{context, Environment, ErrorKind as MiniJinjaErrorKind, UndefinedBehavior};
 use serde::{Deserialize, Serialize};
+use tower_http::cors::CorsLayer;
 
 const DEFAULT_MAX_TOKENS: usize = 16;
 const CHAT_TEMPLATE_NAME: &str = "embedded_chat_template";
 
-/// Contract paths currently implemented by [`router`]. This is a strict subset
-/// of `replica_contract::PUBLIC_ROUTES`; tests keep that relationship explicit.
+/// Contract paths implemented by [`router`]. Tests keep this inventory equal to
+/// `replica_contract::PUBLIC_ROUTES` so the cutover cannot silently drop a
+/// compatibility refusal route.
 pub const IMPLEMENTED_ROUTE_PATHS: &[&str] = &[
     "/v1/health",
     "/v1/models",
     "/v1/models/:model",
     "/v1/completions",
     "/v1/chat/completions",
+    "/v1/embeddings",
+    "/v1/responses",
+    "/v1/messages",
+    "/v1/rerank",
+    "/v1/reranking",
 ];
 
 /// Stable model facts needed by discovery and completion handlers.
@@ -226,6 +233,15 @@ pub fn router(backend: Arc<dyn CompletionBackend>) -> Router {
         .route("/v1/models/:model", get(model))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(unsupported_embeddings))
+        .route("/v1/responses", post(unsupported_responses))
+        .route("/v1/messages", post(unsupported_messages))
+        .route("/v1/rerank", post(unsupported_reranking))
+        .route("/v1/reranking", post(unsupported_reranking))
+        // Scope CORS to registered paths. A router-wide layer would also answer
+        // OPTIONS for private and nonexistent paths before routing can reject
+        // them, which would enlarge the public surface during cutover.
+        .route_layer(CorsLayer::permissive())
         .with_state(state)
 }
 
@@ -313,6 +329,43 @@ async fn model(AxumPath(model_id): AxumPath<String>, State(state): State<ApiStat
         "model_not_found",
         format!("model '{model_id}' is not loaded"),
         Some("model"),
+    )
+}
+
+async fn unsupported_embeddings() -> Response {
+    unsupported_route(
+        "unsupported_embeddings",
+        "embeddings are not supported yet; Camelid has no embeddings runtime or compatibility contract for this route",
+    )
+}
+
+async fn unsupported_reranking() -> Response {
+    unsupported_route(
+        "unsupported_reranking",
+        "reranking is not supported yet; Camelid has no reranking runtime or compatibility contract for this route",
+    )
+}
+
+async fn unsupported_responses() -> Response {
+    unsupported_route(
+        "unsupported_responses",
+        "OpenAI Responses compatibility is not supported yet; Camelid keeps generation on /v1/completions and /v1/chat/completions until request conversion, streaming, tool, and cancellation semantics are implemented and tested",
+    )
+}
+
+async fn unsupported_messages() -> Response {
+    unsupported_route(
+        "unsupported_messages",
+        "Anthropic Messages compatibility is not supported yet; Camelid keeps generation on /v1/completions and /v1/chat/completions until request conversion, streaming, tool, and cancellation semantics are implemented and tested",
+    )
+}
+
+fn unsupported_route(code: &'static str, message: &'static str) -> Response {
+    api_error(
+        StatusCode::NOT_IMPLEMENTED,
+        code,
+        message.to_string(),
+        Some("input"),
     )
 }
 
@@ -952,7 +1005,7 @@ mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
     use axum::http::header::CONTENT_TYPE;
-    use axum::http::Request;
+    use axum::http::{Method, Request};
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Barrier, Mutex};
@@ -1295,12 +1348,18 @@ mod tests {
     }
 
     #[test]
-    fn implemented_paths_are_a_strict_contract_subset() {
-        assert!(IMPLEMENTED_ROUTE_PATHS.len() < replica_contract::PUBLIC_ROUTES.len());
+    fn implemented_paths_are_the_entire_public_contract() {
+        assert_eq!(
+            IMPLEMENTED_ROUTE_PATHS.len(),
+            replica_contract::PUBLIC_ROUTES.len()
+        );
         for path in IMPLEMENTED_ROUTE_PATHS {
             assert!(replica_contract::PUBLIC_ROUTES
                 .iter()
                 .any(|route| route.path == *path));
+        }
+        for route in replica_contract::PUBLIC_ROUTES {
+            assert!(IMPLEMENTED_ROUTE_PATHS.contains(&route.path));
         }
     }
 
@@ -1870,13 +1929,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_and_unimplemented_routes_are_not_exposed() {
-        for path in ["/api/models/load", "/v1/embeddings"] {
+    async fn compatibility_routes_preserve_the_pinned_explicit_refusals() {
+        for (path, code, message) in [
+            (
+                "/v1/embeddings",
+                "unsupported_embeddings",
+                "embeddings are not supported yet; Camelid has no embeddings runtime or compatibility contract for this route",
+            ),
+            (
+                "/v1/responses",
+                "unsupported_responses",
+                "OpenAI Responses compatibility is not supported yet; Camelid keeps generation on /v1/completions and /v1/chat/completions until request conversion, streaming, tool, and cancellation semantics are implemented and tested",
+            ),
+            (
+                "/v1/messages",
+                "unsupported_messages",
+                "Anthropic Messages compatibility is not supported yet; Camelid keeps generation on /v1/completions and /v1/chat/completions until request conversion, streaming, tool, and cancellation semantics are implemented and tested",
+            ),
+            (
+                "/v1/rerank",
+                "unsupported_reranking",
+                "reranking is not supported yet; Camelid has no reranking runtime or compatibility contract for this route",
+            ),
+            (
+                "/v1/reranking",
+                "unsupported_reranking",
+                "reranking is not supported yet; Camelid has no reranking runtime or compatibility contract for this route",
+            ),
+        ] {
             let response = app()
-                .oneshot(Request::post(path).body(Body::empty()).unwrap())
+                .oneshot(
+                    Request::post(path)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "not_implemented", "{path}");
+            assert_eq!(body["error"]["code"], code, "{path}");
+            assert_eq!(body["error"]["message"], message, "{path}");
+            assert_eq!(body["error"]["param"], "input", "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn head_and_cors_preflight_match_the_public_contract_only() {
+        let head = app()
+            .oneshot(Request::head("/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert!(to_bytes(head.into_body(), 1024).await.unwrap().is_empty());
+
+        for route in replica_contract::PUBLIC_ROUTES {
+            let preflight = app()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::OPTIONS)
+                        .uri(route.probe_path)
+                        .header("origin", "https://client.example")
+                        .header("access-control-request-method", route.methods[0].as_str())
+                        .header("access-control-request-headers", "content-type")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(preflight.status(), StatusCode::OK, "{}", route.probe_path);
+            assert_eq!(
+                preflight.headers()["access-control-allow-origin"],
+                "*",
+                "{}",
+                route.probe_path
+            );
+            assert_eq!(
+                preflight.headers()["access-control-allow-methods"],
+                "*",
+                "{}",
+                route.probe_path
+            );
+            assert_eq!(
+                preflight.headers()["access-control-allow-headers"],
+                "*",
+                "{}",
+                route.probe_path
+            );
+        }
+
+        for method in [Method::POST, Method::OPTIONS] {
+            let response = app()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/api/models/load")
+                        .header("origin", "https://client.example")
+                        .header("access-control-request-method", "POST")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
     }
 }
