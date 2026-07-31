@@ -1,8 +1,9 @@
 # The pinned engine dependency
 
-**Status:** migration started behind an internal runtime boundary; the serving
-binary still uses the pin. Records what "un-pin the engine" actually requires,
-because the phrase is short and the work is not.
+**Status:** migration started behind an internal runtime boundary and an
+isolated HTTP adapter; the serving binary still uses the pin. Records what
+"un-pin the engine" actually requires, because the phrase is short and the
+work is not.
 
 `crates/server` depends on the inference engine by git revision:
 
@@ -81,16 +82,20 @@ one explicit seam. Because the deterministic lane *is* greedy, the absence of
 temperature and top-p sampling is not a gap for the lane this product ships.
 Per-OS kernels live in `engine-{macos,linux,windows}`.
 
-**The numerics and owned raw-completion lifecycle are largely solved. The
-in-tree serving layer does not exist.** No public route uses `LoadedModel` yet,
-so this changes no replica or gateway contract.
+**The numerics, owned raw-completion lifecycle, and first isolated serving
+slice now exist.** `crates/server/src/in_tree.rs` implements health, exact
+one-model discovery, and deterministic non-streaming `/v1/completions` behind
+a backend trait backed by `LoadedModel`. It fails closed on unsupported request
+features, enforces single-generation admission, and returns typed errors. The
+adapter is deliberately not composed into the serving binary yet, so no public
+replica or gateway route has changed.
 
 ## 5. The gap, stated plainly
 
 Missing entirely, in rough order of difficulty:
 
-- the HTTP layer — every route above
-- OpenAI request and response schemas
+- the remaining HTTP contract, including chat and compatibility routes
+- the remaining OpenAI request and response schemas beyond raw completion
 - serving model registry and concurrent load/unload/admission policy
 - SSE streaming for completions and chat
 - chat templating
@@ -98,8 +103,9 @@ Missing entirely, in rough order of difficulty:
 - reranking models — likewise
 - the agent workspace subsystem
 
-Loading and owning one immutable model for raw greedy completion is in-tree;
-the missing lifecycle work is deliberately above that boundary.
+Loading and owning one immutable model for raw greedy completion is in-tree,
+as is the first HTTP adapter over it; production composition, attribution,
+streaming, chat, and the other model families remain above that boundary.
 
 This is a program of work, not a change. Anyone estimating it from "the server
 only imports two symbols" will be wrong by an order of magnitude.
@@ -126,12 +132,14 @@ first buys most of the safety at a fraction of the cost.
 
 ## 7. How the migration proceeds
 
-The first slice is intentionally below HTTP: `engine_core::runtime::LoadedModel`
+The first slice was intentionally below HTTP: `engine_core::runtime::LoadedModel`
 provides one owned, fail-closed path from a GGUF file to deterministic raw
-completion. The pinned router remains the production surface while in-tree
-request schemas, handlers, streaming, and chat templating are built and tested
-against that runtime. This keeps the external contract unchanged during the
-port and prevents serving policy from leaking back into the numerics crate.
+completion. The next slice adds an isolated server adapter for health, exact
+model discovery, and non-streaming raw completion. The pinned router remains
+the production surface while the remaining handlers, streaming, and chat
+templating are built and tested against that runtime. This keeps the external
+contract unchanged during the port and prevents serving policy from leaking
+back into the numerics crate.
 
 There is still no route-at-a-time cutover path with the API as it stands, and
 the obvious one does not work. This section records why, so the idea is not
