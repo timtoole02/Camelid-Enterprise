@@ -1,6 +1,6 @@
 [package]
 name = "camelid-enterprise-engine-core"
-description = "Platform-neutral engine core: GGUF container parsing, model configuration, and shared types."
+description = "Platform-neutral Camelid engine: GGUF loading, tokenization, deterministic decoding, and model lifecycle."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
