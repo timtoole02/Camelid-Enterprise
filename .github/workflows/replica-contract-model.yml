@@ -64,7 +64,7 @@ jobs:
         run: >-
           cargo test --locked -p camelid-enterprise
           --test replica_contract_model
-          real_model_conforms_to_in_tree_nonstreaming_slice
+          real_model_conforms_to_in_tree_generation_slice
           -- --ignored --exact --nocapture --test-threads=1
 
       - name: Run pinned-to-in-tree generation parity gate

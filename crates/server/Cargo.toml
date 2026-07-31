@@ -15,6 +15,7 @@ path = "src/main.rs"
 # against exactly this engine version, so the pin is part of the contract.
 camelid = { git = "https://github.com/timtoole02/Camelid", rev = "b4e3a9056567ed8145fc4fa29850d6f1f261ac2b" }
 
+async-stream = "0.3"
 engine-core.workspace = true
 minijinja.workspace = true
 replica-contract.workspace = true

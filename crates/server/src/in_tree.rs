@@ -3,26 +3,32 @@
 //! This router is deliberately separate from [`crate::attributed_router`], the
 //! production router backed by the pinned Camelid dependency. It implements the
 //! first self-owned contract slice — health, exact model discovery, and
-//! deterministic non-streaming text and chat completion — so parity can be
+//! deterministic text and chat completion, including SSE — so parity can be
 //! proven before a production cutover. It must not be merged with the pinned
 //! router: axum rejects overlapping method/path registrations.
+
+mod stream;
+mod worker;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use self::worker::{GenerationWorker, PostError};
+use self::stream::stream_generation;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use engine_core::runtime::{Completion, FinishReason, LoadedModel};
+use engine_core::runtime::{
+    Completion, FinishReason, GenerationControl, IncrementalGeneration, LoadedModel, TokenDelta,
+};
 use engine_core::{EngineError, Result as EngineResult};
 use minijinja::{context, Environment, ErrorKind as MiniJinjaErrorKind, UndefinedBehavior};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
 
 const DEFAULT_MAX_TOKENS: usize = 16;
 const CHAT_TEMPLATE_NAME: &str = "embedded_chat_template";
@@ -63,11 +69,18 @@ pub struct ChatTemplate {
 
 /// Synchronous model boundary used by the HTTP adapter.
 ///
-/// Implementations run on Tokio's blocking pool. Production admission policy
-/// belongs in the server; the engine remains synchronous and host-neutral.
+/// Implementations run on the adapter's dedicated generation worker.
+/// Production admission policy belongs in the server; the engine remains
+/// synchronous and host-neutral.
 pub trait CompletionBackend: Send + Sync + 'static {
     fn descriptor(&self) -> &ModelDescriptor;
     fn complete(&self, prompt: &str, max_new_tokens: usize) -> EngineResult<Completion>;
+    fn complete_incremental(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+    ) -> EngineResult<IncrementalGeneration>;
     fn chat_template(&self) -> Option<ChatTemplate>;
     fn complete_prompt(
         &self,
@@ -76,6 +89,14 @@ pub trait CompletionBackend: Send + Sync + 'static {
         parse_special: bool,
         max_new_tokens: usize,
     ) -> EngineResult<Completion>;
+    fn complete_prompt_incremental(
+        &self,
+        prompt: &str,
+        add_special: bool,
+        parse_special: bool,
+        max_new_tokens: usize,
+        on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+    ) -> EngineResult<IncrementalGeneration>;
 }
 
 /// Adapter from the in-tree engine runtime to [`CompletionBackend`].
@@ -117,6 +138,16 @@ impl CompletionBackend for LoadedModelBackend {
         self.model.complete(prompt, max_new_tokens)
     }
 
+    fn complete_incremental(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+    ) -> EngineResult<IncrementalGeneration> {
+        self.model
+            .complete_incremental(prompt, max_new_tokens, on_token)
+    }
+
     fn chat_template(&self) -> Option<ChatTemplate> {
         let tokenizer = self.model.tokenizer();
         tokenizer.chat_template.as_ref().map(|source| ChatTemplate {
@@ -154,15 +185,29 @@ impl CompletionBackend for LoadedModelBackend {
         self.model
             .complete_prompt(prompt, add_special, parse_special, max_new_tokens)
     }
+
+    fn complete_prompt_incremental(
+        &self,
+        prompt: &str,
+        add_special: bool,
+        parse_special: bool,
+        max_new_tokens: usize,
+        on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+    ) -> EngineResult<IncrementalGeneration> {
+        self.model.complete_prompt_incremental(
+            prompt,
+            add_special,
+            parse_special,
+            max_new_tokens,
+            on_token,
+        )
+    }
 }
 
 #[derive(Clone)]
 struct ApiState {
     backend: Arc<dyn CompletionBackend>,
-    /// The deterministic lane admits one whole generation at a time. This
-    /// early adapter has no waiting queue: a concurrent request gets the same
-    /// typed overload signal the production contract already defines.
-    generation_slot: Arc<Semaphore>,
+    generation_worker: GenerationWorker,
 }
 
 /// Build the isolated in-tree contract slice.
@@ -173,7 +218,7 @@ struct ApiState {
 pub fn router(backend: Arc<dyn CompletionBackend>) -> Router {
     let state = ApiState {
         backend,
-        generation_slot: Arc::new(Semaphore::new(1)),
+        generation_worker: GenerationWorker::spawn(),
     };
     Router::new()
         .route("/v1/health", get(health))
@@ -203,7 +248,7 @@ async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {
         generation_ready: true,
         active_model_id: state.backend.descriptor().id.clone(),
         backend: "engine-core",
-        engine_queue_depth: usize::from(state.generation_slot.available_permits() == 0),
+        engine_queue_depth: state.generation_worker.depth(),
     })
 }
 
@@ -367,14 +412,6 @@ async fn completions(
             Some("prompt"),
         );
     };
-    if request.stream.unwrap_or(false) {
-        return api_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "unsupported_streaming",
-            "the in-tree completion adapter does not implement stream:true yet".to_string(),
-            Some("stream"),
-        );
-    }
     if request
         .temperature
         .is_some_and(|temperature| temperature != 0.0)
@@ -391,6 +428,15 @@ async fn completions(
         .max_tokens
         .map_or(DEFAULT_MAX_TOKENS, |value| value as usize);
     let model_id = descriptor.id.clone();
+    if request.stream.unwrap_or(false) {
+        return stream_generation(
+            &state,
+            GenerationInput::RawCompletion(prompt),
+            max_new_tokens,
+            model_id,
+            false,
+        );
+    }
     let completion = match run_generation(
         &state,
         GenerationInput::RawCompletion(prompt),
@@ -547,14 +593,6 @@ async fn chat_completions(
             Some("messages"),
         );
     }
-    if request.stream.unwrap_or(false) {
-        return api_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "unsupported_streaming",
-            "the in-tree chat adapter does not implement stream:true yet".to_string(),
-            Some("stream"),
-        );
-    }
     if request
         .temperature
         .is_some_and(|temperature| temperature != 0.0)
@@ -590,6 +628,19 @@ async fn chat_completions(
         .max_tokens
         .map_or(DEFAULT_MAX_TOKENS, |value| value as usize);
     let model_id = descriptor.id.clone();
+    if request.stream.unwrap_or(false) {
+        return stream_generation(
+            &state,
+            GenerationInput::RenderedChat {
+                prompt: rendered.text,
+                add_special: rendered.add_special,
+                parse_special: rendered.parse_special,
+            },
+            max_new_tokens,
+            model_id,
+            true,
+        );
+    }
     let completion = match run_generation(
         &state,
         GenerationInput::RenderedChat {
@@ -769,46 +820,54 @@ async fn run_generation(
     input: GenerationInput,
     max_new_tokens: usize,
 ) -> Result<Completion, Response> {
-    let permit = match Arc::clone(&state.generation_slot).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            let mut response = api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "engine_queue_full",
-                "the deterministic generation slot is busy".to_string(),
-                None,
-            );
-            response
-                .headers_mut()
-                .insert("retry-after", HeaderValue::from_static("1"));
-            return Err(response);
-        }
-    };
-
     let backend = Arc::clone(&state.backend);
-    let result = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        match input {
+    let result = state
+        .generation_worker
+        .run(move || match input {
             GenerationInput::RawCompletion(prompt) => backend.complete(&prompt, max_new_tokens),
             GenerationInput::RenderedChat {
                 prompt,
                 add_special,
                 parse_special,
             } => backend.complete_prompt(&prompt, add_special, parse_special, max_new_tokens),
-        }
-    })
-    .await;
+        })
+        .await;
 
     match result {
         Ok(Ok(completion)) => Ok(completion),
         Ok(Err(error)) => Err(engine_error(error)),
-        Err(error) => Err(api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "generation_task_failed",
-            format!("generation task failed: {error}"),
-            None,
-        )),
+        Err(error) => Err(engine_post_error(error)),
     }
+}
+
+fn engine_error_parts(error: EngineError) -> (&'static str, String) {
+    match error {
+        EngineError::ShapeMismatch(message) => ("context_length_exceeded", message),
+        other => ("generation_failed", other.to_string()),
+    }
+}
+
+fn engine_post_error(error: PostError) -> Response {
+    let (code, message) = match error {
+        PostError::Full => (
+            "engine_queue_full",
+            "the deterministic generation queue is full",
+        ),
+        PostError::Unavailable => (
+            "generation_worker_unavailable",
+            "the deterministic generation worker is unavailable",
+        ),
+    };
+    let mut response = api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        code,
+        message.to_string(),
+        None,
+    );
+    response
+        .headers_mut()
+        .insert("retry-after", HeaderValue::from_static("1"));
+    response
 }
 
 fn engine_error(error: EngineError) -> Response {
@@ -895,6 +954,7 @@ mod tests {
     use axum::http::header::CONTENT_TYPE;
     use axum::http::Request;
     use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Barrier, Mutex};
     use tower::ServiceExt;
 
@@ -934,6 +994,31 @@ mod tests {
             })
         }
 
+        fn complete_incremental(
+            &self,
+            prompt: &str,
+            max_new_tokens: usize,
+            on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+        ) -> EngineResult<IncrementalGeneration> {
+            let completion = self.complete(prompt, max_new_tokens)?;
+            for (index, token_id) in completion.generated_tokens.iter().copied().enumerate() {
+                let text = if completion.generated_tokens.len() == 1 {
+                    completion.text.clone()
+                } else {
+                    completion
+                        .text
+                        .chars()
+                        .nth(index)
+                        .map(String::from)
+                        .unwrap_or_default()
+                };
+                if on_token(TokenDelta { token_id, text }) == GenerationControl::Cancel {
+                    return Ok(IncrementalGeneration::Cancelled);
+                }
+            }
+            Ok(IncrementalGeneration::Completed(completion))
+        }
+
         fn chat_template(&self) -> Option<ChatTemplate> {
             Some(ChatTemplate {
                 source: concat!(
@@ -961,12 +1046,24 @@ mod tests {
         ) -> EngineResult<Completion> {
             self.complete(prompt, max_new_tokens)
         }
+
+        fn complete_prompt_incremental(
+            &self,
+            prompt: &str,
+            _add_special: bool,
+            _parse_special: bool,
+            max_new_tokens: usize,
+            on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+        ) -> EngineResult<IncrementalGeneration> {
+            self.complete_incremental(prompt, max_new_tokens, on_token)
+        }
     }
 
     struct BlockingBackend {
         descriptor: ModelDescriptor,
         started: Arc<Barrier>,
         release: Arc<Barrier>,
+        block_first: Arc<AtomicBool>,
     }
 
     struct TemplateBackend {
@@ -983,6 +1080,15 @@ mod tests {
             unreachable!("template refusal tests must stop before generation")
         }
 
+        fn complete_incremental(
+            &self,
+            _prompt: &str,
+            _max_new_tokens: usize,
+            _on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+        ) -> EngineResult<IncrementalGeneration> {
+            unreachable!("template refusal tests must stop before generation")
+        }
+
         fn chat_template(&self) -> Option<ChatTemplate> {
             self.template.clone()
         }
@@ -996,6 +1102,17 @@ mod tests {
         ) -> EngineResult<Completion> {
             unreachable!("template refusal tests must stop before generation")
         }
+
+        fn complete_prompt_incremental(
+            &self,
+            _prompt: &str,
+            _add_special: bool,
+            _parse_special: bool,
+            _max_new_tokens: usize,
+            _on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+        ) -> EngineResult<IncrementalGeneration> {
+            unreachable!("template refusal tests must stop before generation")
+        }
     }
 
     impl CompletionBackend for BlockingBackend {
@@ -1004,14 +1121,33 @@ mod tests {
         }
 
         fn complete(&self, _prompt: &str, _max_new_tokens: usize) -> EngineResult<Completion> {
-            self.started.wait();
-            self.release.wait();
+            if self.block_first.swap(false, Ordering::SeqCst) {
+                self.started.wait();
+                self.release.wait();
+            }
             Ok(Completion {
                 prompt_tokens: vec![10],
                 generated_tokens: vec![20],
                 text: "x".to_string(),
                 finish_reason: FinishReason::Length,
             })
+        }
+
+        fn complete_incremental(
+            &self,
+            prompt: &str,
+            max_new_tokens: usize,
+            on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+        ) -> EngineResult<IncrementalGeneration> {
+            let completion = self.complete(prompt, max_new_tokens)?;
+            if on_token(TokenDelta {
+                token_id: 20,
+                text: "x".to_string(),
+            }) == GenerationControl::Cancel
+            {
+                return Ok(IncrementalGeneration::Cancelled);
+            }
+            Ok(IncrementalGeneration::Completed(completion))
         }
 
         fn chat_template(&self) -> Option<ChatTemplate> {
@@ -1026,6 +1162,83 @@ mod tests {
             max_new_tokens: usize,
         ) -> EngineResult<Completion> {
             self.complete(prompt, max_new_tokens)
+        }
+
+        fn complete_prompt_incremental(
+            &self,
+            prompt: &str,
+            _add_special: bool,
+            _parse_special: bool,
+            max_new_tokens: usize,
+            on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+        ) -> EngineResult<IncrementalGeneration> {
+            self.complete_incremental(prompt, max_new_tokens, on_token)
+        }
+    }
+
+    struct StreamingBackend {
+        descriptor: ModelDescriptor,
+        produced: Arc<AtomicUsize>,
+    }
+
+    impl CompletionBackend for StreamingBackend {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn complete(&self, _prompt: &str, _max_new_tokens: usize) -> EngineResult<Completion> {
+            unreachable!("the streaming test must use complete_incremental")
+        }
+
+        fn complete_incremental(
+            &self,
+            _prompt: &str,
+            max_new_tokens: usize,
+            on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+        ) -> EngineResult<IncrementalGeneration> {
+            let mut generated_count = 0;
+            for _ in 0..max_new_tokens {
+                self.produced.fetch_add(1, Ordering::SeqCst);
+                generated_count += 1;
+                if on_token(TokenDelta {
+                    token_id: 20,
+                    text: "x".to_string(),
+                }) == GenerationControl::Cancel
+                {
+                    return Ok(IncrementalGeneration::Cancelled);
+                }
+            }
+            Ok(IncrementalGeneration::Completed(Completion {
+                prompt_tokens: vec![10],
+                generated_tokens: vec![20; generated_count],
+                text: "x".repeat(generated_count),
+                finish_reason: FinishReason::Length,
+            }))
+        }
+
+        fn chat_template(&self) -> Option<ChatTemplate> {
+            None
+        }
+
+        fn complete_prompt(
+            &self,
+            _prompt: &str,
+            _add_special: bool,
+            _parse_special: bool,
+            _max_new_tokens: usize,
+        ) -> EngineResult<Completion> {
+            unreachable!("the streaming test uses raw completion")
+        }
+
+        fn complete_prompt_incremental(
+            &self,
+            _prompt: &str,
+            _add_special: bool,
+            _parse_special: bool,
+            _max_new_tokens: usize,
+            _on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+        ) -> EngineResult<IncrementalGeneration> {
+            unreachable!("the streaming test uses raw completion")
         }
     }
 
@@ -1054,6 +1267,17 @@ mod tests {
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, headers, body)
+    }
+
+    async fn health_depth(app: Router) -> usize {
+        let response = app
+            .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()["engine_queue_depth"]
+            .as_u64()
+            .unwrap() as usize
     }
 
     fn post(body: Value) -> Request<Body> {
@@ -1175,6 +1399,15 @@ mod tests {
                 unreachable!("the chat route must use complete_prompt")
             }
 
+            fn complete_incremental(
+                &self,
+                _prompt: &str,
+                _max_new_tokens: usize,
+                _on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+            ) -> EngineResult<IncrementalGeneration> {
+                unreachable!("the chat route must use complete_prompt_incremental")
+            }
+
             fn chat_template(&self) -> Option<ChatTemplate> {
                 FakeBackend {
                     descriptor: self.descriptor.clone(),
@@ -1197,6 +1430,30 @@ mod tests {
                     text: "answer".to_string(),
                     finish_reason: FinishReason::EndOfGeneration,
                 })
+            }
+
+            fn complete_prompt_incremental(
+                &self,
+                prompt: &str,
+                add_special: bool,
+                parse_special: bool,
+                max_new_tokens: usize,
+                on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+            ) -> EngineResult<IncrementalGeneration> {
+                let completion = self.complete_prompt(
+                    prompt,
+                    add_special,
+                    parse_special,
+                    max_new_tokens,
+                )?;
+                if on_token(TokenDelta {
+                    token_id: 4,
+                    text: completion.text.clone(),
+                }) == GenerationControl::Cancel
+                {
+                    return Ok(IncrementalGeneration::Cancelled);
+                }
+                Ok(IncrementalGeneration::Completed(completion))
             }
         }
 
@@ -1303,11 +1560,6 @@ mod tests {
     async fn unsupported_chat_shapes_fail_closed() {
         let cases = [
             (
-                json!({"messages":[{"role":"user","content":"hi"}],"stream":true}),
-                StatusCode::NOT_IMPLEMENTED,
-                "unsupported_streaming",
-            ),
-            (
                 json!({"messages":[{"role":"user","content":"hi"}],"temperature":0.5}),
                 StatusCode::BAD_REQUEST,
                 "unsupported_sampling",
@@ -1380,11 +1632,6 @@ mod tests {
                 "model_not_found",
             ),
             (
-                json!({"prompt":"hi","stream":true}),
-                StatusCode::NOT_IMPLEMENTED,
-                "unsupported_streaming",
-            ),
-            (
                 json!({"prompt":"hi","temperature":0.5}),
                 StatusCode::BAD_REQUEST,
                 "unsupported_sampling",
@@ -1407,6 +1654,134 @@ mod tests {
         }
     }
 
+    fn data_events(body: &str) -> Vec<&str> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn raw_and_chat_streams_emit_openai_chunks_and_done() {
+        let raw = app()
+            .oneshot(post(json!({
+                "model":"test-model",
+                "prompt":"hi",
+                "max_tokens":2,
+                "stream":true
+            })))
+            .await
+            .unwrap();
+        assert_eq!(raw.status(), StatusCode::OK);
+        assert!(raw.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
+        let bytes = to_bytes(raw.into_body(), 1024 * 1024).await.unwrap();
+        let raw = String::from_utf8(bytes.to_vec()).unwrap();
+        let events = data_events(&raw);
+        assert_eq!(events.last(), Some(&"[DONE]"));
+        let chunks = events[..events.len() - 1]
+            .iter()
+            .map(|event| serde_json::from_str::<Value>(event).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk["object"] == "text_completion"));
+        assert_eq!(chunks[0]["choices"][0]["text"], "x");
+        assert_eq!(chunks[1]["choices"][0]["text"], "x");
+        assert_eq!(chunks[2]["choices"][0]["text"], "");
+        assert_eq!(chunks[2]["choices"][0]["finish_reason"], "length");
+
+        let chat = app()
+            .oneshot(post_chat(json!({
+                "model":"test-model",
+                "messages":[{"role":"user","content":"hi"}],
+                "max_tokens":2,
+                "stream":true
+            })))
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), StatusCode::OK);
+        assert!(chat.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
+        let bytes = to_bytes(chat.into_body(), 1024 * 1024).await.unwrap();
+        let chat = String::from_utf8(bytes.to_vec()).unwrap();
+        let events = data_events(&chat);
+        assert_eq!(events.last(), Some(&"[DONE]"));
+        let chunks = events[..events.len() - 1]
+            .iter()
+            .map(|event| serde_json::from_str::<Value>(event).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 4);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk["object"] == "chat.completion.chunk"));
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "x");
+        assert_eq!(chunks[2]["choices"][0]["delta"]["content"], "x");
+        assert_eq!(chunks[3]["choices"][0]["delta"], json!({}));
+        assert_eq!(chunks[3]["choices"][0]["finish_reason"], "length");
+    }
+
+    #[tokio::test]
+    async fn an_engine_error_after_sse_headers_is_a_typed_terminal_event() {
+        let response = app()
+            .oneshot(post(json!({
+                "prompt":"overflow",
+                "max_tokens":1,
+                "stream":true
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("event: error"));
+        let events = data_events(&body);
+        assert_eq!(events.last(), Some(&"[DONE]"));
+        let error: Value = serde_json::from_str(events[0]).unwrap();
+        assert_eq!(error["error"]["type"], "server_error");
+        assert_eq!(error["error"]["code"], "context_length_exceeded");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_backpressured_stream_cancels_generation() {
+        let produced = Arc::new(AtomicUsize::new(0));
+        let app = router(Arc::new(StreamingBackend {
+            descriptor: test_descriptor(),
+            produced: Arc::clone(&produced),
+        }));
+        let response = app
+            .clone()
+            .oneshot(post(json!({"prompt":"hi","max_tokens":100,"stream":true})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while produced.load(Ordering::SeqCst) < 33 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "producer never reached the bounded event queue"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(produced.load(Ordering::SeqCst), 33);
+
+        drop(response);
+        while health_depth(app.clone()).await != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "generation worker did not recover after stream drop"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(produced.load(Ordering::SeqCst) < 100);
+    }
+
     #[tokio::test]
     async fn malformed_json_and_engine_context_errors_are_typed() {
         let malformed = Request::post("/v1/completions")
@@ -1424,7 +1799,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_generation_is_rejected_without_queueing() {
+    async fn generation_queue_is_bounded_and_reports_its_depth() {
         let started = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         let app = router(Arc::new(BlockingBackend {
@@ -1439,6 +1814,7 @@ mod tests {
             },
             started: Arc::clone(&started),
             release: Arc::clone(&release),
+            block_first: Arc::new(AtomicBool::new(true)),
         }));
 
         let first_app = app.clone();
@@ -1450,9 +1826,30 @@ mod tests {
         });
         started.wait();
 
+        let mut queued = tokio::task::JoinSet::new();
+        for index in 0..8 {
+            let app = app.clone();
+            queued.spawn(async move {
+                app.oneshot(post(json!({
+                    "prompt":format!("queued-{index}"),
+                    "max_tokens":1
+                })))
+                .await
+                .unwrap()
+            });
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while health_depth(app.clone()).await != 9 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "all eight waiting jobs were not admitted"
+            );
+            tokio::task::yield_now().await;
+        }
+
         let busy = app
             .clone()
-            .oneshot(post(json!({"prompt":"second","max_tokens":1})))
+            .oneshot(post(json!({"prompt":"overflow","max_tokens":1})))
             .await
             .unwrap();
         assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1462,16 +1859,14 @@ mod tests {
         assert_eq!(body["error"]["type"], "runtime_unavailable");
         assert_eq!(body["error"]["code"], "engine_queue_full");
 
-        let health = app
-            .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let bytes = to_bytes(health.into_body(), 1024 * 1024).await.unwrap();
-        let health: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(health["engine_queue_depth"], 1);
+        assert_eq!(health_depth(app.clone()).await, 9);
 
         release.wait();
         assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        while let Some(response) = queued.join_next().await {
+            assert_eq!(response.unwrap().status(), StatusCode::OK);
+        }
+        assert_eq!(health_depth(app).await, 0);
     }
 
     #[tokio::test]

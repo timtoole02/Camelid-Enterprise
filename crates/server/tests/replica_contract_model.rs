@@ -645,14 +645,14 @@ async fn in_tree_generation_matches_pinned_engine() {
 /// The isolated in-tree router is intentionally not the production surface
 /// yet, so the production conformance test above cannot exercise it. This leg
 /// loads the same independently verified GGUF through `engine-core` and proves
-/// the non-streaming adapter's real model discovery, raw-tokenization, embedded
-/// chat-template rendering, special-token parsing, context admission, and
-/// fail-closed surface. A zero generation budget keeps this a contract test,
-/// not a second multi-minute inference benchmark; numerics remain covered by
-/// the engine's deterministic forward fixtures.
+/// real model discovery, raw tokenization, embedded chat-template rendering,
+/// special-token parsing, context admission, SSE framing, and the fail-closed
+/// surface. A zero generation budget keeps the HTTP checks contractual rather
+/// than turning them into a second multi-minute inference benchmark; numerics
+/// and incremental equality are asserted immediately after load.
 #[tokio::test]
 #[ignore = "requires CAMELID_ENTERPRISE_TEST_MODEL to name a compatible local GGUF"]
-async fn real_model_conforms_to_in_tree_nonstreaming_slice() {
+async fn real_model_conforms_to_in_tree_generation_slice() {
     let model = test_model_path();
     let loaded = LoadedModel::load(&model).expect("the in-tree runtime must load the pinned GGUF");
     let context_length = loaded.config().context_length;
@@ -773,16 +773,31 @@ async fn real_model_conforms_to_in_tree_nonstreaming_slice() {
             json!({
                 "model": model_id,
                 "messages": [{"role":"user","content":"Reply briefly."}],
+                "max_tokens": 0,
                 "stream": true
             }),
         ),
     )
     .await;
-    assert_eq!(streaming.status(), StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(
-        body_json(streaming).await["error"]["code"],
-        "unsupported_streaming"
-    );
+    assert_eq!(streaming.status(), StatusCode::OK);
+    assert!(streaming.headers()[CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    let bytes = to_bytes(streaming.into_body(), 1024 * 1024).await.unwrap();
+    let stream = String::from_utf8(bytes.to_vec()).unwrap();
+    let events = stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .collect::<Vec<_>>();
+    assert_eq!(events.last(), Some(&"[DONE]"));
+    assert_eq!(events.len(), 3, "expected role, finish, and [DONE]: {stream}");
+    let role: Value = serde_json::from_str(events[0]).unwrap();
+    let finish: Value = serde_json::from_str(events[1]).unwrap();
+    assert_eq!(role["object"], "chat.completion.chunk");
+    assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(finish["choices"][0]["delta"], json!({}));
+    assert_eq!(finish["choices"][0]["finish_reason"], "length");
 
     for path in ["/api/models/load", "/v1/embeddings"] {
         let response = send(app.clone(), post_json(path, json!({}))).await;
