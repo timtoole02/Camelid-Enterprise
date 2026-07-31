@@ -14,7 +14,7 @@ pub mod compute;
 pub mod kv_cache;
 pub mod rope;
 
-pub use compute::{argmax, Decoder};
+pub use compute::{argmax, DecodeControl, DecodeOutput, DecodeStopReason, Decoder};
 pub use kv_cache::{f16_to_f32_kv, f32_to_f16_kv, LlamaKvCache, LlamaKvCachePlan};
 pub use rope::{apply_rope, RopePairing};
 

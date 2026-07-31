@@ -21,7 +21,7 @@ use camelid_enterprise::{
     apply_deterministic, load_startup_model, replica_router, Attribution, ModelIdentity,
     WorkerThreads,
 };
-use engine_core::runtime::LoadedModel;
+use engine_core::runtime::{GenerationControl, IncrementalGeneration, LoadedModel};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -656,6 +656,22 @@ async fn real_model_conforms_to_in_tree_nonstreaming_slice() {
     let model = test_model_path();
     let loaded = LoadedModel::load(&model).expect("the in-tree runtime must load the pinned GGUF");
     let context_length = loaded.config().context_length;
+    let incremental_prompt = "Complete this sentence: The capital of France is";
+    let blocking = loaded
+        .complete(incremental_prompt, 2)
+        .expect("blocking generation must establish the incremental oracle");
+    let mut incremental_text = String::new();
+    let incremental = loaded
+        .complete_incremental(incremental_prompt, 2, |delta| {
+            incremental_text.push_str(&delta.text);
+            GenerationControl::Continue
+        })
+        .expect("incremental generation must complete");
+    assert_eq!(
+        incremental,
+        IncrementalGeneration::Completed(blocking.clone())
+    );
+    assert_eq!(incremental_text, blocking.text);
     let model_id = model.file_name().unwrap().to_string_lossy().into_owned();
     let backend = LoadedModelBackend::new(model_id.clone(), loaded)
         .expect("the model filename is a valid discovery id");

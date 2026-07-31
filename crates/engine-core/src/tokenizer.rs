@@ -260,6 +260,53 @@ pub struct Tokenizer {
     pub chat_template: Option<String>,
 }
 
+/// Stateful token-to-text decoder for incremental generation.
+///
+/// A token can end in the middle of a multi-byte UTF-8 character. Decoding
+/// each token independently would either lose those bytes or emit replacement
+/// characters. This decoder instead re-decodes the accumulated ids and emits
+/// only the newly valid suffix, so concatenating its deltas is byte-identical
+/// to [`Tokenizer::decode`] over the same complete sequence.
+pub struct IncrementalDecoder<'tokenizer> {
+    tokenizer: &'tokenizer Tokenizer,
+    token_ids: Vec<TokenId>,
+    emitted: String,
+    remove_special: bool,
+}
+
+impl IncrementalDecoder<'_> {
+    /// Add one token and return the newly decodable text suffix.
+    pub fn push(&mut self, token_id: TokenId) -> Result<String> {
+        self.token_ids.push(token_id);
+        let decoded = match self.tokenizer.decode(&self.token_ids, self.remove_special) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.token_ids.pop();
+                return Err(error);
+            }
+        };
+        let Some(delta) = decoded.strip_prefix(&self.emitted) else {
+            self.token_ids.pop();
+            return Err(EngineError::InvalidTokenizerMetadata(
+                "incremental decode changed an already-emitted text prefix".to_string(),
+            ));
+        };
+        let delta = delta.to_string();
+        self.emitted = decoded;
+        Ok(delta)
+    }
+
+    /// Token ids accepted by this decoder so far.
+    pub fn token_ids(&self) -> &[TokenId] {
+        &self.token_ids
+    }
+
+    /// Full valid text emitted so far.
+    pub fn text(&self) -> &str {
+        &self.emitted
+    }
+}
+
 /// The Llama-3 tokenizer's special-token signature. Llama 3 / 3.1 / 3.2 all
 /// place these five stable chat markers at these exact ids in a 128,256-token
 /// vocab, and no other tokenizer family does — so a GPT-2/BPE GGUF carrying
@@ -300,6 +347,16 @@ fn resolve_gpt2_pre_tokenizer(
 }
 
 impl Tokenizer {
+    /// Create a stateful decoder for token-by-token generation.
+    pub fn incremental_decoder(&self, remove_special: bool) -> IncrementalDecoder<'_> {
+        IncrementalDecoder {
+            tokenizer: self,
+            token_ids: Vec::new(),
+            emitted: String::new(),
+            remove_special,
+        }
+    }
+
     /// Build a tokenizer from a parsed GGUF header. Fails closed: an unknown
     /// tokenizer model, an unknown pre-tokenizer, malformed metadata arrays,
     /// or an out-of-range special id all refuse construction.
@@ -1353,9 +1410,11 @@ fn flush_bytes(bytes: &mut Vec<u8>, text: &mut String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bpe_pretokenize, bpe_pretokenize_with, is_chat_control_marker, is_mark, BpeRegistry, Token,
-        TokenKind,
+        bpe_byte_to_char, bpe_pretokenize, bpe_pretokenize_with, is_chat_control_marker, is_mark,
+        BpePreTokenizer, BpeRegistry, SpecialTokens, Token, TokenKind, Tokenizer, TokenizerConfig,
+        TokenizerModel,
     };
+    use std::collections::HashMap;
 
     fn tok(text: &str, kind: TokenKind) -> Token {
         Token {
@@ -1364,6 +1423,64 @@ mod tests {
             score: 0.0,
             kind,
         }
+    }
+
+    #[test]
+    fn incremental_decode_holds_partial_utf8_and_omits_control_tokens() {
+        let mut tokens = [0xf0, 0x9f, 0xa6, 0x99, b'!']
+            .into_iter()
+            .enumerate()
+            .map(|(id, byte)| Token {
+                id: id as u32,
+                text: bpe_byte_to_char(byte).to_string(),
+                score: 0.0,
+                kind: TokenKind::Normal,
+            })
+            .collect::<Vec<_>>();
+        tokens.push(Token {
+            id: 5,
+            text: "<|eot_id|>".to_string(),
+            score: 0.0,
+            kind: TokenKind::Control,
+        });
+        let tokenizer = Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::Llama3,
+            token_to_id: tokens
+                .iter()
+                .map(|token| (token.text.clone(), token.id))
+                .collect::<HashMap<_, _>>(),
+            tokens,
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens {
+                eot: Some(5),
+                ..SpecialTokens::default()
+            },
+            config: TokenizerConfig {
+                add_bos: false,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: None,
+        };
+        let mut decoder = tokenizer.incremental_decoder(true);
+
+        assert_eq!(decoder.push(0).unwrap(), "");
+        assert_eq!(decoder.push(1).unwrap(), "");
+        assert_eq!(decoder.push(2).unwrap(), "");
+        assert_eq!(decoder.push(3).unwrap(), "🦙");
+        assert_eq!(decoder.push(4).unwrap(), "!");
+        assert_eq!(decoder.push(5).unwrap(), "");
+        assert_eq!(decoder.token_ids(), &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(decoder.text(), "🦙!");
+        assert_eq!(
+            decoder.text(),
+            tokenizer.decode(decoder.token_ids(), true).unwrap()
+        );
     }
 
     #[test]
