@@ -6,6 +6,12 @@
 
 /* ---- Camelid mark / Avatar ---- */
 .camelid-mark { display: block; }
+/* The eye is a hole in the source mark, so it has to be painted in whatever
+   surface sits behind the glyph. --color-bg is right for the page; anything that
+   draws the mark on its own background overrides this one variable rather than
+   passing a prop down through every call site. */
+.camelid-mark__eye { fill: var(--camelid-mark-eye, var(--color-bg)); }
+.camelid-avatar { --camelid-mark-eye: var(--color-surface); }
 .camelid-mark__ear { transform-box: fill-box; transform-origin: 50% 100%; transition: transform 130ms var(--ease-standard); }
 .camelid-mark[data-state='awaiting'] { animation: camelidMarkBreathe 2.2s var(--ease-standard) infinite; }
 @keyframes camelidMarkBreathe {
