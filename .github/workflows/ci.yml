@@ -34,6 +34,12 @@ jobs:
   # never once run against that backend.
   windows-check:
     runs-on: windows-latest
+    # The pinned engine contains evidence paths that reach 262 characters under
+    # the runner's default C:\Users\runneradmin\.cargo checkout root. Keep the
+    # dependency cache on a short drive-root path so Cargo can fetch it before
+    # this job reaches any of our Windows code.
+    env:
+      CARGO_HOME: D:\c
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
