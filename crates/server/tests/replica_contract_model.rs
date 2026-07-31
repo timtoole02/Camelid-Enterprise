@@ -799,8 +799,19 @@ async fn real_model_conforms_to_in_tree_generation_slice() {
     assert_eq!(finish["choices"][0]["delta"], json!({}));
     assert_eq!(finish["choices"][0]["finish_reason"], "length");
 
-    for path in ["/api/models/load", "/v1/embeddings"] {
-        let response = send(app.clone(), post_json(path, json!({}))).await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
-    }
+    // The control plane is not served at all, so its paths do not resolve. The
+    // compatibility routes are registered and refuse explicitly instead, which
+    // is the distinction a shared 404 would collapse: a client can tell "this
+    // replica will never serve embeddings" from "this build has not heard of
+    // the route". The exact codes and messages are pinned by the unit test
+    // `compatibility_routes_preserve_the_pinned_explicit_refusals`; what this
+    // adds is that a real loaded model does not change the answer.
+    let absent = send(app.clone(), post_json("/api/models/load", json!({}))).await;
+    assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+
+    let embeddings = send(app, post_json("/v1/embeddings", json!({}))).await;
+    assert_eq!(embeddings.status(), StatusCode::NOT_IMPLEMENTED);
+    let refusal = body_json(embeddings).await;
+    assert_eq!(refusal["error"]["type"], "not_implemented");
+    assert_eq!(refusal["error"]["code"], "unsupported_embeddings");
 }
