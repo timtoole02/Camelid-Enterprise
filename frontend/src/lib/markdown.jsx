@@ -214,7 +214,13 @@ const renderMarkdownText = (text, keyPrefix) => {
       }
       return
     }
-    const listItem = line.match(/^[-*]\s+(.+)$/)
+    /* Literal bullet characters count as list markers, not just the markdown
+       spellings. Models emit `•` directly and often — asked for a bulleted
+       list, Llama 3.2 answers with `• Red\n• Blue\n• Yellow` rather than
+       `- Red`. Matching only [-*] sent those lines to the paragraph
+       accumulator, which joins on a space, so a three-item list rendered as one
+       run-on line with bullets stranded mid-sentence. */
+    const listItem = line.match(/^[-*•‣·▪]\s+(.+)$/)
     if (listItem) {
       flushParagraph()
       if (!list.length) flushList()
