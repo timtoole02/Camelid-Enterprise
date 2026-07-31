@@ -3558,3 +3558,240 @@ async fn forwards_exactly_the_public_contract_routes() {
         );
     }
 }
+
+/// `/auth/whoami` reports the identity the gateway resolved, and reports it from
+/// the token rather than from anything the caller said about itself.
+///
+/// The assertion that matters is on the *values*: a console renders these, and a
+/// console that renders a self-asserted principal shows something that no
+/// downstream authorization, quota key or audit line agrees with.
+#[tokio::test]
+async fn whoami_reports_the_principal_and_organization_the_token_resolves_to() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let organization = store.create_organization("acme").unwrap();
+    let principal = store
+        .create_user_in_organization("ada", &organization)
+        .unwrap();
+    let token = store
+        .issue_token_for_organization(&principal, &organization, TokenLifetime::Never)
+        .unwrap();
+
+    let unreachable_upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let gateway = spawn_gateway_with_auth(
+        unreachable_upstream,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: None,
+        },
+    )
+    .await;
+
+    let request = Request::get(format!("http://{}/auth/whoami", gateway.addr))
+        // Deliberately present, deliberately ignored: a client that tries to
+        // tell the gateway who it is must not be able to influence the answer.
+        .header("x-camelid-principal-id", "usr_someone_else")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = client().request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(Body::new(response.into_body()), 4096).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["authentication"], "required");
+    assert_eq!(body["principal_id"], principal.as_str());
+    assert_eq!(body["organization_id"], organization.as_str());
+}
+
+/// The endpoint is a credential check, so it refuses exactly the way every other
+/// credential check does. A console branches on `error.type` and honors
+/// `WWW-Authenticate`; both have to mean the same thing here as on `/v1/models`.
+#[tokio::test]
+async fn whoami_refuses_a_missing_token_the_same_way_a_proxied_route_does() {
+    let store = Arc::new(SqliteIdentityStore::open_in_memory().unwrap());
+    let unreachable_upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let gateway = spawn_gateway_with_auth(
+        unreachable_upstream,
+        GatewayAuth::RequireToken {
+            store,
+            quota: None,
+            usage: None,
+        },
+    )
+    .await;
+
+    let request = Request::get(format!("http://{}/auth/whoami", gateway.addr))
+        .body(Body::empty())
+        .unwrap();
+    let response = client().request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()["www-authenticate"], "Bearer");
+    assert_eq!(
+        to_bytes(Body::new(response.into_body()), 1024)
+            .await
+            .unwrap(),
+        r#"{"error":{"message":"missing bearer token","type":"unauthorized"}}"#
+    );
+}
+
+/// An expired credential stays distinguishable from one that was never valid.
+///
+/// This is the whole reason a client would call this endpoint on a schedule
+/// rather than once: `token_expired` is the case where the correct action is to
+/// obtain a new credential rather than to re-present this one.
+#[tokio::test]
+async fn whoami_reports_an_expired_token_as_expired_not_merely_unauthorized() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let expired = store
+        .issue_token(&principal, TokenLifetime::Until(identity::unix_now() - 1))
+        .unwrap();
+
+    let unreachable_upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let gateway = spawn_gateway_with_auth(
+        unreachable_upstream,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: None,
+        },
+    )
+    .await;
+
+    let request = Request::get(format!("http://{}/auth/whoami", gateway.addr))
+        .header("authorization", format!("Bearer {expired}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = client().request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = to_bytes(Body::new(response.into_body()), 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "token_expired");
+}
+
+/// A revoked credential stops resolving, which is what makes sign-out and
+/// operator revocation actually mean something to a console holding the token.
+#[tokio::test]
+async fn whoami_stops_resolving_a_revoked_token() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
+    store.revoke_token(&token).unwrap();
+
+    let unreachable_upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let gateway = spawn_gateway_with_auth(
+        unreachable_upstream,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: None,
+        },
+    )
+    .await;
+
+    let request = Request::get(format!("http://{}/auth/whoami", gateway.addr))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = client().request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// With authentication disabled the endpoint answers rather than 404s, so a
+/// console can tell "this deployment has auth off" from "this gateway predates
+/// the route". Guessing between those two decides whether the console demands a
+/// credential nobody can mint, or assumes none is needed.
+#[tokio::test]
+async fn whoami_says_authentication_is_disabled_rather_than_pretending_to_be_absent() {
+    let unreachable_upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let gateway = spawn_gateway_with_auth(unreachable_upstream, GatewayAuth::Disabled).await;
+
+    let request = Request::get(format!("http://{}/auth/whoami", gateway.addr))
+        .body(Body::empty())
+        .unwrap();
+    let response = client().request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(Body::new(response.into_body()), 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["authentication"], "disabled");
+    // No identity is invented to fill the shape out.
+    assert!(body["principal_id"].is_null());
+    assert!(body["organization_id"].is_null());
+}
+
+/// The endpoint is the gateway's own: it is answered locally and never becomes a
+/// replica's problem. A replica has no identity store, and the request-id
+/// indirection exists precisely so it stays identity-blind.
+#[tokio::test]
+async fn whoami_is_never_forwarded_to_a_replica() {
+    let store = SqliteIdentityStore::open_in_memory().unwrap();
+    let principal = store.create_user("ada").unwrap();
+    let token = store.issue_token(&principal, TokenLifetime::Never).unwrap();
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_server(
+        Router::new()
+            .fallback(any(capture_request))
+            .with_state(Arc::clone(&captured)),
+    )
+    .await;
+    let gateway = spawn_gateway_with_auth(
+        upstream.addr,
+        GatewayAuth::RequireToken {
+            store: Arc::new(store),
+            quota: None,
+            usage: None,
+        },
+    )
+    .await;
+
+    let request = Request::get(format!("http://{}/auth/whoami", gateway.addr))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = client().request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        captured.lock().unwrap().is_none(),
+        "the gateway forwarded its own identity endpoint to a replica"
+    );
+}
+
+/// `/auth/whoami` is the gateway's, not the replica's: it must not have leaked
+/// into the published route registry, where its presence would make every
+/// replica advertise an identity surface it does not have and cannot serve.
+#[test]
+fn whoami_is_absent_from_the_published_replica_contract() {
+    assert!(
+        !replica_contract::PUBLIC_ROUTES
+            .iter()
+            .any(|route| route.path.starts_with("/auth")),
+        "an identity route reached the replica contract"
+    );
+}

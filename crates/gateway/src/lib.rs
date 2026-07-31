@@ -1029,9 +1029,13 @@ fn router_with_routing_options(
     audit: Option<Arc<GatewayLog>>,
 ) -> Router {
     let client = http_client();
-    // `/healthz` is the gateway's own liveness probe, not part of the replica
-    // contract, so it is registered explicitly and answered locally.
-    let mut router = Router::new().route("/healthz", get(gateway_health));
+    // `/healthz` is the gateway's own liveness probe and `/auth/whoami` reports
+    // the caller's resolved identity: both are the gateway's own, not part of
+    // the replica contract, so they are registered explicitly and answered
+    // locally rather than being derived from the contractual route set.
+    let mut router = Router::new()
+        .route("/healthz", get(gateway_health))
+        .route("/auth/whoami", get(gateway_whoami));
     for spec in replica_contract::contractual_routes() {
         router = router.route(spec.path, proxy_methods(spec));
     }
@@ -1067,6 +1071,129 @@ fn http_client() -> Client<HttpConnector, Body> {
 
 async fn gateway_health() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+/// Reports the identity the gateway resolved for the caller's own credential.
+///
+/// Gateway-local like [`gateway_health`], and deliberately not in
+/// `replica-contract`: it answers from the identity store this process owns, it
+/// never reaches a replica, and a replica has no identity to report — staying
+/// identity-blind is the property the request-id indirection exists to protect.
+///
+/// # Why this exists at all
+///
+/// A console has to render *who you are*, and the only alternative to asking the
+/// server is for the client to assert it. That is not a weaker version of this
+/// endpoint, it is a different and false claim: a principal id typed into a text
+/// field describes whoever typed it, and the token it travels beside is what
+/// actually decides every downstream authorization, quota key and audit line. Two
+/// identities for one session, disagreeing silently, with the displayed one wrong
+/// in exactly the cases that matter. The value here is the resolved token's, or
+/// there is no value.
+///
+/// It adds no unauthenticated surface. Every refusal is the one
+/// [`AuthRefusal`] already produces for a proxied route, so a client branches on
+/// the same `error.type` and honors the same `WWW-Authenticate` challenge here as
+/// everywhere else, and `token_expired` stays distinguishable from a credential
+/// that was never valid.
+///
+/// # The disabled case answers rather than 404s
+///
+/// Under [`GatewayAuth::Disabled`] there is no identity to report and the honest
+/// answer is to say so, not to pretend the route is absent. A console that cannot
+/// tell "auth is off" from "this gateway is too old to have the route" is a
+/// console that must either demand a token no operator can mint or assume one is
+/// unnecessary; both are guesses about the deployment's security posture, and the
+/// second guesses in the unsafe direction. This discloses nothing a caller could
+/// not establish in one request to any forwarded route, which in that mode
+/// answers without a credential.
+///
+/// The audit record is written for the same reason it is written for a refused
+/// proxy request: this is where a client's credential gets checked, so a burst of
+/// failures against it is exactly the signal an operator needs, and an
+/// unaudited credential check is a blind spot in the one place brute force is
+/// cheapest. It is deliberately *not* written to the usage log — that sink is
+/// transport accounting for served inference, and nothing was served.
+async fn gateway_whoami(State(state): State<GatewayState>, request: Request) -> Response {
+    let started_ts = unix_timestamp();
+    let started_at = Instant::now();
+    let request_id = mint_request_id();
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+
+    let store = match &state.auth {
+        GatewayAuth::RequireToken { store, .. } => store,
+        GatewayAuth::Disabled => {
+            return audited(
+                &state,
+                AuditedRequest {
+                    request_id: &request_id,
+                    identity: None,
+                    reason: None,
+                    method: &method,
+                    path: &path,
+                    model_id: None,
+                    usage: None,
+                    request_metrics: None,
+                    connection_termination: None,
+                    started_ts,
+                    started_at,
+                },
+                Json(serde_json::json!({ "authentication": "disabled" })).into_response(),
+            )
+        }
+    };
+
+    let identity = match authenticate(store, request.headers()).await {
+        Ok(context) => context,
+        Err(refusal) => {
+            return audited(
+                &state,
+                AuditedRequest {
+                    request_id: &request_id,
+                    identity: None,
+                    reason: Some(refusal.audit_reason()),
+                    method: &method,
+                    path: &path,
+                    model_id: None,
+                    usage: None,
+                    request_metrics: None,
+                    connection_termination: None,
+                    started_ts,
+                    started_at,
+                },
+                refusal.into_response(),
+            )
+        }
+    };
+
+    let body = Json(serde_json::json!({
+        "authentication": "required",
+        "principal_id": identity.principal_id().as_str(),
+        "organization_id": identity.organization_id().as_str(),
+    }))
+    .into_response();
+
+    audited(
+        &state,
+        AuditedRequest {
+            request_id: &request_id,
+            identity: Some(&identity),
+            reason: None,
+            method: &method,
+            path: &path,
+            model_id: None,
+            // Never the usage log: that sink accounts for served inference
+            // bytes, and this endpoint serves none. A record here would be an
+            // inference charge against a caller who only asked who they were.
+            usage: None,
+            request_metrics: None,
+            connection_termination: None,
+            started_ts,
+            started_at,
+        },
+        body,
+    )
 }
 
 /// Builds the [`MethodRouter`] for one contractual route: every HTTP method the
