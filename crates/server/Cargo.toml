@@ -73,4 +73,5 @@ toml = "0.8"
 # middleware and the served-route filter are driven through real routers with
 # `tower::ServiceExt::oneshot`, which is a normal dependency above because the
 # startup loader uses it too.
+http-body-util = "0.1"
 tempfile.workspace = true

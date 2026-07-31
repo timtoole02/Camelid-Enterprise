@@ -22,6 +22,13 @@ between releases. The private pinned-route inventory and executable conformance
 live in `crates/server/src/contract.rs`; they drive the exact pinned
 `camelid::api::router_with_state` and do not reimplement the engine API.
 
+Static catalog mode keeps the same default-deny surface but intentionally routes
+only the two generation routes with a proven JSON `model` selector; it serves
+model discovery locally and refuses the remaining routes rather than inventing
+a pool-selection rule. That gateway-specific behavior is documented in
+`docs/architecture/gateway-model-catalog.md`, not promoted into this
+single-replica contract.
+
 ## Evidence labels
 
 - **Executable (no model):** exercised against the pinned engine's router under

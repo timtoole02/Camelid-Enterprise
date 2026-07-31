@@ -104,6 +104,29 @@ With the gateway running, clients use `127.0.0.1:8080`. It forwards the contract
 
 > **Listening is not readiness.** The model is read whole and hashed *before* the port is bound — a replica must never answer a request without being able to say what produced it — and then, with the port bound but nothing served from it, the same file is loaded. On a large GGUF from cold cache that is tens of seconds of quiet between `listening` and `replica ready`. Probe `GET /v1/health` for `"generation_ready":true`; a bare TCP-connect check would report ready far too early.
 
+### Static model routing
+
+The gateway also supports a static catalog for one pool per model. Choose
+exactly one gateway mode at startup: legacy transparent `--upstream`, or one or
+more `--model-route <model-id>=<http://replica-pool>` entries. A catalog id is
+not an alias: it must exactly equal an id advertised by that pool's
+`/v1/models` endpoint. Catalog startup verifies every mapping before binding.
+
+```bash
+cargo run --release --bin camelid-enterprise-gateway -- serve \
+  --model-route 'Llama 3.2 1B Instruct=http://llama-pool:8181'
+```
+
+In catalog mode, `GET /v1/models` and `GET /v1/models/{model}` are served from
+the configured catalog. `POST /v1/completions` and
+`POST /v1/chat/completions` select their pool from a required JSON `model`
+field; the request bytes are then forwarded unchanged and responses still
+stream. The catalog is immutable until restart. It is an operator inventory,
+not pool readiness: use the replica readiness probes for readiness, and the
+gateway's `/healthz` for gateway liveness. See [deploy/README.md](deploy/README.md)
+for selector memory/concurrency limits, endpoint restrictions, and the security
+model.
+
 ```bash
 curl http://127.0.0.1:8181/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -219,6 +242,49 @@ kubectl apply -f deploy/k8s/deployment.yaml -f deploy/k8s/service.yaml \
 Bare-metal Apple Silicon hosts run the binaries directly; [deploy/macos/](deploy/macos/README.md) has the launchd units and the readiness and drain procedures.
 
 See [deploy/README.md](deploy/README.md) for the trust boundary, the full scaling model, probe configuration, the drain sequence, and sizing guidance. Three things there are easy to miss and expensive to rediscover: the replica network policy only filters anything if the cluster CNI enforces NetworkPolicy at all; a replica's drain time is the **sum** of every generation it has already accepted, not the longest one; and the Kubernetes replica pod spec must keep `enableServiceLinks: false`, or every rollout after the first refuses to start.
+
+The supplied gateway Deployment runs two replicas. If you later opt into its
+per-organization fixed-window quota, each gateway process has an independent
+in-memory counter; a short burst across a window boundary can therefore admit
+under `4 ×` the configured limit across the two pods. See
+[deploy/README.md](deploy/README.md) for the full quota sizing constraint and
+deployment requirements.
+
+### Enabling authentication
+
+Bearer-token auth is opt-in via `--identity-db <path>`. Two things to get right
+before the first start:
+
+**Create the database before running more than one process against it.** Any
+CLI subcommand creates it. Schema migration is serialized under a write lock,
+but the initial `journal_mode=WAL` switch on a file that does not yet exist is
+not, so several processes opening a brand-new database at once can collide and
+fail to start. This matters directly for the two-replica gateway Deployment
+above sharing one volume.
+
+```bash
+# Once, before starting the gateway:
+camelid-enterprise-gateway create-user --identity-db /var/lib/camelid/identity.sqlite alice
+camelid-enterprise-gateway list-users  --identity-db /var/lib/camelid/identity.sqlite
+```
+
+**Record the principal id.** `list-users` is the only way back to it. Issue a
+credential with a lifetime, and refresh it before it lapses:
+
+```bash
+camelid-enterprise-gateway issue-token  --identity-db <db> <principal> --expires-in-seconds 86400
+camelid-enterprise-gateway rotate-token --identity-db <db> -   # reads the token from stdin
+```
+
+`rotate-token` gives the replacement the same lifetime the presented token was
+issued with, so refreshing a credential that is nearing expiry yields another
+bounded one; `--expires-in-seconds` sets a different lifetime and `--no-expiry`
+removes the bound entirely. An *expired* token cannot be rotated — re-issue
+instead, which is
+why the principal id has to be recoverable. Rotation needs filesystem access to
+the identity database, so a remote client that receives
+`401 {"type": "token_expired"}` cannot refresh itself; that is an operator
+action today.
 
 ## Scope
 

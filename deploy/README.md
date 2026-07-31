@@ -25,12 +25,47 @@ replica pool on **one instance type**, and start every replica in it with the
 worker-pool width, and neither is covered by the configuration digest, so a pool
 that mixes either is really several pools wearing one Service.
 
-The gateway in this release is deliberately transparent: one fixed upstream,
-opaque streaming request/response bodies, no retries, and no response rewriting.
-On Kubernetes, point it at the replica Service and let Kubernetes balance the
-identical pool. On one box, point it directly at the replica. Tenant-aware
-routing has not landed, and bearer-token authentication is opt-in rather than the
-default; see [Trust boundary](#trust-boundary) for what that means for exposure.
+The gateway has two explicit startup modes. Legacy transparent mode uses one
+fixed `--upstream`, keeps request and response bodies opaque and streaming, and
+forwards the replica contract unchanged. Static catalog mode uses one or more
+`--model-route <model-id>=<http://replica-pool>` entries instead; it maps a
+model to a pool without letting a client select an arbitrary origin. The modes
+are mutually exclusive. The stock Kubernetes manifest remains single-upstream
+mode. Authentication and per-organization quotas are optional in either mode;
+the manifest configures neither an identity database nor a quota, so keep both
+services on a trusted network until an operator supplies identity and enables
+authentication.
+Catalog ids are exact backend ids, not aliases: before binding, catalog mode
+queries each configured pool's `/v1/models` and refuses startup unless that
+pool advertises the configured id. This matters because selection forwards the
+client body unchanged; an alias would otherwise produce a late
+`model_not_found` from the correctly selected pool.
+With both an identity database and `CAMELID_GATEWAY_USAGE_LOG=<path>`, the
+gateway also writes an append-only JSONL terminal transport record for each
+authenticated, quota-admitted request:
+`{ts, started_ts, duration_ms, request_id, principal, organization, method, path, model_id, response_head_status, request_bytes, response_bytes, stream_outcome}`.
+`model_id` is the selected static-catalog entry, or `null` for legacy
+transparent mode, catalog discovery, and requests rejected before selection.
+`stream_outcome` is `completed` when the response reached EOF, `body_error`
+when it returned an error, `gateway_timeout` when the gateway's connection
+deadline closed it, or `incomplete` when the stream was dropped without an
+observable cause. `request_bytes` is `null` unless the gateway forwarded the
+request and observed its body reach EOF; `0` is therefore a known empty body,
+not a default for an unmeasured one. Byte counts are opaque payload bytes
+observed by the gateway, not tokenizer usage or billable inference units.
+The log is best-effort while running: a full writer queue or a failing disk
+drops records, with a rate-limited warning for each. On a clean shutdown
+(SIGTERM, including a Kubernetes rolling update) the gateway drains whatever
+the queue already accepted before exiting — **provided the termination grace
+period leaves room for it**; see the shutdown-budget note below, because a
+grace period equal to the connection cap does not. If the drain does not finish
+within five seconds it stops waiting and logs an `error` naming how many
+records were still queued; the writer keeps going, so that count is an upper
+bound on what is lost, not a measurement. An abrupt crash still loses the
+queue, and each pod writes its own file. It is useful evidence for later
+durable aggregation, not a replacement for it.
+Only the OpenAI-compatible `/v1` inference surface is public through the gateway;
+replica `/api`, embedded WebUI, workspace, and model-lifecycle routes return 404.
 The gateway admits at most 256 concurrent request streams by default (including
 the full lifetime of streaming responses); set `CAMELID_GATEWAY_MAX_IN_FLIGHT`
 to tune that bound. Every accepted client connection is also force-closed after
@@ -177,7 +212,7 @@ identical.
 
 ## Gateway contract
 
-The gateway forwards the contractual routes and nothing else:
+Both modes default-deny every route outside this replica surface:
 
 - `/v1/health`
 - `/v1/models` and `/v1/models/{model}`
@@ -207,18 +242,69 @@ with `Access-Control-Request-Method`) is answered locally by the CORS layer
 and never reaches the replica or consumes an admission permit. No credentials
 are enabled.
 
-Request and response bodies remain streaming and opaque. The gateway removes
-HTTP hop-by-hop headers and strips client-supplied `Forwarded`, `X-Forwarded-*`,
-and `X-Real-IP` values because this release does not yet establish trusted
-client identity. It stamps its own `x-camelid-request-id` on every forwarded
-request, overwriting any client-supplied value, and with `serve --audit-log
-<path>` writes one JSONL line per handled request — auth and admission
-rejections included — as `{ts, request_id, principal, method, path, status}`.
-It does not retry requests. The upstream connection pool keeps
-at most 32 idle connections for 30 seconds, and the configurable concurrency
+In transparent mode, request and response bodies remain streaming and opaque.
+Catalog mode keeps response bodies streaming and opaque, but materializes a
+JSON generation request up to `--max-model-selection-body-bytes` (2 MiB by
+default) to read its `model` field. A separate
+`--model-selection-memory-budget-bytes` limit (32 MiB by default) allows at
+most `memory_budget / (2 * max_body)` concurrent materialized selectors: 8 at
+the defaults. Each slot reserves a raw body plus the decoded model-id copy.
+
+That capacity queues rather than refuses. A request that finds it busy waits up
+to five seconds for a slot and gets a typed `503` only if the wait expires: a
+slot is held for the milliseconds a body takes to arrive, so refusing on
+contact would fail valid requests that merely overlapped. Holding a slot is
+bounded in turn -- a request that has one must deliver its body within fifteen
+seconds or it is refused with `408` and the slot is reclaimed, so slow clients
+cannot occupy the budget for the whole `--max-connection-seconds` window. A
+request whose declared `Content-Length` already exceeds the body limit is
+refused with `413` from its head, before it takes a slot. Catalog mode accepts
+only `application/json` and `application/*+json`, and only a JSON *object*;
+malformed, missing, unknown, non-object, oversized, or other-media-type
+selectors are rejected before quota, inference admission, or any upstream call.
+Only `POST /v1/completions` and `POST /v1/chat/completions` are routable in
+catalog mode because the pinned Enterprise contract proves their JSON `model`
+field. Catalog discovery is served locally and is charged against
+`--org-request-quota` like any other authenticated request. `/v1/health` and
+the currently unsupported compatibility POST routes return typed `501` rather
+than being sent to an arbitrary pool; `/healthz` remains the gateway liveness
+endpoint. Catalog discovery reports configured inventory, not replica
+readiness.
+
+When identity is enabled, one organization may hold at most half the global
+selector capacity by default -- four slots at the default budget
+(`--max-org-model-selections` / `CAMELID_GATEWAY_MAX_ORG_MODEL_SELECTIONS`
+changes it). The bound is derived from the budget rather than fixed, so the
+invariant holds however the budget is configured: no tenant takes more than
+half, and there is always capacity left for another one. This per-process
+permit is acquired before the global selector slot, and the two acquisitions
+share one five-second wait rather than one each. It is intentionally separate
+from request quota: invalid selectors remain uncharged, but cannot monopolize
+selector capacity.
+
+Catalog startup contacts every configured pool, so **the gateway will not start
+while any configured pool is unreachable**; on Kubernetes a gateway rollout
+that coincides with a pool outage restarts until the pool answers. That is
+deliberate -- a catalog the gateway cannot vouch for is worse than a gateway
+that is visibly not ready -- and it does not affect the stock manifest, which
+remains single-upstream mode.
+
+Authentication runs before catalog selection, so an authenticated deployment
+does not disclose model inventory to an anonymous caller. Catalog mode does
+not implement per-organization model permissions: every authenticated caller
+can use every configured entry. Do not present this as an IDOR control; roles
+and resource policy remain future authorization work. The gateway removes HTTP
+hop-by-hop headers and strips client-supplied `Forwarded`, `X-Forwarded-*`, and
+`X-Real-IP` values because this release does not yet establish trusted client
+identity. It stamps its own `x-camelid-request-id` on every forwarded request,
+overwriting any client-supplied value, and with `serve --audit-log <path>`
+writes one JSONL line per handled request — auth and admission rejections
+included — as `{ts, request_id, principal, method, path, status}`. It does not
+retry requests. The upstream connection pool keeps at
+most 32 idle connections for 30 seconds, and the configurable concurrency
 limit is held until a streaming response completes, disconnects, or the
-connection's maximum duration elapses. Saturation returns a typed `503` with
-a `Retry-After` of 1-3 seconds (randomized, so clients rejected at the same
+connection's maximum duration elapses. Saturation returns a typed `503` with a
+`Retry-After` of 1-3 seconds (randomized, so clients rejected at the same
 instant do not retry in lockstep).
 
 ## Starting and draining
@@ -382,9 +468,41 @@ Adjust before applying:
 - **Gateway probes** — readiness and liveness use the local `/healthz` endpoint.
   Replica availability is represented by the replica Deployment's own readiness
   and by typed gateway `502` responses, not by removing healthy gateway pods.
+- **Per-organization quota** — when you opt in with an identity database plus
+  `CAMELID_GATEWAY_ORG_REQUEST_QUOTA`, the counter is fixed-window, in-memory,
+  and local to each gateway process. The supplied manifest runs **two** gateway
+  replicas, so Kubernetes distributes an organization's traffic across two
+  independent counters: each process can admit under `2 × limit` in a short
+  fixed-window-boundary burst, making the deployment-wide worst case under
+  `4 × limit`. Size the per-pod value with that bound in mind. A strict global
+  organization quota needs durable, shared state and is not implemented.
+- **Transport usage log** — `CAMELID_GATEWAY_USAGE_LOG` requires
+  `CAMELID_GATEWAY_IDENTITY_DB`; use a writable, durable mounted path if the
+  JSONL evidence must survive pod replacement. The stock manifest supplies
+  neither identity nor a usage-log volume, so it emits no usage records. These
+  raw gateway byte counters and terminal outcomes are not tokenizer usage,
+  billing, or a durable aggregation service. The gateway opens each configured
+  audit and usage file before it binds its listener, rejects missing parents or
+  unwritable destinations at startup, and rejects audit and usage paths that
+  resolve to the same file. Runtime writes use a bounded dedicated writer queue:
+  a full queue or writer failure loses records but emits rate-limited warnings.
 - **Shutdown drain** — both gateway and replica stop accepting connections on
-  SIGTERM and drain active streams. The examples grant 300 seconds before
-  kubelet may send SIGKILL; keep the replica window at least as long as the
+  SIGTERM and drain active streams. The gateway then drains its JSONL logs, so
+  the grace period has to cover both stages, not just the first:
+
+  ```
+  terminationGracePeriodSeconds
+    >= CAMELID_GATEWAY_MAX_CONNECTION_SECONDS   # connection drain
+     + 5s per configured JSONL log              # audit and/or usage
+     + margin
+  ```
+
+  The gateway manifest ships 330s against a 300s connection cap and two
+  possible logs. Setting the grace period *equal* to the connection cap leaves
+  no budget for the log drain: a connection accepted just before SIGTERM can
+  consume the whole period, and kubelet then kills the process mid-drain. Raise
+  the grace period whenever you raise the connection cap. The gateway logs the
+  budget it needs at startup. Keep the replica window at least as long as the
   gateway window, and size both above the longest permitted generation.
 - **NetworkPolicy enforcement** — the replica ingress policy permits port 8181
   only from gateway-labeled pods in the same namespace (plus node traffic that

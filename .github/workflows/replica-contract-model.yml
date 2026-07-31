@@ -7,6 +7,7 @@ on:
       - .github/workflows/replica-contract-model.yml
       - Cargo.lock
       - Cargo.toml
+      - crates/gateway/**
       - crates/replica-contract/**
       - crates/server/**
 
@@ -47,6 +48,15 @@ jobs:
           model="${RUNNER_TEMP}/${MODEL_FILENAME}"
           test "$(stat -c %s "${model}")" = "${MODEL_SIZE}"
           echo "${MODEL_SHA256}  ${model}" | sha256sum --check --strict
+
+      - name: Run model-backed gateway catalog contract
+        env:
+          CAMELID_ENTERPRISE_TEST_MODEL: ${{ runner.temp }}/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+        run: >-
+          cargo test --locked -p camelid-enterprise-gateway
+          --test model_catalog_model
+          real_model_routes_through_a_verified_static_catalog
+          -- --ignored --exact --nocapture --test-threads=1
 
       - name: Run model-backed replica contract
         env:
