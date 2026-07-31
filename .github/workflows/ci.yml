@@ -40,9 +40,12 @@ jobs:
     # this job reaches any of our Windows code.
     env:
       CARGO_HOME: D:\c
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Allow the pinned engine's long evidence paths
+        run: git config --global core.longpaths true
       - uses: Swatinem/rust-cache@v2
       # engine-windows's tests are not gated on `target_os`, so they also run on
       # the two runners above. Running them here is what makes them mean
