@@ -30,13 +30,17 @@ cluster — with no dependency on an outside provider.
 ## 2. Ground truth — what exists **Today**
 
 Verified against the current repository. This is the entire scope present right
-now; the applications named in the project vision (WebUI, desktop app, agentic
-terminal, Kanban agents) are **not in this repository**.
+now. Of the applications named in the project vision, the **WebUI now lives here**
+as `frontend/` — a browser console built against the published replica contract,
+which the gateway can serve itself (`--console-dir`). The desktop app, agentic
+terminal and Kanban agents remain **not in this repository**.
 
 ### 2.1 Repository layout (present)
 
 ```
 Cargo.toml                     workspace: 8 member crates
+frontend/                      browser console (React + Vite); static bundle,
+                               optionally served by the gateway
 crates/
   engine-core/                 platform-neutral engine (gguf, model, tensor,
                                forward, tokenizer, host, error)
@@ -135,8 +139,10 @@ what the vision requires that is absent today:
   model ids to pools, but models are still mounted by path; there is no durable
   registry, upload, lifecycle API, or operator workflow beyond replica-local
   `/api/models/load`.
-- **No application tier.** WebUI, desktop app, agentic terminal, and Kanban
-  agent system are named in the vision but are not in this repository. Their
+- **Application tier is one console deep.** The WebUI is present as `frontend/`
+  and speaks only the contractual routes plus the gateway's own `/auth/whoami`.
+  Desktop app, agentic terminal, and Kanban agent system are named in the vision
+  but are not in this repository. Their
   internals are unknown from this tree and must not be assumed here.
 - **No platform datastore.** Identity has a local SQLite database, but the
   decided PostgreSQL store for aggregated audit/usage records, metering rollups,
@@ -215,7 +221,7 @@ tokens for one model"; everything multi-user is layered on top.
 | **Gateway / Control Plane** | Terminating client connections, authenticating requests, routing to the right model pool, quotas, rate limiting, usage metering. | Run inference. Store user credentials (delegates to Identity). | **Partial** — transparent forwarding, immutable static exact-backend-id-to-pool routing with pre-bind verification, memory-bounded selector work, and an authenticated per-organization selector cap; admission control, opt-in bearer auth, per-organization request quotas, audit records, and raw terminal transport accounting exist. Dynamic catalog management, pool-health aggregation, per-organization model policy, durable shared quota state, and model-token metering do not. |
 | **Identity & Auth Service** | Users, orgs/teams, credentials, sessions, API tokens, roles/permissions. | Route inference or store conversation content. | **Partial** — local users, organizations, memberships, organization-scoped tokens, expiry, rotation, and revocation exist; no roles, sessions, remote refresh, or federation. |
 | **Model / Catalog Service** | Registry of available models, their files, and lifecycle (register, load target, retire); mapping model name → replica pool. | Serve inference itself. Own user data. | **Initial static slice** — the gateway owns an immutable startup catalog of exact backend model id → pool mappings and local discovery; pre-bind verification proves the id exists in its pool. There is no durable registry, lifecycle, health aggregation, or dynamic reload. |
-| **Application Tier** | End-user experiences: WebUI, desktop app, agentic terminal, Kanban agents. | Bypass the gateway to reach replicas directly. | **External** — not in this repo. |
+| **Application Tier** | End-user experiences: WebUI, desktop app, agentic terminal, Kanban agents. | Bypass the gateway to reach replicas directly. | **Partial** — the WebUI exists as `frontend/`: a static console that talks only to the gateway, reads readiness from `/v1/health`, and resolves its own identity from `/auth/whoami`. It never addresses a replica. The gateway can serve its built bundle (`--console-dir`), which is opt-in and the only configuration in which the gateway answers a request without a credential. The remaining experiences are not in this repo. |
 | **Platform Data + Observability** | Aggregated audit/usage records, metering rollups, shared quota state, receipts, metrics, and logs. | Own identity records. Be reached directly by replicas or clients. | **Not built** — raw per-pod gateway logs, per-replica receipts, and stderr tracing exist, but the decided PostgreSQL aggregation store does not. |
 
 ### 5.2 Boundaries that must NOT move

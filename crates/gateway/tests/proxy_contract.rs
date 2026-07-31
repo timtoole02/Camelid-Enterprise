@@ -3795,3 +3795,396 @@ fn whoami_is_absent_from_the_published_replica_contract() {
         "an identity route reached the replica contract"
     );
 }
+
+/// Spawns a gateway with the browser console mounted from `dir`.
+async fn spawn_gateway_with_console(upstream: SocketAddr, dir: &std::path::Path) -> TestServer {
+    let upstream = UpstreamOrigin::parse(&format!("http://{upstream}")).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = camelid_enterprise_gateway::with_console(
+        router_with_options(upstream, DEFAULT_MAX_IN_FLIGHT, GatewayAuth::Disabled, None),
+        dir.to_path_buf(),
+    );
+    let task = tokio::spawn(async move {
+        camelid_enterprise_gateway::serve(
+            listener,
+            router,
+            Duration::from_secs(30),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    });
+    TestServer { addr, task }
+}
+
+/// A minimal built-console layout: an index and one hashed asset.
+fn console_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("index.html"), "<!doctype html><title>console</title>").unwrap();
+    std::fs::create_dir(dir.path().join("assets")).unwrap();
+    std::fs::write(dir.path().join("assets/index-abc123.js"), "export default 1\n").unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn the_console_is_served_when_a_directory_is_configured() {
+    let console = console_fixture();
+    let unreachable = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let gateway = spawn_gateway_with_console(unreachable, console.path()).await;
+
+    for (path, needle) in [
+        ("/", "console"),
+        ("/index.html", "console"),
+        ("/assets/index-abc123.js", "export default"),
+    ] {
+        let response = client()
+            .request(
+                Request::get(format!("http://{}{path}", gateway.addr))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "serving {path}");
+        let body = to_bytes(Body::new(response.into_body()), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains(needle),
+            "{path} did not serve the expected asset"
+        );
+    }
+}
+
+/// The console must never answer for a contractual path.
+///
+/// A single-page app normally serves `index.html` for anything unmatched. Here
+/// that would hand an API client `200 OK` and a page of HTML for a route the
+/// contract does not carry — a caller told its request succeeded, holding a
+/// login screen. Every API prefix keeps answering as an API.
+#[tokio::test]
+async fn the_console_never_answers_for_a_contractual_or_gateway_path() {
+    let console = console_fixture();
+    let unreachable = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let gateway = spawn_gateway_with_console(unreachable, console.path()).await;
+
+    for path in [
+        "/v1/not-a-route",
+        "/v1/",
+        "/auth/nope",
+        "/v1/models/a/b/c",
+        // Ordinary client mistakes that must still read as API calls: a base-URL
+        // join that doubled the slash, a case typo, and a probe configured with a
+        // trailing slash. Each of these previously answered 200 with the console
+        // page, telling an API caller its request had succeeded.
+        "//v1/models",
+        "/V1/models",
+        "/AUTH/whoami",
+        "/healthz/",
+        "/v1//models",
+        // Percent-encoded spellings. `ServeDir` decodes before it resolves, so a
+        // guard that reads the raw path is asking a different question than the
+        // file lookup answers, and every disagreement fell through to the
+        // console: each of these answered 200 with the page.
+        "/v1%2fchat%2fcompletions",
+        "/v1%2Fmodels",
+        "/%76%31/models",
+        "/v%31/models",
+        "/%61uth/whoami",
+        "/health%7a",
+        // Dot segments, which `ServeDir` skips when walking components.
+        "/./v1/models",
+        "/v1/./models",
+    ] {
+        let response = client()
+            .request(
+                Request::get(format!("http://{}{path}", gateway.addr))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{path} should be a typed API refusal, not the console"
+        );
+        let body = to_bytes(Body::new(response.into_body()), 4096).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("<!doctype"),
+            "{path} was answered with the console page: {text}"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"]["type"], "not_found");
+    }
+}
+
+/// Mounting the console must not move any contractual route.
+#[tokio::test]
+async fn the_contract_still_reaches_the_replica_with_the_console_mounted() {
+    let console = console_fixture();
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_server(
+        Router::new()
+            .fallback(any(capture_request))
+            .with_state(Arc::clone(&captured)),
+    )
+    .await;
+    let gateway = spawn_gateway_with_console(upstream.addr, console.path()).await;
+
+    let response = client()
+        .request(
+            Request::get(format!("http://{}/v1/models", gateway.addr))
+                .header("host", "public-gateway.example")
+                .header("x-client-test", "console-mounted")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        captured.lock().unwrap().is_some(),
+        "a contractual route stopped reaching the replica once the console was mounted"
+    );
+}
+
+/// The asset server resolves paths itself rather than trusting the request, so
+/// a traversal cannot reach a file outside the configured directory.
+#[tokio::test]
+async fn the_console_refuses_to_serve_outside_its_directory() {
+    let console = console_fixture();
+    let secret = console.path().parent().unwrap().join("gateway-secret.txt");
+    std::fs::write(&secret, "TOKEN=super-secret").unwrap();
+
+    let unreachable = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let gateway = spawn_gateway_with_console(unreachable, console.path()).await;
+
+    for path in [
+        "/../gateway-secret.txt",
+        "/..%2fgateway-secret.txt",
+        "/assets/../../gateway-secret.txt",
+        "/%2e%2e/gateway-secret.txt",
+    ] {
+        let response = client()
+            .request(
+                Request::get(format!("http://{}{path}", gateway.addr))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(Body::new(response.into_body()), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&body).contains("super-secret"),
+            "{path} escaped the console directory"
+        );
+    }
+
+    let _ = std::fs::remove_file(&secret);
+}
+
+/// Without the flag the gateway's surface is exactly what it was.
+#[tokio::test]
+async fn no_console_is_served_when_none_is_configured() {
+    let store = Arc::new(SqliteIdentityStore::open_in_memory().unwrap());
+    let unreachable = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let gateway = spawn_gateway_with_auth(
+        unreachable,
+        GatewayAuth::RequireToken {
+            store,
+            quota: None,
+            usage: None,
+        },
+    )
+    .await;
+
+    let response = client()
+        .request(
+            Request::get(format!("http://{}/", gateway.addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// The console answers without a credential even on an authenticated gateway,
+/// and it has to: the sign-in page is what a caller needs *before* it holds a
+/// token. This test exists so that property is a decision on the record rather
+/// than an accident someone later "fixes" into an unusable console.
+#[tokio::test]
+async fn the_console_answers_without_a_credential_by_necessity() {
+    let console = console_fixture();
+    let unreachable = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let store = Arc::new(SqliteIdentityStore::open_in_memory().unwrap());
+    let upstream = UpstreamOrigin::parse(&format!("http://{unreachable}")).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = camelid_enterprise_gateway::with_console(
+        router_with_options(
+            upstream,
+            DEFAULT_MAX_IN_FLIGHT,
+            GatewayAuth::RequireToken {
+                store,
+                quota: None,
+                usage: None,
+            },
+            None,
+        ),
+        console.path().to_path_buf(),
+    );
+    let task = tokio::spawn(async move {
+        camelid_enterprise_gateway::serve(
+            listener,
+            router,
+            Duration::from_secs(30),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+    });
+    let gateway = TestServer { addr, task };
+
+    let page = client()
+        .request(
+            Request::get(format!("http://{}/", gateway.addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK, "the sign-in page must load anonymously");
+
+    // The API it signs into is still closed.
+    let api = client()
+        .request(
+            Request::get(format!("http://{}/v1/models", gateway.addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A missing asset must answer `404`, not the index page with a `200`.
+///
+/// The natural single-page-app shape — `ServeDir::fallback(ServeFile::new(index))`
+/// — passes the fallback's status through unaltered, so every unresolvable path
+/// answers `200 OK` with `text/html`. That makes the commonest operational
+/// mistake silent: rebuild the bundle under a running gateway, and a browser
+/// holding the previous index requests a hashed asset that no longer exists,
+/// gets 200 and HTML, refuses it with a MIME-type error, and renders blank —
+/// with nothing in any log pointing at the stale file.
+#[tokio::test]
+async fn a_missing_console_asset_is_a_404_not_the_index_page() {
+    let console = console_fixture();
+    let unreachable = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let gateway = spawn_gateway_with_console(unreachable, console.path()).await;
+
+    // The exact shape of a stale-bundle request: a hashed asset from a build
+    // that no longer exists on disk.
+    for path in [
+        "/assets/index-STALEHASH.js",
+        "/assets/nope.css",
+        "/not-a-page",
+    ] {
+        let response = client()
+            .request(
+                Request::get(format!("http://{}{path}", gateway.addr))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{path} should be a 404; a 200 here is what makes a stale bundle silent"
+        );
+        let body = to_bytes(Body::new(response.into_body()), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&body).contains("<!doctype"),
+            "{path} was answered with the index page"
+        );
+    }
+
+    // The root still resolves, without any fallback: ServeDir appends
+    // index.html for a directory request on its own.
+    let root = client()
+        .request(
+            Request::get(format!("http://{}/", gateway.addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(root.status(), StatusCode::OK);
+}
+
+/// The console must answer under the same edge layers as everything else.
+///
+/// `router_with_routing_options` applies the CORS layer over the routes present
+/// at that moment; a fallback attached afterwards is not covered by it. Without
+/// re-applying, the console would be the one part of the surface sitting outside
+/// the layers the rest of the gateway answers under.
+#[tokio::test]
+async fn the_console_answers_under_the_same_edge_layers() {
+    let console = console_fixture();
+    let unreachable = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let gateway = spawn_gateway_with_console(unreachable, console.path()).await;
+
+    let response = client()
+        .request(
+            Request::get(format!("http://{}/", gateway.addr))
+                .header("origin", "https://elsewhere.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().contains_key("access-control-allow-origin"),
+        "the console answered outside the CORS layer every other route sits behind"
+    );
+}

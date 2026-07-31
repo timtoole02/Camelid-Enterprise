@@ -1073,6 +1073,177 @@ async fn gateway_health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// Serves the browser console's built assets from this process.
+///
+/// Strictly additive and opt-in: without `--console-dir` nothing below is
+/// registered and the gateway's surface is exactly what it was. A deployment
+/// that fronts the console with its own CDN or object store keeps doing that.
+///
+/// # Why the gateway and not the replica
+///
+/// The replica exists to serve a fixed, published, minimal route set whose whole
+/// value is that it does not grow. Adding a static-asset surface to *that*
+/// process would work against the one property it is built to hold. The gateway
+/// is already the component the deployment documents as its trust boundary, it
+/// already terminates client traffic, and it already answers two routes of its
+/// own (`/healthz`, `/auth/whoami`). The console is a third.
+///
+/// # This genuinely widens the anonymous surface, and it has to
+///
+/// Everything here answers without a credential, and that is not an oversight
+/// that could be tightened later: the sign-in page is what the caller needs
+/// *before* they have a token to authenticate with. A console behind
+/// authentication cannot be signed into. So a deployment that turns this on is
+/// choosing to serve static files to anyone who can reach the port, and the
+/// network policy in `deploy/k8s/` remains what decides who that is.
+///
+/// What it is *not* is a widening of the API surface. Nothing here proxies, and
+/// nothing here reaches a replica.
+///
+/// # API paths never fall through to the page
+///
+/// A single-page app usually answers every unmatched path with `index.html`, so
+/// client-side routing works on a hard refresh. Doing that here would mean a
+/// client calling `/v1/embeddings` on a gateway whose contract does not carry it
+/// receives `200 OK` and a page of HTML — an API caller handed a login screen and
+/// told it succeeded. The contractual prefixes are answered as a typed `404`
+/// instead, and only genuinely non-API paths see the console.
+///
+/// The console routes on the URL fragment (`#history`), which is never sent to a
+/// server, so it needs no history fallback to work — the fallback below exists
+/// only so a mistyped path lands somewhere coherent.
+pub fn with_console(router: Router, console_dir: PathBuf) -> Router {
+    // The CORS layer is re-applied here on purpose. `router_with_routing_options`
+    // installs it over the routes that exist at that moment, and a fallback
+    // attached afterwards is not covered by it — so without this the console
+    // would be the one part of the gateway's surface sitting outside the edge
+    // layers everything else answers under, differing in whatever those layers
+    // do now and in whatever they are taught to do later.
+    router
+        .fallback(console_handler)
+        .layer(CorsLayer::permissive())
+        .layer(Extension(Arc::new(console_dir)))
+}
+
+/// Whether a path is an attempt at this gateway's API rather than at the console.
+///
+/// `/v1/` is the published contract; `/auth/` and `/healthz` are the gateway's
+/// own. A request under any of them is an API call, and a caller who gets one
+/// slightly wrong is owed a machine-readable refusal rather than a web page.
+///
+/// The comparison deliberately normalizes first, and the normalization is the
+/// whole point of the function. Matching the raw path caught only exact
+/// spellings, so three ordinary client mistakes each produced `200 OK` and a
+/// page of HTML for what was plainly an API call:
+///
+/// * `//v1/models` — the classic result of joining a base URL and a path that
+///   both carry a slash. A caller with this bug got a login page and a success
+///   status instead of the `401` that would have told them what was wrong.
+/// * `/V1/models` — paths are case-sensitive, so this genuinely is not the
+///   contractual route and axum will not proxy it. But nobody types it meaning
+///   "serve me the console", and answering it with one hides the typo.
+/// * `/healthz/` — a liveness probe configured with a trailing slash silently
+///   stopped reading the gateway's health and started reading a web page.
+///
+/// Being generous here is the safe direction: the cost of catching too much is
+/// a `404` on a path the console never had, and the cost of catching too little
+/// is an API client that believes an HTML page was its answer.
+///
+/// # It must decode before it compares, or it guards a different string
+///
+/// The subtle version of this bug is worse than the obvious ones above, and it
+/// is what makes the decoding step non-optional. `ServeDir` does not resolve the
+/// raw path: it strips leading slashes, percent-decodes, and then walks the
+/// components, skipping `.` segments. So a guard that compares the *raw* path is
+/// asking a different question than the file resolver answers, and every
+/// disagreement falls through to the console — `/v1%2fchat%2fcompletions` reads
+/// as one opaque segment here and as `v1/chat/completions` there. An SDK aimed at
+/// that spelling got `200 OK` and a page of HTML, then failed on JSON parsing
+/// with an error naming nothing useful; `/health%7a` gave a liveness probe an
+/// unconditional `200` that never ran a health check at all.
+///
+/// Decoding first is what keeps the two in agreement. A path whose encoding is
+/// not valid UTF-8 is treated as an API path rather than passed to the console:
+/// it is not a thing the console has, and refusing costs nothing.
+fn is_api_path(path: &str) -> bool {
+    let Ok(decoded) = percent_encoding::percent_decode_str(path).decode_utf8() else {
+        return true;
+    };
+
+    // Collapse repeated slashes, drop `.` segments, and lowercase — the same
+    // shape `ServeDir` will resolve to. `..` is left alone: `ServeDir` refuses
+    // those outright, and any `/v1/..`-style spelling is caught by the prefix
+    // check anyway.
+    let mut normalized = String::with_capacity(decoded.len() + 1);
+    for segment in decoded.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        normalized.push('/');
+        normalized.extend(segment.chars().flat_map(char::to_lowercase));
+    }
+    if normalized.is_empty() {
+        normalized.push('/');
+    }
+
+    normalized == "/v1"
+        || normalized.starts_with("/v1/")
+        || normalized == "/auth"
+        || normalized.starts_with("/auth/")
+        || normalized == "/healthz"
+}
+
+async fn console_handler(
+    Extension(dir): Extension<Arc<PathBuf>>,
+    request: Request,
+) -> Response {
+    use tower::ServiceExt as _;
+    use tower_http::services::ServeDir;
+
+    if is_api_path(request.uri().path()) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": { "message": "no such route", "type": "not_found" }
+            })),
+        )
+            .into_response();
+    }
+
+    // `ServeDir` resolves and rejects `..` itself rather than trusting the
+    // request path, which is the whole reason to use it instead of joining the
+    // path onto the directory by hand.
+    //
+    // Deliberately no fallback service. The obvious shape here is
+    // `.fallback(ServeFile::new(index))` so client-side routing survives a hard
+    // refresh — but tower-http passes the fallback's status through unaltered,
+    // so *every* unresolvable path answers `200 OK` with `text/html`. That turns
+    // the single most common operational mistake into a silent one: rebuild the
+    // bundle under a running gateway and a browser holding the old index asks for
+    // a hashed asset that no longer exists, receives 200 and HTML, and refuses it
+    // with a MIME-type error while the console renders blank — with no 404
+    // anywhere to point at the stale file.
+    //
+    // Nothing is lost by omitting it. This console routes on the URL fragment,
+    // which is never sent to a server, so there is no history to fall back for;
+    // and `/` still resolves, because `ServeDir` appends `index.html` for
+    // directory requests on its own.
+    let service = ServeDir::new(dir.as_ref().as_path());
+    match service.oneshot(request).await {
+        Ok(response) => response.map(Body::new),
+        Err(error) => {
+            tracing::error!(%error, "console asset read failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": { "message": "console asset unavailable", "type": "gateway_error" }
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Reports the identity the gateway resolved for the caller's own credential.
 ///
 /// Gateway-local like [`gateway_health`], and deliberately not in

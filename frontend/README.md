@@ -75,3 +75,35 @@ npm run build
 Output is static assets in `dist/`, servable by anything. Nothing in the build
 assumes a particular mount path or origin — the gateway endpoint is chosen at
 sign-in and stored per browser.
+
+## Serving it from the gateway
+
+The gateway can host the built bundle itself, so one process is a complete
+deployment:
+
+```bash
+cargo run -p camelid-enterprise-gateway -- serve --addr 127.0.0.1:8080 --upstream http://127.0.0.1:8181 --identity-db ./identity.db --console-dir ./frontend/dist
+```
+
+The console is then at the gateway's own address, and the endpoint field can be
+left at its default — it is already talking to the right place.
+
+This is opt-in, and omitting it is not a degraded mode: the bundle is static and
+any web server or object store can host it. Two things are worth knowing before
+turning it on.
+
+**The assets answer without authentication, necessarily.** The sign-in page is
+what a caller needs *before* they hold a token, so a console behind
+authentication cannot be signed into. Serving it here means serving those files
+to anyone who can reach the port; `deploy/k8s/` is what decides who that is. The
+API is unaffected — `/v1/*` still refuses without a bearer token.
+
+**API paths never fall through to the page.** A single-page app usually answers
+every unmatched path with `index.html`. Doing that here would hand a client
+calling a route this gateway does not carry a `200 OK` and a page of HTML — an
+API caller told it succeeded, holding a login screen. `/v1/*`, `/auth/*` and
+`/healthz` keep answering as APIs, with a typed `404`.
+
+Startup logs the console's posture at `WARN`. The gateway's log filter comes from
+`RUST_LOG` and shows errors only when it is unset, so run it with `RUST_LOG=warn`
+if you want to see that line (and the one about running unauthenticated).

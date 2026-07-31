@@ -1,5 +1,5 @@
 use camelid_enterprise_gateway::{
-    router_with_model_catalog, router_with_options, GatewayAuth, GatewayLog, LogFlush,
+    router_with_model_catalog, router_with_options, with_console, GatewayAuth, GatewayLog, LogFlush,
     ModelCatalog, ModelSelectionLimits, OrgQuota, UpstreamOrigin, VerifiedModelCatalog,
     DEFAULT_LOG_FLUSH_DEADLINE, DEFAULT_MAX_CONNECTION_DURATION, DEFAULT_MAX_IN_FLIGHT,
     DEFAULT_MAX_MODEL_SELECTION_BODY_BYTES, DEFAULT_MODEL_SELECTION_MEMORY_BUDGET_BYTES,
@@ -127,6 +127,19 @@ enum Command {
             env = "CAMELID_GATEWAY_ORG_REQUEST_QUOTA_WINDOW_SECONDS"
         )]
         org_request_quota_window_seconds: NonZeroU64,
+        /// Directory of built console assets to serve from this gateway, as
+        /// produced by `npm run build` in `frontend/` (its `dist/`).
+        ///
+        /// Omitted by default, and omitting it is not a degraded mode: the
+        /// console is a static bundle any web server or object store can host,
+        /// and a deployment that already has one should keep using it. This
+        /// exists so a single process is a complete deployment.
+        ///
+        /// Everything under it is served WITHOUT authentication, necessarily —
+        /// the sign-in page is what a caller needs before they hold a token.
+        /// Turning this on serves those files to anyone who can reach the port.
+        #[arg(long, env = "CAMELID_GATEWAY_CONSOLE_DIR")]
+        console_dir: Option<PathBuf>,
     },
     /// Create a user and its personal organization, then print the principal id.
     CreateUser {
@@ -257,6 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             usage_log,
             org_request_quota,
             org_request_quota_window_seconds,
+            console_dir,
         } => {
             serve(ServeArgs {
                 upstream,
@@ -276,6 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     limit: org_request_quota,
                     window_seconds: org_request_quota_window_seconds,
                 },
+                console_dir,
             })
             .await
         }
@@ -348,6 +363,7 @@ struct ServeArgs {
     identity_db: Option<PathBuf>,
     logs: GatewayLogArgs,
     org_request_quota: OrgQuotaArgs,
+    console_dir: Option<PathBuf>,
 }
 
 type GatewayLogs = (Option<Arc<GatewayLog>>, Option<Arc<GatewayLog>>);
@@ -438,6 +454,7 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         identity_db,
         logs,
         org_request_quota,
+        console_dir,
     } = args;
     let configured_routing = parse_serve_routing(upstream, model_routes)?;
     let selection_limits = match &configured_routing {
@@ -526,6 +543,28 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 audit,
             )
         }
+    };
+    // Layered on last, so it can only ever catch paths the contract did not
+    // claim. The warning is not boilerplate: this is the one configuration that
+    // serves bytes to an unauthenticated caller, and an operator who set it
+    // without meaning to should see it in the startup log.
+    let router = match console_dir {
+        Some(dir) => {
+            if !dir.join("index.html").is_file() {
+                return Err(format!(
+                    "--console-dir {} has no index.html; point it at the frontend's built dist/ \
+                     directory (npm run build)",
+                    dir.display()
+                )
+                .into());
+            }
+            tracing::warn!(
+                console_dir = %dir.display(),
+                "serving the browser console from this gateway; its assets answer without authentication"
+            );
+            with_console(router, dir)
+        }
+        None => router,
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let max_connection_duration = Duration::from_secs(max_connection_seconds);
