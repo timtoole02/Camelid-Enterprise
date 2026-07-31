@@ -150,6 +150,21 @@ impl LoadedModel {
         self.tokenizer.encode(prompt, true, false)
     }
 
+    /// Encode a prompt using caller-selected tokenizer framing.
+    ///
+    /// Serving code uses this for prompts rendered from the model's embedded
+    /// chat template: a template may already contain its BOS text, and its
+    /// control markers must be parsed as special tokens. Raw completions keep
+    /// using [`Self::encode_completion`] so chat policy cannot leak into them.
+    pub fn encode_prompt(
+        &self,
+        prompt: &str,
+        add_special: bool,
+        parse_special: bool,
+    ) -> Result<Vec<TokenId>> {
+        self.tokenizer.encode(prompt, add_special, parse_special)
+    }
+
     /// Generate from already-tokenized input.
     ///
     /// The prompt plus requested budget must fit the declared context window.
@@ -201,6 +216,18 @@ impl LoadedModel {
     /// Tokenize and greedily complete a raw-text prompt.
     pub fn complete(&self, prompt: &str, max_new_tokens: usize) -> Result<Completion> {
         let prompt_tokens = self.encode_completion(prompt)?;
+        self.generate(&prompt_tokens, max_new_tokens)
+    }
+
+    /// Complete an already-rendered prompt using explicit tokenizer framing.
+    pub fn complete_prompt(
+        &self,
+        prompt: &str,
+        add_special: bool,
+        parse_special: bool,
+        max_new_tokens: usize,
+    ) -> Result<Completion> {
+        let prompt_tokens = self.encode_prompt(prompt, add_special, parse_special)?;
         self.generate(&prompt_tokens, max_new_tokens)
     }
 }
@@ -338,5 +365,12 @@ mod tests {
         assert!(completion.generated_tokens.is_empty());
         assert_eq!(completion.text, "");
         assert_eq!(completion.finish_reason, FinishReason::Length);
+    }
+
+    #[test]
+    fn rendered_prompt_encoding_keeps_chat_policy_explicit() {
+        let model = synthetic_model();
+        assert_eq!(model.encode_prompt("<eog>", false, true).unwrap(), vec![0]);
+        assert!(model.encode_prompt("<eog>", false, false).is_err());
     }
 }

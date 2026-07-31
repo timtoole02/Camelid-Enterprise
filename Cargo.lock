@@ -272,6 +272,7 @@ dependencies = [
  "camelid-enterprise-replica-contract",
  "clap",
  "http-body-util",
+ "minijinja",
  "rayon",
  "serde",
  "serde_json",

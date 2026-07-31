@@ -82,30 +82,34 @@ one explicit seam. Because the deterministic lane *is* greedy, the absence of
 temperature and top-p sampling is not a gap for the lane this product ships.
 Per-OS kernels live in `engine-{macos,linux,windows}`.
 
-**The numerics, owned raw-completion lifecycle, and first isolated serving
-slice now exist.** `crates/server/src/in_tree.rs` implements health, exact
-one-model discovery, and deterministic non-streaming `/v1/completions` behind
-a backend trait backed by `LoadedModel`. It fails closed on unsupported request
-features, enforces single-generation admission, and returns typed errors. The
-adapter is deliberately not composed into the serving binary yet, so no public
-replica or gateway route has changed.
+**The numerics, owned completion lifecycle, and first isolated serving slices
+now exist.** `crates/server/src/in_tree.rs` implements health, exact one-model
+discovery, and deterministic non-streaming `/v1/completions` and
+`/v1/chat/completions` behind a backend trait backed by `LoadedModel`. Chat uses
+the GGUF-embedded template with strict Jinja evaluation and explicit
+special-token parsing; a missing or incompatible template is a typed refusal,
+not a generic role-prefixed fallback. Both generation paths share one admission
+slot and fail closed on unsupported request features. The adapter is
+deliberately not composed into the serving binary yet, so no public replica or
+gateway route has changed.
 
 ## 5. The gap, stated plainly
 
 Missing entirely, in rough order of difficulty:
 
-- the remaining HTTP contract, including chat and compatibility routes
-- the remaining OpenAI request and response schemas beyond raw completion
+- the remaining HTTP contract, including compatibility routes
+- the remaining OpenAI request and response schemas beyond deterministic
+  string-content completion and chat
 - serving model registry and concurrent load/unload/admission policy
 - SSE streaming for completions and chat
-- chat templating
 - embeddings models — a different model family, not a decode loop
 - reranking models — likewise
 - the agent workspace subsystem
 
-Loading and owning one immutable model for raw greedy completion is in-tree,
-as is the first HTTP adapter over it; production composition, attribution,
-streaming, chat, and the other model families remain above that boundary.
+Loading and owning one immutable model for greedy completion is in-tree, as are
+strict embedded-template rendering and the non-streaming HTTP adapters over it;
+production composition, attribution, streaming, broader template parity, and
+the other model families remain above that boundary.
 
 This is a program of work, not a change. Anyone estimating it from "the server
 only imports two symbols" will be wrong by an order of magnitude.
@@ -134,12 +138,12 @@ first buys most of the safety at a fraction of the cost.
 
 The first slice was intentionally below HTTP: `engine_core::runtime::LoadedModel`
 provides one owned, fail-closed path from a GGUF file to deterministic raw
-completion. The next slice adds an isolated server adapter for health, exact
-model discovery, and non-streaming raw completion. The pinned router remains
-the production surface while the remaining handlers, streaming, and chat
-templating are built and tested against that runtime. This keeps the external
-contract unchanged during the port and prevents serving policy from leaking
-back into the numerics crate.
+completion. The next slices add an isolated server adapter for health, exact
+model discovery, non-streaming raw completion, and strict embedded-template
+chat completion. The pinned router remains the production surface while SSE,
+the remaining handlers, and broader template parity are built and tested
+against that runtime. This keeps the external contract unchanged during the
+port and prevents serving policy from leaking back into the numerics crate.
 
 There is still no route-at-a-time cutover path with the API as it stands, and
 the obvious one does not work. This section records why, so the idea is not
@@ -182,11 +186,11 @@ yet. Roughly by how invasive they are:
 
 The least-risky route implementation order is still easiest and most
 load-bearing first — `/v1/health`, then `/v1/models`, then `/v1/completions`,
-then `/v1/chat/completions` with templating and SSE, then a deliberate decision
-about `/v1/embeddings` and the rerank pair, which are different model families
-and may not belong in this product's surface at all. None of that sequencing is
-eligible for production cutover until one of the three prerequisites above is
-in place.
+then non-streaming `/v1/chat/completions` with templating, then SSE for both
+generation routes, then a deliberate decision about `/v1/embeddings` and the
+rerank pair, which are different model families and may not belong in this
+product's surface at all. None of that sequencing is eligible for production
+cutover until one of the three prerequisites above is in place.
 
 ## 8. Recommendation
 
@@ -194,9 +198,9 @@ Continue the migration without weakening the pinned production contract:
 
 1. **Keep the server pin in place during the port.** It remains the contract
    anchor until an in-tree surface passes the same model-backed contract.
-2. **Build upward from `runtime::LoadedModel`.** Raw completion is the first
-   owned lifecycle; request schemas, model discovery, chat templating, and SSE
-   follow without coupling HTTP into `engine-core`.
+2. **Build upward from `runtime::LoadedModel`.** Raw and chat completion now
+   share the owned lifecycle; SSE and the remaining request schemas follow
+   without coupling HTTP into `engine-core`.
 3. **Choose a §7 cutover prerequisite before switching any route.** Route-group
    composition or a wholesale router replacement can make the transition
    explicit; overlapping `Router::merge` cannot.
