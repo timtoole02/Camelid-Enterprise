@@ -12,30 +12,37 @@ forward for one deterministic inference replica. It is not a promise that every
 route present in the pinned desktop engine is a stable Enterprise API.
 
 The dependency-free public route registry in `crates/replica-contract` is the
-source of truth for contractual paths, methods, and classification, structured
-so replicas and gateways *can* share it without linking the inference engine.
-In its legacy transparent mode, the gateway derives its forwarded route surface
-directly from `replica_contract::PUBLIC_ROUTES` rather than a hand-maintained
-mirror, so its allowlist cannot silently drift from this contract; a gateway
-integration test (`forwards_exactly_the_public_contract_routes`) asserts it
-forwards exactly the contractual routes and methods, and nothing beyond them.
-Static catalog mode keeps that default-deny surface but intentionally routes
+source of truth for contractual paths, methods, and classification, structured so
+replicas and gateways share it without linking the inference engine. Both do:
+the replica's served-route filter derives its allow list from
+`replica_contract::PUBLIC_ROUTES`, and so does the gateway's forwarding table.
+Neither declares a second inventory, so a route added here is served and
+forwarded from the one edit, and there is no pair of lists that can drift apart
+between releases. The private pinned-route inventory and executable conformance
+live in `crates/server/src/contract.rs`; they drive the exact pinned
+`camelid::api::router_with_state` and do not reimplement the engine API.
+
+Static catalog mode keeps the same default-deny surface but intentionally routes
 only the two generation routes with a proven JSON `model` selector; it serves
 model discovery locally and refuses the remaining routes rather than inventing
 a pool-selection rule. That gateway-specific behavior is documented in
 `docs/architecture/gateway-model-catalog.md`, not promoted into this
-single-replica contract. The private pinned-route inventory and executable
-conformance live in
-`crates/server/src/contract.rs`; they drive the exact pinned
-`camelid::api::router_with_state` and do not reimplement the engine API.
+single-replica contract.
 
 ## Evidence labels
 
-- **Executable (no model):** exercised against the exact attributed production
-  router with an empty `AppState`.
+- **Executable (no model):** exercised against the pinned engine's router under
+  attribution (`camelid_enterprise::attributed_router`) with an empty
+  `AppState`. Deliberately *without* the served-surface filters, because these
+  rows pin what the **engine** answers; the filters in front of it are pinned
+  separately, by the served-stack tests in `crates/server/src/main.rs` and
+  `crates/server/src/surface.rs`.
 - **Executable (model):** exercised by the ignored model-backed conformance test
-  when `CAMELID_ENTERPRISE_TEST_MODEL` names a compatible local GGUF. This test
-  is explicit/manual and is not part of the default CI matrix.
+  when `CAMELID_ENTERPRISE_TEST_MODEL` names a compatible local GGUF. That test
+  drives `camelid_enterprise::replica_router` — the same composition `serve`
+  uses, filters included — so its evidence is about the surface a client meets
+  and not about a router nothing serves. This test is explicit/manual and is not
+  part of the default CI matrix.
 - **Pinned source:** verified against the exact engine revision above, but no
   independent Enterprise test drives the condition yet.
 - **Unspecified:** deliberately not promised by this contract.

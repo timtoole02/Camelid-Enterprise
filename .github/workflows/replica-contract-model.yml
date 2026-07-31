@@ -61,6 +61,12 @@ jobs:
       - name: Run model-backed replica contract
         env:
           CAMELID_ENTERPRISE_TEST_MODEL: ${{ runner.temp }}/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+          # Verified against the artifact by the step above with `sha256sum
+          # --check`, then handed to the test so the digest the replica
+          # publishes is checked against a number nothing in this workspace
+          # computed. Deliberately not `CAMELID_*`: the lane's admission scan is
+          # deny-by-default over that whole namespace and this test calls it.
+          ENTERPRISE_TEST_MODEL_SHA256: ${{ env.MODEL_SHA256 }}
         run: >-
           cargo test --locked -p camelid-enterprise
           --test replica_contract_model

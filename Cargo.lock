@@ -272,6 +272,7 @@ dependencies = [
  "camelid-enterprise-replica-contract",
  "clap",
  "http-body-util",
+ "rayon",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -330,6 +331,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "pin-project-lite",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",
@@ -1618,6 +1620,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
+ "sha2-asm",
 ]
 
 [[package]]
@@ -1629,6 +1632,15 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "digest 0.11.3",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
