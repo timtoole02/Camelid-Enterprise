@@ -118,7 +118,7 @@ async fn real_model_routes_through_a_verified_static_catalog() {
     };
     let loaded_model = LoadedModel::load(&model)
         .expect("the in-tree runtime must load the catalog test model");
-    let (replica, expected_model_id) = replica_router(loaded_model, &model, identity)
+    let (replica, expected_model_id) = replica_router(loaded_model, &model, identity, 1)
         .expect("the production replica composition must accept the catalog test model");
     let replica = spawn_router(replica).await;
 

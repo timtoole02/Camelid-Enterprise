@@ -295,7 +295,10 @@ async fn real_model_conforms_to_replica_http_v1() {
     };
     let loaded_model = LoadedModel::load(&model)
         .expect("the in-tree runtime must load the model it was pointed at");
-    let (app, model_id) = replica_router(loaded_model, &model, identity)
+    // One slot: this test asserts the exact depth at which the bounded queue
+    // refuses, which is `slots + queue depth`. Taking the runner's default width
+    // would make that assertion a fact about the CI machine.
+    let (app, model_id) = replica_router(loaded_model, &model, identity, 1)
         .expect("the production replica composition must accept the loaded model");
 
     // The route the load used is refused on the surface that is served, which is
@@ -615,7 +618,7 @@ async fn in_tree_generation_matches_pinned_engine() {
     let loaded = LoadedModel::load(&model).expect("the in-tree runtime must load the parity model");
     let backend = LoadedModelBackend::new(model_id, loaded)
         .expect("the pinned engine's model id is a valid in-tree discovery id");
-    let in_tree = in_tree_router(Arc::new(backend));
+    let in_tree = in_tree_router(Arc::new(backend), 1);
 
     for (case, expected) in cases.iter().zip(expected) {
         let actual = capture_generation(in_tree.clone(), case).await;
@@ -660,7 +663,7 @@ async fn real_model_conforms_to_in_tree_generation_slice() {
     let model_id = model.file_name().unwrap().to_string_lossy().into_owned();
     let backend = LoadedModelBackend::new(model_id.clone(), loaded)
         .expect("the model filename is a valid discovery id");
-    let app = in_tree_router(Arc::new(backend));
+    let app = in_tree_router(Arc::new(backend), 1);
 
     let health = send(
         app.clone(),

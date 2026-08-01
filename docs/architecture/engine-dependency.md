@@ -53,9 +53,17 @@ the asynchronous policy around it.
 - explicit pinned-compatible `501 not_implemented` responses for embeddings,
   Responses, Messages, rerank, and reranking.
 
-The generation worker admits one active request and eight queued requests. A
-ninth queued request gets the typed `engine_queue_full` response with
-`Retry-After: 1`. Streaming uses a bounded 32-delta channel; a stalled client
+The generation worker runs `--max-concurrency` requests at once (default: the
+host's available parallelism) and admits eight more into a bounded queue. The
+request past that gets the typed `engine_queue_full` response with
+`Retry-After: 1`. `/v1/health` publishes the width as
+`engine_generation_slots`, so `engine_queue_depth` can be read against its own
+denominator.
+
+Width is a throughput property, not a numeric one. Each generation constructs
+its own decoder and KV cache over read-only weights and is never fused with
+another, so a request emits the same tokens at any width. That is the line
+between a worker pool and batching, and only the former is in this lane. Streaming uses a bounded 32-delta channel; a stalled client
 backpressures generation, and a disconnected client cancels it at the next
 token boundary.
 

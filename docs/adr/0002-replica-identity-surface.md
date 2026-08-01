@@ -100,10 +100,10 @@ out-of-namespace refusal, terminated by `namespace=CAMELID_` with no trailing
 newline. Today that is
 
 ```
-45121fb83fef631f8464c32dada6100b23f0a0af80347031f812803ee9ec2a09
+318fb6d65c0fb2cd3630594b08cc70a1bc3ae0bca7b8bd15c121458e651959f6
 ```
 
-published as its first twelve characters, `45121fb83fef`, on headers and in
+published as its first twelve characters, `318fb6d65c0f`, on headers and in
 completion bodies, and in full on serving receipts — the same three places, at
 the same two lengths, as its sibling.
 
@@ -761,9 +761,9 @@ spelling of that same setting is refused for the reason `CAMELID_THREADS` is.
 That is an ergonomic rule, not a soundness one, and saying so is the point: a row
 kept for a reason its own bar does not state is a row nobody can audit. The
 earlier plan to delete the pair before publishing the digest is therefore
-withdrawn rather than deferred; both rows are inside `45121fb83fef`, and removing
+withdrawn rather than deferred; both rows are inside `318fb6d65c0f`, and removing
 them later would land it on
-`f3a2b47d322b056e670079125df670c50c25da57e05abccbdc4d76c6f0fa3653`.
+`19aedcad6dfd12111c7d819b484b5f26afc81f3b905592ce986c9fa66882232b`.
 
 Widening the *scanned namespace* remains rejected. A scan that claims one prefix
 is easy to reason about; a handful of exact foreign names with written reasons is

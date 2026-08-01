@@ -11,12 +11,29 @@
 
 ## Scaling model
 
-The deterministic lane scales **horizontally**. One replica serves one model,
-one generation at a time — that serialization is what makes its output
-reproducible, so a replica never gets faster under load, it gets *more
-neighbors*. Capacity planning is therefore simple multiplication:
+The deterministic lane scales **horizontally first**. One replica serves one
+model, and runs `--max-concurrency` generations at once (default: host cores).
+Reproducibility does not come from serializing them: each generation owns its
+decoder and KV cache over read-only weights, so a request emits the same tokens
+whatever runs beside it.
 
-    aggregate throughput = replicas × single-stream throughput
+**Slots do not multiply throughput.** Decode is memory-bandwidth-bound, and
+concurrent generations stream the same weights, so they contend on bandwidth
+rather than sharing out cores. A measured example on an 8-core M4, two clients,
+one 1B model: at one slot the pair finished in 92.5s and the second client spent
+almost all of it queued; at two slots they finished together in 75.9s — 1.22x
+the aggregate, not 2x, with each individual request 1.63x slower than it was
+running alone. Plan capacity as
+
+    aggregate throughput ≈ replicas × single-stream throughput
+
+and treat slots as what removes the *queue*, not what adds capacity: they buy a
+second client an answer that starts now instead of after the first client's
+whole generation. Add replicas for throughput.
+
+Slots are also bounded by memory rather than by correctness — each concurrent
+generation carries its own KV cache, which grows with that request's context —
+so a host serving long contexts near its memory ceiling wants a lower width.
 
 Route tenants to lanes at the gateway above the Service; the per-response
 attribution headers let the gateway and clients verify what they got. Keep each
@@ -77,7 +94,8 @@ comfortably exceed the slowest real generation this deployment serves.
 
 When a replica's queue is full it returns `503` + `Retry-After`; treat that as
 the autoscaling signal (scale on queue-full rate or p95 latency, not CPU — a
-serialized replica at steady decode is *supposed* to sit near its CPU limit).
+replica with every slot busy at steady decode is *supposed* to sit near its CPU
+limit).
 
 ## Trust boundary
 
