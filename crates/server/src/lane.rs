@@ -121,10 +121,20 @@ const REFUSED_FOREIGN: &[(&str, &str)] = &[
 ];
 
 /// Keys the deterministic lane sets to canonical values before the engine
-/// reads any of them. The engine pins its forward pass to the order-stable
-/// CPU path when `CAMELID_DETERMINISTIC` is on; the explicit `false` entries
-/// mirror the engine CLI's own deterministic-mode behavior so the vector is
-/// complete even if a key's default changes upstream.
+/// reads any of them.
+///
+/// **These no longer reach an engine.** They were written for the pinned
+/// engine, which read them: `CAMELID_DETERMINISTIC` pinned its forward pass to
+/// the order-stable CPU path, and the explicit `false` entries mirrored its
+/// CLI's deterministic-mode behavior. Since the in-tree cutover the serving
+/// engine is `engine-core`, which reads no environment variable on any serving
+/// path, so this loop writes fourteen keys nothing reads and the digest over
+/// them describes no tunable. The lane's output guarantee does not depend on
+/// them — it comes from `engine-core` being single-threaded with a fixed
+/// reduction order. Retiring the vector is a versioned identity change and is
+/// deliberately deferred; see
+/// `docs/adr/0003-identity-after-the-engine-cutover.md` for what the published
+/// digest still claims and what triggers the correction.
 ///
 /// Editing this list mints a new public lane identity, and a pure reorder does
 /// it just as surely as a value change — see [`ConfigVector::sha256`] before
