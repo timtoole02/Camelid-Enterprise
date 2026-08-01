@@ -25,6 +25,30 @@ use engine_core::tensor::{Q8_0Block, Q8_0_BLOCK_VALUES};
 /// the same exact i32 block sums and the same single-accumulator f32 reduction
 /// as the portable reference. On other targets it delegates to
 /// [`engine_core::tensor::q8_0_dot_rows`].
+/// The accelerated [`engine_core::tensor::Q8Projection`]: every row of one
+/// projection, through [`q8_0_dot_rows`].
+///
+/// Built on `engine_core`'s generic `project_rows` rather than a hand-rolled
+/// loop, so the row-splitting policy lives in one place for every host. Because
+/// that helper is generic over the leaf kernel, this monomorphizes with
+/// [`q8_0_dot_rows`] inlined — the whole point of the seam being per projection
+/// rather than per row, since the vocabulary head would otherwise cost one
+/// indirect call per output row per token.
+pub fn q8_0_project_rows(
+    weight_blocks: &[Q8_0Block],
+    blocks_per_row: usize,
+    input_blocks: &[Q8_0Block],
+    out: &mut [f32],
+) {
+    engine_core::tensor::project_rows(
+        weight_blocks,
+        blocks_per_row,
+        input_blocks,
+        out,
+        q8_0_dot_rows,
+    )
+}
+
 pub fn q8_0_dot_rows(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     {

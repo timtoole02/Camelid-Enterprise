@@ -12,7 +12,7 @@ use crate::gguf::read_metadata;
 use crate::model::{
     expand_fused_dense_tensors, LlamaModelConfig, LlamaTensorBinding, LlamaWeights,
 };
-use crate::tensor::{q8_0_dot_rows, Q8DotRows, TensorStore};
+use crate::tensor::{q8_0_project_rows, Q8Projection, TensorStore};
 use crate::tokenizer::{TokenId, Tokenizer};
 use crate::{EngineError, Result};
 
@@ -75,21 +75,27 @@ pub struct LoadedModel {
     config: LlamaModelConfig,
     tokenizer: Tokenizer,
     weights: LlamaWeights,
-    q8_dot: Q8DotRows,
+    q8_projection: Q8Projection,
 }
 
 impl LoadedModel {
     /// Load a model using the portable, order-stable Q8_0 dot implementation.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        Self::load_with_q8_dot(path, q8_0_dot_rows)
+        Self::load_with_q8_projection(path, q8_0_project_rows)
     }
 
-    /// Load a model with a caller-supplied Q8_0 kernel.
+    /// Load a model with a caller-supplied Q8_0 projection kernel.
     ///
     /// Platform crates use this seam for an accelerated kernel proven
-    /// bit-identical to the portable reference. All parsing, validation, and
-    /// model ownership remain platform-neutral.
-    pub fn load_with_q8_dot(path: impl AsRef<Path>, q8_dot: Q8DotRows) -> Result<Self> {
+    /// bit-identical to the portable reference. The seam is one call per
+    /// projection, not per row, so an implementation is free to divide the rows
+    /// however its host prefers — including handing the whole projection to a
+    /// device. All parsing, validation, and model ownership remain
+    /// platform-neutral.
+    pub fn load_with_q8_projection(
+        path: impl AsRef<Path>,
+        q8_projection: Q8Projection,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let gguf = read_metadata(path)?;
         let name = gguf.model_name().map(str::to_owned);
@@ -115,7 +121,7 @@ impl LoadedModel {
             config,
             tokenizer,
             weights,
-            q8_dot,
+            q8_projection,
         )
     }
 
@@ -126,7 +132,7 @@ impl LoadedModel {
         config: LlamaModelConfig,
         tokenizer: Tokenizer,
         weights: LlamaWeights,
-        q8_dot: Q8DotRows,
+        q8_projection: Q8Projection,
     ) -> Result<Self> {
         weights.validate_dense_shapes(&config)?;
         let vocab_size = config.vocab_size.ok_or_else(|| {
@@ -147,7 +153,7 @@ impl LoadedModel {
             config,
             tokenizer,
             weights,
-            q8_dot,
+            q8_projection,
         })
     }
 
@@ -199,7 +205,7 @@ impl LoadedModel {
     pub fn generate(&self, prompt_tokens: &[TokenId], max_new_tokens: usize) -> Result<Completion> {
         self.validate_generation_request(prompt_tokens, max_new_tokens)?;
 
-        let mut decoder = Decoder::with_q8_dot(&self.config, &self.weights, self.q8_dot)?;
+        let mut decoder = Decoder::with_q8_projection(&self.config, &self.weights, self.q8_projection)?;
         let generated_tokens = decoder.generate_until(prompt_tokens, max_new_tokens, |token| {
             self.tokenizer.special.eog.contains(&token)
         })?;
@@ -225,7 +231,7 @@ impl LoadedModel {
         self.validate_generation_request(prompt_tokens, max_new_tokens)?;
 
         let mut text_decoder = self.tokenizer.incremental_decoder(true);
-        let mut decoder = Decoder::with_q8_dot(&self.config, &self.weights, self.q8_dot)?;
+        let mut decoder = Decoder::with_q8_projection(&self.config, &self.weights, self.q8_projection)?;
         let output = decoder.generate_until_with_callback(
             prompt_tokens,
             max_new_tokens,
@@ -452,7 +458,7 @@ mod tests {
             config,
             tokenizer,
             weights,
-            q8_0_dot_rows,
+            q8_0_project_rows,
         )
         .unwrap()
     }
