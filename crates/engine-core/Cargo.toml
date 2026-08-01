@@ -10,6 +10,10 @@ repository.workspace = true
 name = "engine_core"
 
 [dependencies]
+# Parallelism across independent output rows of a linear projection. The
+# global pool this uses is the one the serving binary sizes with --threads,
+# so the published worker width describes work that actually happens.
+rayon = "1"
 serde.workspace = true
 
 [dev-dependencies]
