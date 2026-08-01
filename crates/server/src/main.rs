@@ -51,6 +51,15 @@ enum Command {
         /// Worker threads. Sizes this replica's global data-parallel pool, and
         /// the width it actually resolves to is published on every response.
         ///
+        /// Since the engine cutover the pool it sizes has no reader on the
+        /// serving path: `engine-core`'s forward pass is single-threaded and
+        /// contains no `rayon`. The flag still refuses a zero width and still
+        /// publishes the width it resolved, so it remains an honest report of
+        /// the process it describes — but it does not currently change how a
+        /// request is executed. See docs/adr/0003-identity-after-the-engine-cutover.md;
+        /// whether this flag names anything is settled there, with the GPU
+        /// backend, rather than piecemeal.
+        ///
         /// Bound to `CAMELID_ENTERPRISE_THREADS` and not `CAMELID_THREADS`. The
         /// pinned engine reads that second name for its own purposes — and reads
         /// it for *presence*, not value, so setting it changes the engine's
