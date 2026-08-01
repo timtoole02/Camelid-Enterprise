@@ -14,7 +14,7 @@ use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
 use camelid_enterprise::in_tree::{router as in_tree_router, LoadedModelBackend};
 use camelid_enterprise::{
     apply_deterministic, load_startup_model, replica_router, Attribution, ModelIdentity,
-    WorkerThreads,
+    NumericPosture, WorkerThreads,
 };
 use engine_core::runtime::{GenerationControl, IncrementalGeneration, LoadedModel};
 use http_body_util::BodyExt;
@@ -85,12 +85,17 @@ fn post_json(path: &str, body: Value) -> Request<Body> {
         .unwrap()
 }
 
-/// All six identity fields, on every response this harness drives.
+/// All seven identity fields, on every response this harness drives.
 ///
 /// The first three were the whole of this check before, which left the model
 /// digest — the field that changes every token while changing nothing else, and
 /// the only one this harness can verify against real weights — unasserted on the
 /// one path CI runs with a model loaded.
+///
+/// The posture is asserted at its literal published value rather than against
+/// `expected`, because unlike the digests it is not something this harness
+/// computes: it is the constant the kernel that actually ran declares, and
+/// comparing it to a copy of itself would assert nothing.
 fn assert_attribution(response: &axum::response::Response, expected: &Published) {
     assert_eq!(response.headers()["x-camelid-lane"], "deterministic");
     assert_eq!(
@@ -110,6 +115,7 @@ fn assert_attribution(response: &axum::response::Response, expected: &Published)
         response.headers()["x-camelid-worker-threads"],
         expected.workers.to_string()
     );
+    assert_eq!(response.headers()["x-camelid-posture"], "bit-identical");
 }
 
 async fn send(app: axum::Router, request: Request<Body>) -> axum::response::Response {
@@ -291,6 +297,7 @@ async fn real_model_conforms_to_replica_http_v1() {
         model: model_identity,
         host: Arc::new(TEST_HOST.to_string()),
         workers,
+        posture: NumericPosture::BitIdentical,
         receipts: None,
     };
     let loaded_model = LoadedModel::load(&model)
@@ -382,6 +389,7 @@ async fn real_model_conforms_to_replica_http_v1() {
     assert_eq!(first["camelid_admission_sha256"], &expected.admission[..12]);
     assert_eq!(first["camelid_host"], TEST_HOST);
     assert_eq!(first["camelid_worker_threads"], json!(expected.workers));
+    assert_eq!(first["camelid_posture"], "bit-identical");
 
     let second = send(app.clone(), post_json("/v1/chat/completions", request)).await;
     assert_eq!(second.status(), StatusCode::OK);

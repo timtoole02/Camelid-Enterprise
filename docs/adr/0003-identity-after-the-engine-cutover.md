@@ -111,14 +111,32 @@ published copy moves, and clients comparing replicas across the change get a
 false negative. It is worth doing once.
 
 It is not worth doing twice, and doing it now would be doing it twice. The
-in-tree engine is CPU-only today (`engine-core` has no GPU backend, and the
-macOS crate supplies one Q8_0 kernel through an explicit seam). A GPU backend is
-planned for macOS/Metal and for Windows and Linux. That work will introduce the
-first execution posture this replica can actually vary on — resident versus
-portable kernels, device present or not, per-host kernel selection — which is
-precisely the material a configuration vector should describe. Designing the
-vector before that variance exists would produce a second vector describing
-nothing.
+in-tree engine is CPU-only today (`engine-core` has no GPU backend; the macOS and
+Windows crates each supply one Q8_0 kernel through an explicit seam, proven
+bit-identical to the portable one, so they vary speed and not output). A GPU
+backend is planned for macOS/Metal and for Windows and Linux.
+
+Per-host kernel selection is not the trigger, and it already exists: each
+platform crate picks between an accelerated kernel and the portable reference at
+runtime, on `dotprod` or on `avx2`. It is output-invariant by construction — the
+accelerated kernel is admitted only against a bit-identity proof — so two hosts
+that route differently still answer identically, which is exactly why it does not
+need a published discriminator. A GPU backend is different: it would introduce
+the first execution posture this replica can vary its *output* on — device
+present or not, resident versus host-side execution, a reduction order the
+hardware picks rather than the source. That is precisely the material a
+configuration vector should describe. Designing the vector before that variance
+exists would produce a second vector describing nothing.
+
+That posture now has a field to arrive in. `x-camelid-posture` /
+`camelid_posture` / the receipt's `posture` is published today at
+`bit-identical`, which is what every kernel here truthfully is, precisely so the
+GPU lane lands as a value change on a field consumers already read rather than
+as a new surface bolted on at the moment the claim weakens (ADR 0002 §9). It
+does not pre-empt anything this record defers: unlike a configuration vector, a
+posture is not a digest, it is in no digest preimage, and adding it retires no
+published identity — so it is available now without the versioned
+identity-contract change above, and the trigger below is unchanged by it.
 
 **Trigger:** the first change that gives `engine-core` more than one execution
 path for the same model on the same host. At that point, in one versioned

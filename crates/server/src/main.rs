@@ -21,7 +21,8 @@
 // that happens, which is what keeps the surface a client meets and the surface
 // the tests drive from being two different things.
 use camelid_enterprise::{
-    apply_deterministic, replica_router, Attribution, ModelIdentity, WorkerThreads, ENGINE_PIN,
+    apply_deterministic, replica_router, Attribution, ModelIdentity, NumericPosture, WorkerThreads,
+    ENGINE_PIN,
 };
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
@@ -145,6 +146,34 @@ async fn serve(
     let host = engine_windows::probe();
     let host_summary = host.summary();
 
+    // The kernel and the numeric contract it holds to, bound as one pair.
+    //
+    // Two independent cfg cascades — one choosing the kernel, one choosing the
+    // posture — would let the published claim drift from the code making it,
+    // which is the whole reason a posture is declared beside its kernel rather
+    // than at the point of use. Binding them makes "take the kernel without its
+    // posture" impossible to express here. It also avoids doubling the
+    // shadowing hazard the loader comment below already warns about.
+    //
+    // The macOS arm writes `BitIdentical` here instead of taking
+    // `engine_macos::POSTURE`, because that crate is not editable in this lane.
+    // It is the same claim its kernel already makes — the NEON dot is tested
+    // bit-identical to the portable reference — and moving it into engine-macos
+    // later replaces this literal rather than leaving a second place to edit.
+    #[cfg(target_os = "macos")]
+    let (q8_dot, posture): (engine_core::tensor::Q8DotRows, NumericPosture) =
+        (engine_macos::q8_0_dot_rows, NumericPosture::BitIdentical);
+    #[cfg(target_os = "windows")]
+    let (q8_dot, posture): (engine_core::tensor::Q8DotRows, NumericPosture) =
+        (engine_windows::q8_0_dot_rows, engine_windows::POSTURE);
+    // The portable arm is the reference itself, so its posture is bit-identical
+    // by definition rather than by measurement.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let (q8_dot, posture): (engine_core::tensor::Q8DotRows, NumericPosture) = (
+        engine_core::tensor::q8_0_dot_rows,
+        NumericPosture::BitIdentical,
+    );
+
     // Before the engine state, and before the listener: everything this replica
     // publishes about itself has to be settled before it can answer anything.
     //
@@ -172,12 +201,13 @@ async fn serve(
 
     eprintln!(
         "[lane] deterministic | in-tree engine | parity oracle pin {} | config vector sha256 {} | admission sha256 {} | \
-         model sha256 {} | host {} | worker threads {} | generation slots {}",
+         model sha256 {} | host {} | posture {} | worker threads {} | generation slots {}",
         ENGINE_PIN,
         config.short(),
         config.admission_short(),
         model_identity.short(),
         host_summary,
+        posture.published(),
         workers.count(),
         generation_slots
     );
@@ -196,6 +226,7 @@ async fn serve(
         model: model_identity,
         host: Arc::new(host_summary),
         workers,
+        posture,
         receipts: serving_receipts.map(Arc::new),
     };
 
@@ -208,16 +239,20 @@ async fn serve(
     eprintln!("[lane] listening on http://{addr}");
     eprintln!("[lane] loading model; nothing is served until the load completes");
 
-    // Platform crates may supply an accelerated kernel only through a seam that
-    // is proven bit-identical to the portable implementation. Model ownership
-    // remains in-tree and in-process; no load/unload control-plane router exists.
-    #[cfg(target_os = "macos")]
-    let loaded_model = engine_core::runtime::LoadedModel::load_with_q8_dot(
-        &model,
-        engine_macos::q8_0_dot_rows,
-    )?;
-    #[cfg(not(target_os = "macos"))]
-    let loaded_model = engine_core::runtime::LoadedModel::load(&model)?;
+    // Platform crates may supply an accelerated kernel only through a seam whose
+    // numeric contract is declared beside the kernel and published on every
+    // response. Model ownership remains in-tree and in-process; no load/unload
+    // control-plane router exists.
+    //
+    // One uncfg'd load, over the kernel selected with its posture above. The
+    // fallback arm there is narrowed against every arm above it rather than left
+    // as `not(macos)`, and this is why: two live arms would both compile — a
+    // second `let` is legal shadowing — so before the pair was bound the replica
+    // would have performed the multi-gigabyte load twice and served from the
+    // portable one, with an `unused_variables` warning as the only signal and no
+    // job that denies it. Behaviour on the portable arm is unchanged:
+    // `LoadedModel::load` is defined as `load_with_q8_dot(path, q8_0_dot_rows)`.
+    let loaded_model = engine_core::runtime::LoadedModel::load_with_q8_dot(&model, q8_dot)?;
 
     // Re-verify the digest and compose in the library, so the stack this process
     // serves is exactly the stack the model-backed contract drives.
@@ -361,6 +396,7 @@ mod tests {
                 .expect("this crate's own manifest is readable"),
             host: Arc::new("test/host cores=1 simd=none".to_string()),
             workers: WorkerThreads::resolved(1),
+            posture: NumericPosture::BitIdentical,
             receipts: None,
         };
         let served_model = Arc::new(ServedModel::new(
@@ -474,6 +510,7 @@ mod tests {
                 "x-camelid-model-sha256",
                 "x-camelid-host",
                 "x-camelid-worker-threads",
+                "x-camelid-posture",
             ] {
                 assert!(headers.contains_key(name), "{method} {path} lost {name}");
             }
@@ -520,6 +557,7 @@ mod tests {
             "x-camelid-model-sha256",
             "x-camelid-host",
             "x-camelid-worker-threads",
+            "x-camelid-posture",
         ] {
             assert!(response.headers().contains_key(name), "a refusal lost {name}");
         }

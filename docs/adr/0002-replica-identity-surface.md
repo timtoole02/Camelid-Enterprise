@@ -559,6 +559,10 @@ So the questions get separate fields, and none impersonates another:
 - **`host`** and **`worker_threads`** — *is this the same machine, at the same
   width?* Vary across a fleet by design. Diffing them detects what the digests are
   deliberately blind to.
+- **`posture`** — *what numeric contract does the kernel that produced these
+  tokens hold to?* Constant across a fleet running one backend, and the field
+  that moves when a replica is served by a path admitted under a published
+  tolerance rather than a bit-identity proof. See §9.
 
 The honest consequence, stated plainly because a reader will otherwise assume it
 away: **two replicas may publish the same `config_sha256` and still emit
@@ -840,6 +844,60 @@ environment writes specifically. It is not a general licence for the replica's
 state to drift after startup, and anything else that turns out to be mutable
 after the gate deserves the same treatment rather than a footnote here.
 
+### 9. The numeric posture is published, and is in neither digest
+
+Every kernel this workspace ships is bit-identical to the portable reference:
+the macOS NEON Q8_0 dot and the Windows AVX2 one are each admitted through
+engine-core's seam only against a bit-identity proof, so per-host kernel
+selection varies speed and not output. That will not stay true. A GPU lane is
+planned, and it is expected to be admitted under its own numeric contract — a
+published maximum relative error against the CPU reference and a measured top-1
+agreement floor over a fixed prompt set — rather than under a claim of
+bit-equality it cannot make.
+
+So the replica publishes which posture it is serving under, as
+`x-camelid-posture` / `camelid_posture` / the receipt's `posture`. Today every
+replica publishes `bit-identical`. The value of shipping it at that value now,
+rather than at the moment the claim weakens, is that the GPU lane then arrives
+as a *value change on an existing field* — which every existing client already
+reads and compares — rather than as a new surface appearing exactly when the
+guarantee gets weaker, which is the worst possible moment to ask consumers to
+adopt a field.
+
+**Its own field, not bytes in `config_sha256`.** This is the same argument §5
+makes for `host` and `worker_threads`, and it is the argument that decides it: a
+digest is worth publishing only if it is constant across every conforming
+replica. Folding the posture in makes `config_sha256` a function of the backend,
+so two replicas running one audited configuration on two backends publish
+different configuration digests and the field stops answering "is this the
+audited configuration?". It would also move a value tests pin at full 64 hex,
+retiring a published identity for a change that alters no applied value — the
+precise thing §1 refuses to do to `admission_sha256`.
+
+It is likewise not operator-settable, by flag or by environment. A posture an
+operator can set is a replica declaring a numeric contract it did not prove; it
+is a compile-time constant declared by the crate that supplies the kernel, next
+to the kernel, so the claim cannot drift from the code making it. Giving it an
+admission permit would additionally move `admission_sha256`, which is the one
+way this change could have retired a digest.
+
+**On all three surfaces, not the header alone.** Without the body field, a
+bit-identical replica and a tolerance-conformant one have byte-identical
+completion bodies across every attribution field — the same defect the
+`camelid_host` correction in §4 exists to fix, in the same place, for the same
+reason. A client verifying attribution from the body is the case the README
+demonstrates.
+
+**The caveat, recorded rather than discovered later: posture is per-path.** A
+replica may legitimately be tolerance-conformant on prefill and bit-identical on
+decode. One replica-wide value is a true statement today only because one seam
+(engine-core's Q8_0 dot) serves every projection in both phases. The first path
+with a posture of its own must make the field per-path; collapsing to the
+weakest member would publish `tolerance-conformant` for a decode that is
+bit-identical, which destroys the only thing the field answers. That obligation
+is documentation on `engine_core::posture::NumericPosture` and nothing in the
+tree enforces it, which is stated here so the gap is on the record.
+
 ---
 
 ## Consequences
@@ -1012,6 +1070,11 @@ own output:
 7. **The frozen vector itself** — a canonical key the new engine no longer reads
    is dead weight inside a public digest, which is what
    `every_canonical_key_is_read_by_the_engine` exists to catch.
+
+The **numeric posture** does not move at a pin bump. It describes the kernel this
+workspace supplies through the seam, not the pinned engine, so a bump changes it
+only if it changes which kernel is supplied — and then the constant beside that
+kernel is the one edit, because every published copy reads it.
 
 ---
 

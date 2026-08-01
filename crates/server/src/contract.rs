@@ -304,6 +304,7 @@ mod tests {
     use axum::http::header::ALLOW;
     use axum::http::{Method, Request, StatusCode};
     use axum::Router;
+    use engine_core::posture::NumericPosture;
     use std::path::Path;
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -346,6 +347,7 @@ mod tests {
                 .expect("this crate's own manifest is readable"),
             host: Arc::new(TEST_HOST.to_string()),
             workers: WorkerThreads::resolved(TEST_THREADS),
+            posture: NumericPosture::BitIdentical,
             receipts: None,
         }
     }
@@ -361,7 +363,7 @@ mod tests {
 
     /// Every identity field, on every response these tests drive.
     ///
-    /// All six and not the first three, and the omission this repairs was not
+    /// All seven and not the first three, and the omission this repairs was not
     /// cosmetic. `attributed_router` is the composition this file and the
     /// model-backed conformance harness both run, and it is the only place the
     /// admission digest, the model digest and the worker width are published
@@ -390,6 +392,7 @@ mod tests {
             response.headers()["x-camelid-worker-threads"],
             TEST_THREADS.to_string()
         );
+        assert_eq!(response.headers()["x-camelid-posture"], "bit-identical");
     }
 
     #[test]

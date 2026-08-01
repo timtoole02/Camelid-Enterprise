@@ -103,8 +103,8 @@ the names a `Connection` header nominates, and its contract tests assert that
 unchanged through the real proxy. So a load balancer probing *through* a gateway
 still sees the replica's own identity, and the identity-pinning probe below works
 from either side. (The contract suite has not yet been extended to
-`x-camelid-admission-sha256`, `x-camelid-model-sha256` and
-`x-camelid-worker-threads`; the forwarding rule is name-agnostic, so they pass
+`x-camelid-admission-sha256`, `x-camelid-model-sha256`,
+`x-camelid-worker-threads` and `x-camelid-posture`; the forwarding rule is name-agnostic, so they pass
 through for the same reason, but they are not pinned by a test yet.)
 
 launchd expresses no ordering between jobs. None is needed at boot — while the
@@ -211,6 +211,7 @@ curl -fsS --max-time 3 -D "$H" -o "$B" http://127.0.0.1:8181/v1/health \
   && grep -qi '^x-camelid-admission-sha256: 318fb6d65c0f' "$H" \
   && grep -qi '^x-camelid-model-sha256: <first 12 hex>'   "$H" \
   && grep -qi '^x-camelid-worker-threads: 8'              "$H" \
+  && grep -qi '^x-camelid-posture: bit-identical'       "$H" \
   && grep -q  '"generation_ready":true'                   "$B"
 ```
 
@@ -224,6 +225,7 @@ worth pinning:
 | `x-camelid-model-sha256` | a replica serving different weights under the same file name |
 | `x-camelid-host` | a replica that came up on the wrong hardware class |
 | `x-camelid-worker-threads` | a replica at the wrong pool width |
+| `x-camelid-posture` | a replica serving under a different numeric contract than the one you audited |
 
 Get the model value with `shasum -a 256 <your GGUF> | cut -c1-12`. The
 configuration digest is `30d77c260803` at engine pin

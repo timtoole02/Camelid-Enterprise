@@ -31,20 +31,21 @@ It runs as a single Rust binary serving an OpenAI-compatible API — the same on
 
 ```console
 $ camelid-enterprise serve --model /srv/models/Llama-3.2-1B-Instruct-Q8_0.gguf
-[lane] deterministic | in-tree engine | parity oracle pin b4e3a9056567ed8145fc4fa29850d6f1f261ac2b | config vector sha256 30d77c260803 | admission sha256 318fb6d65c0f | model sha256 3f8a1c04b7e2 | host macos/aarch64 cores=8 simd=dotprod+i8mm+neon | worker threads 8 | generation slots 8
+[lane] deterministic | in-tree engine | parity oracle pin b4e3a9056567ed8145fc4fa29850d6f1f261ac2b | config vector sha256 30d77c260803 | admission sha256 318fb6d65c0f | model sha256 3f8a1c04b7e2 | host macos/aarch64 cores=8 simd=dotprod+i8mm+neon | posture bit-identical | worker threads 8 | generation slots 8
 [lane] model /srv/models/Llama-3.2-1B-Instruct-Q8_0.gguf
 [lane] listening on http://127.0.0.1:8181
 [lane] loading model; nothing is served until the load completes
 [lane] model loaded as 'Llama 3.2 1B Instruct'; replica ready
 
 $ curl -s http://127.0.0.1:8181/v1/chat/completions -d '{ … }' \
-    | jq '{camelid_lane, camelid_config_sha256, camelid_admission_sha256, camelid_model_sha256, camelid_host, camelid_worker_threads}'
+    | jq '{camelid_lane, camelid_config_sha256, camelid_admission_sha256, camelid_model_sha256, camelid_host, camelid_posture, camelid_worker_threads}'
 {
   "camelid_lane": "deterministic",
   "camelid_config_sha256": "30d77c260803",
   "camelid_admission_sha256": "318fb6d65c0f",
   "camelid_model_sha256": "3f8a1c04b7e2",
   "camelid_host": "macos/aarch64 cores=8 simd=dotprod+i8mm+neon",
+  "camelid_posture": "bit-identical",
   "camelid_worker_threads": 8
 }
 ```
@@ -54,7 +55,7 @@ $ curl -s http://127.0.0.1:8181/v1/chat/completions -d '{ … }' \
 LLM serving stacks quietly trade reproducibility for performance. Batching, speculative decoding, and per-deployment kernel tuning all change the numerics under a request, so the same prompt can produce different output depending on load, neighbors, and flags — and nothing in the response tells you which you got. For chat, that's fine. For evaluations, regression testing, caching, audit trails, and regulated workloads, it isn't.
 
 - **Reproducible output, on purpose.** On the deterministic lane, the same greedy request yields the identical token stream on every run — including across process restarts.
-- **Execution posture is declared, not accidental.** A replica declares its lane at startup; the response carries which one produced it, under which configuration, from which weights, on which machine, at which pool width.
+- **Execution posture is declared, not accidental.** A replica declares its lane at startup; the response carries which one produced it, under which configuration, from which weights, on which machine, at which pool width — and under which numeric contract, since acceleration will not always be bit-identical and `camelid_posture` is where a replica says which it is serving under rather than leaving a client to assume.
 - **Fails closed.** A configuration that would move a replica off its declared posture is a startup error, not a silent degradation. Admission is deny-by-default: an environment variable nobody wrote a rule for is refused, rather than waved through because nobody listed it as dangerous — and the admission policy itself is published as a digest, so a client can tell two builds apart by what they would refuse.
 - **Attribution everywhere.** Every response is tagged in headers, in the completion body, and in an optional audit receipt.
 - **A serving surface, not an application.** The replica serves the routes of a versioned HTTP contract — generation, model listing, health, and the engine's own typed compatibility replies — and refuses the rest of its router, model management and runtime control included. It also refuses a generation request that names weights other than its own, because the engine resolves that field against the filesystem — withholding the model-management routes is necessary and, on its own, is not enough.
@@ -147,12 +148,12 @@ Every response is attributable to the lane that produced it, in three places so 
 
 | Location | Fields |
 |---|---|
-| **Response headers** (streams included) | `x-camelid-lane`, `x-camelid-config-sha256`, `x-camelid-admission-sha256`, `x-camelid-model-sha256`, `x-camelid-host`, `x-camelid-worker-threads` |
-| **Completion body** (non-streaming JSON) | `camelid_lane`, `camelid_config_sha256`, `camelid_admission_sha256`, `camelid_model_sha256`, `camelid_host`, `camelid_worker_threads` |
+| **Response headers** (streams included) | `x-camelid-lane`, `x-camelid-config-sha256`, `x-camelid-admission-sha256`, `x-camelid-model-sha256`, `x-camelid-host`, `x-camelid-posture`, `x-camelid-worker-threads` |
+| **Completion body** (non-streaming JSON) | `camelid_lane`, `camelid_config_sha256`, `camelid_admission_sha256`, `camelid_model_sha256`, `camelid_host`, `camelid_posture`, `camelid_worker_threads` |
 | **Serving receipt** (opt-in, `--serving-receipts <path>`) | one JSONL line per request, digests at full length, plus the gateway's `request_id` |
 
 ```json
-{"admission_sha256":"318fb6d65c0fb2cd3630594b08cc70a1bc3ae0bca7b8bd15c121458e651959f6","config_sha256":"30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7","host":"macos/aarch64 cores=8 simd=dotprod+i8mm+neon","lane":"deterministic","method":"POST","model_sha256":"3f8a1c04b7e2d95608f31a7c4be0d2593a6e18cf7b402d95e6c1380af472bb19","path":"/v1/chat/completions","request_id":"req_9f2c1ad4e7b30516","status":200,"ts":1784845685.882345,"worker_threads":8}
+{"admission_sha256":"318fb6d65c0fb2cd3630594b08cc70a1bc3ae0bca7b8bd15c121458e651959f6","config_sha256":"30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7","host":"macos/aarch64 cores=8 simd=dotprod+i8mm+neon","lane":"deterministic","method":"POST","model_sha256":"3f8a1c04b7e2d95608f31a7c4be0d2593a6e18cf7b402d95e6c1380af472bb19","path":"/v1/chat/completions","posture":"bit-identical","request_id":"req_9f2c1ad4e7b30516","status":200,"ts":1784845685.882345,"worker_threads":8}
 ```
 
 `request_id` is the one receipt field the replica does not mint. It is the
@@ -304,7 +305,7 @@ crates/
 │                     quant/tensor kernels, deterministic decode. No host code.
 ├── engine-macos/     Apple Silicon backend — NEON / dot-product kernels.
 ├── engine-linux/     Linux backend — x86 AVX/VNNI and CUDA (in progress).
-├── engine-windows/   Windows backend (in progress).
+├── engine-windows/   Windows backend — x86-64 AVX2 Q8_0 kernel.
 ├── gateway/          Transparent streaming entry point in front of replicas.
 ├── identity/         Bearer token → opaque principal id, for the gateway.
 ├── replica-contract/ Dependency-free public route registry, shared by both.

@@ -24,8 +24,10 @@ The production path is:
 8. apply attribution outermost and begin serving.
 
 On macOS the loader supplies `engine_macos::q8_0_dot_rows` through the runtime's
-explicit Q8_0 kernel seam. Its output is tested bit-for-bit against the portable
-implementation. Other supported hosts currently use the portable kernel.
+explicit Q8_0 kernel seam, and on Windows `engine_windows::q8_0_dot_rows`. Both
+are tested bit-for-bit against the portable implementation; the Windows kernel
+routes to AVX2 or to the portable reference itself, so a host without AVX2 takes
+the same numbers by a different path. Linux currently uses the portable kernel.
 
 ## Owned runtime
 

@@ -136,7 +136,7 @@ network. The gateway logs a warning to this effect at startup.
 
 ## What a replica publishes, and what it serves
 
-Every response carries six headers, and they answer different questions. A
+Every response carries seven headers, and they answer different questions. A
 consumer that compares one of them has checked one of them.
 
 | Header | Answers |
@@ -147,10 +147,11 @@ consumer that compares one of them has checked one of them.
 | `x-camelid-model-sha256` | are these the weights I audited? (12 hex; `shasum -a 256` of the GGUF) |
 | `x-camelid-host` | is this the hardware class the guarantee is scoped to? |
 | `x-camelid-worker-threads` | is this the pool width the pool actually came up at? |
+| `x-camelid-posture` | is this the numeric contract I audited? (`bit-identical`, or a declared tolerance) |
 
 Non-streaming completion bodies carry the same facts as `camelid_lane`,
 `camelid_config_sha256`, `camelid_admission_sha256`, `camelid_model_sha256`,
-`camelid_host` and `camelid_worker_threads`, and each serving receipt carries them with the digests
+`camelid_host`, `camelid_worker_threads` and `camelid_posture`, and each serving receipt carries them (as `posture` for the last) with the digests
 at full length. The gateway does not strip them — it removes only hop-by-hop
 headers and the names a `Connection` header nominates — so a probe *through* the
 gateway still sees the replica's own identity. Its contract tests pin that for

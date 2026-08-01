@@ -5,15 +5,16 @@
 //! Three locations, so no consumer misses it:
 //! - `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-admission-sha256`
 //!   / `x-camelid-model-sha256` / `x-camelid-host` / `x-camelid-worker-threads`
-//!   headers on every response (including streams);
+//!   / `x-camelid-posture` headers on every response (including streams);
 //! - `camelid_lane` / `camelid_config_sha256` / `camelid_admission_sha256` /
-//!   `camelid_model_sha256` / `camelid_host` / `camelid_worker_threads` fields
-//!   injected into non-streaming completion JSON bodies;
+//!   `camelid_model_sha256` / `camelid_host` / `camelid_worker_threads` /
+//!   `camelid_posture` fields injected into non-streaming completion JSON
+//!   bodies;
 //! - an optional append-only serving-receipt log (JSONL), one line per request,
 //!   carrying the same facts as `lane`, `config_sha256`, `admission_sha256`,
-//!   `model_sha256`, `host` and `worker_threads`, and — when present — the
-//!   gateway-stamped `request_id` that joins the receipt to the gateway's audit
-//!   record for the same request.
+//!   `model_sha256`, `host`, `worker_threads` and `posture`, and — when
+//!   present — the gateway-stamped `request_id` that joins the receipt to the
+//!   gateway's audit record for the same request.
 //!
 //! These are separate fields because they are separate claims, and none stands
 //! in for another.
@@ -46,6 +47,33 @@
 //! attribution from the body — which is what the README demonstrates, and the
 //! only surface a response-body-shaped client library exposes without extra
 //! work — could not tell them apart on the one axis that had moved.
+//!
+//! **Numeric posture** is the contract the kernel that produced these tokens
+//! holds to, and it is published because acceleration will not always be
+//! bit-identical. Every kernel this workspace ships is bit-identical to the
+//! portable reference today, so the published value is the same everywhere; a
+//! path admitted under a declared tolerance instead is what the field is here
+//! for, and shipping it now means that arrival moves a value rather than adding
+//! a surface at the moment the claim weakens.
+//!
+//! It is deliberately NOT folded into `config_sha256`, for the same reason
+//! `host` is not: that digest identifies a *configuration*, byte-identical
+//! across a conforming fleet, which is what makes comparing it worth anything.
+//! Folding the posture in would move a value tests pin at full 64 hex and would
+//! make two replicas running one audited configuration on different backends
+//! publish different configuration digests — the per-hardware lookup table these
+//! fields exist to eliminate.
+//!
+//! It is on the body and not only on the header for the reason `camelid_host`
+//! is: without it, a bit-identical replica and a tolerance-conformant one have
+//! byte-identical completion bodies across every attribution field, and a client
+//! verifying attribution from the body — the surface the README demonstrates,
+//! and the only one a response-shaped client library exposes without extra
+//! work — could not see the one axis that had moved.
+//!
+//! It is a replica-wide value today only because one seam serves every path. See
+//! `engine_core::posture::NumericPosture` for what a second path with its own
+//! posture obliges, which is not "publish the weakest one".
 //!
 //! **Model identity** is the content of the weights, and it is here because it
 //! is the one input that changes every token while changing nothing else. The
@@ -87,6 +115,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use engine_core::posture::NumericPosture;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -313,6 +342,16 @@ pub struct Attribution {
     /// banner prints, e.g. `linux/x86_64 cores=16 simd=...`). Attributed on
     /// every response and receipt; never an input to `config_sha256`.
     pub host: Arc<String>,
+    /// The numeric contract the kernel that produced these tokens holds to.
+    ///
+    /// A compile-time constant chosen by target — the platform crate that
+    /// supplies the kernel declares it beside the kernel — so it is not
+    /// operator-settable by flag or by environment, and it is an input to
+    /// neither digest. Both of those are load-bearing: a posture an operator can
+    /// set is a replica declaring a numeric contract it did not prove, and a
+    /// posture in a digest preimage retires a published identity every time a
+    /// backend changes.
+    pub posture: NumericPosture,
     /// Resolved worker-pool width. Machine state, like `host`, and published for
     /// the same reason: it is not in any digest and cannot be recovered from
     /// one.
@@ -348,10 +387,16 @@ impl Attribution {
         if let Ok(value) = HeaderValue::from_str(self.host.as_str()) {
             headers.insert("x-camelid-host", value);
         }
-        // No fallible conversion on these two: both were rendered and validated
-        // at startup, so there is no failure left to swallow.
+        // No fallible conversion on these three: the first two were rendered and
+        // validated at startup, and `published()` returns a `&'static str`
+        // precisely so the posture has no conversion that could fail and be
+        // swallowed on the one surface a streaming client can read.
         headers.insert("x-camelid-model-sha256", self.model.short.clone());
         headers.insert("x-camelid-worker-threads", self.workers.header.clone());
+        headers.insert(
+            "x-camelid-posture",
+            HeaderValue::from_static(self.posture.published()),
+        );
     }
 
     /// Add the attribution fields to a completion body.
@@ -376,6 +421,7 @@ impl Attribution {
         obj.insert("camelid_model_sha256".into(), self.model.short().into());
         obj.insert("camelid_host".into(), self.host.as_str().into());
         obj.insert("camelid_worker_threads".into(), self.workers.count.into());
+        obj.insert("camelid_posture".into(), self.posture.published().into());
     }
 
     /// One serving-receipt line.
@@ -410,6 +456,7 @@ impl Attribution {
             "model_sha256": self.model.sha256.as_str(),
             "host": self.host.as_str(),
             "worker_threads": self.workers.count,
+            "posture": self.posture.published(),
         })
     }
 }
@@ -535,6 +582,7 @@ mod tests {
     use axum::response::Response;
     use axum::routing::{get, post};
     use axum::{Json, Router};
+    use engine_core::posture::Tolerance;
     use std::path::Path;
     use tower::ServiceExt;
 
@@ -583,6 +631,7 @@ mod tests {
             model: model(model_sha),
             host: Arc::new(TEST_HOST.to_string()),
             workers: WorkerThreads::resolved(TEST_THREADS),
+            posture: NumericPosture::BitIdentical,
             receipts,
         }
     }
@@ -591,6 +640,19 @@ mod tests {
     fn ctx_on_host(host: &str, receipts: Option<Arc<PathBuf>>) -> Attribution {
         Attribution {
             host: Arc::new(host.to_string()),
+            ..ctx_full(TEST_MODEL_SHA, TEST_ADMISSION_SHA, receipts)
+        }
+    }
+
+    /// The same replica under a different numeric contract: only `posture`
+    /// moves. The tolerance's numbers are arbitrary — none of them reaches the
+    /// wire, only the variant does.
+    fn ctx_with_posture(
+        posture: NumericPosture,
+        receipts: Option<Arc<PathBuf>>,
+    ) -> Attribution {
+        Attribution {
+            posture,
             ..ctx_full(TEST_MODEL_SHA, TEST_ADMISSION_SHA, receipts)
         }
     }
@@ -615,8 +677,8 @@ mod tests {
     }
 
     /// Every response carries lane, config vector, admission policy, model
-    /// digest, host and worker width — even on a non-completion path, whose body
-    /// is left alone.
+    /// digest, host, worker width and numeric posture — even on a non-completion
+    /// path, whose body is left alone.
     #[tokio::test]
     async fn headers_on_every_response_body_untouched_off_completion_paths() {
         let app = attributed(Router::new().route(
@@ -634,6 +696,7 @@ mod tests {
         assert_eq!(header(&resp, "x-camelid-model-sha256"), TEST_MODEL_SHA[..12]);
         assert_eq!(header(&resp, "x-camelid-host"), TEST_HOST);
         assert_eq!(header(&resp, "x-camelid-worker-threads"), "6");
+        assert_eq!(header(&resp, "x-camelid-posture"), "bit-identical");
 
         let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
         assert!(
@@ -793,7 +856,75 @@ mod tests {
         assert_eq!(one_body["camelid_worker_threads"], two_body["camelid_worker_threads"]);
     }
 
-    /// A JSON completion body gains all six fields, each matching its header
+    /// Two replicas serving under different numeric contracts must not publish
+    /// identical attribution on any of the three surfaces.
+    ///
+    /// This is the test that measures the posture field's power, and it is why
+    /// `NumericPosture` carries a second variant before any kernel in this tree
+    /// declares one: with a single variant nothing here could construct a second
+    /// posture, and the field would ship on three surfaces with no test able to
+    /// show it distinguishes anything.
+    ///
+    /// The shape is the `host` test's, for the same reason: everything else
+    /// these two replicas publish is byte-identical — same weights, same
+    /// configuration, same admission policy, same hardware class, same pool
+    /// width — so this field is the only thing that could tell a bit-identical
+    /// replica from one admitted under a tolerance. The body assertion is the
+    /// one that matters most, because a body-shaped client sees no headers.
+    #[tokio::test]
+    async fn two_postures_render_differently_everywhere_they_are_published() {
+        const TOLERANT: NumericPosture =
+            NumericPosture::Conformant(Tolerance::new(1e-3, 0.998, "eval/greedy-512"));
+
+        async fn responses(posture: NumericPosture) -> (String, serde_json::Value, String) {
+            let dir = tempfile::tempdir().unwrap();
+            let receipts = dir.path().join("receipts.jsonl");
+            let app = Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    post(|| async { Json(serde_json::json!({ "id": "chatcmpl-1" })) }),
+                )
+                .layer(from_fn_with_state(
+                    ctx_with_posture(posture, Some(Arc::new(receipts.clone()))),
+                    attribute,
+                ));
+            let resp = app
+                .oneshot(Request::post("/v1/chat/completions").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let header_value = header(&resp, "x-camelid-posture");
+            let body: serde_json::Value =
+                serde_json::from_str(&read_body(resp).await).unwrap();
+            let receipt = read_receipts(&receipts, 1).await.remove(0);
+            (header_value, body, receipt["posture"].as_str().unwrap().to_string())
+        }
+
+        let (one_header, one_body, one_receipt) =
+            responses(NumericPosture::BitIdentical).await;
+        let (two_header, two_body, two_receipt) = responses(TOLERANT).await;
+
+        assert_eq!(one_header, "bit-identical");
+        assert_eq!(two_header, "tolerance-conformant");
+        assert_ne!(one_header, two_header, "the header must distinguish the postures");
+        assert_eq!(one_body["camelid_posture"], "bit-identical");
+        assert_ne!(
+            one_body["camelid_posture"], two_body["camelid_posture"],
+            "the completion body must distinguish the postures"
+        );
+        assert_eq!(one_receipt, "bit-identical");
+        assert_ne!(one_receipt, two_receipt, "the receipt must distinguish the postures");
+
+        // …while every other published field is identical. That is what makes
+        // this field the only thing that could have told them apart, and it is
+        // also the assertion that fails if the posture ever leaks into a digest.
+        assert_eq!(one_body["camelid_config_sha256"], two_body["camelid_config_sha256"]);
+        assert_eq!(one_body["camelid_admission_sha256"], two_body["camelid_admission_sha256"]);
+        assert_eq!(one_body["camelid_model_sha256"], two_body["camelid_model_sha256"]);
+        assert_eq!(one_body["camelid_host"], two_body["camelid_host"]);
+        assert_eq!(one_body["camelid_worker_threads"], two_body["camelid_worker_threads"]);
+    }
+
+    /// A JSON completion body gains all seven fields, each matching its header
     /// where both are published, and its original fields survive.
     #[tokio::test]
     async fn completion_json_body_is_attributed_in_place() {
@@ -811,6 +942,7 @@ mod tests {
         let header_model = header(&resp, "x-camelid-model-sha256");
         let header_host = header(&resp, "x-camelid-host");
         let header_threads = header(&resp, "x-camelid-worker-threads");
+        let header_posture = header(&resp, "x-camelid-posture");
         let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
         assert_eq!(body["camelid_lane"], "deterministic");
         assert_eq!(body["camelid_config_sha256"], TEST_SHA[..12]);
@@ -826,6 +958,8 @@ mod tests {
         assert_eq!(body["camelid_worker_threads"], serde_json::json!(TEST_THREADS));
         assert!(body["camelid_worker_threads"].is_number(), "thread count must not be a string");
         assert_eq!(body["camelid_worker_threads"].as_u64().unwrap().to_string(), header_threads);
+        assert_eq!(body["camelid_posture"], "bit-identical");
+        assert_eq!(body["camelid_posture"].as_str().unwrap(), header_posture);
         assert_eq!(body["id"], "chatcmpl-1", "original fields must be preserved");
     }
 
@@ -837,7 +971,7 @@ mod tests {
     /// three passes all of them. Here the header set is read off the response
     /// and each name is *mechanically* required to appear in the body and in the
     /// receipt — `x-camelid-worker-threads` → `camelid_worker_threads` →
-    /// `worker_threads` — so a seventh header added to `stamp` alone fails here
+    /// `worker_threads` — so an eighth header added to `stamp` alone fails here
     /// without anyone remembering to extend a list.
     ///
     /// Values are checked with `starts_with` in the receipt's direction because
@@ -866,7 +1000,11 @@ mod tests {
                 (name.as_str().to_string(), value.to_str().unwrap().to_string())
             })
             .collect();
-        assert!(published.len() >= 6, "expected the full header set: {published:?}");
+        // The vacuity bound, and it has to move with the set. It is a `>=`, so
+        // left at six it would silently tolerate the posture header being
+        // dropped from `stamp` — the derived loop below only checks the headers
+        // that are actually there.
+        assert!(published.len() >= 7, "expected the full header set: {published:?}");
 
         let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
         let receipt = read_receipts(&receipts, 1).await.remove(0);
@@ -950,6 +1088,9 @@ mod tests {
         assert_eq!(header(&resp, "x-camelid-admission-sha256"), TEST_ADMISSION_SHA[..12]);
         assert_eq!(header(&resp, "x-camelid-model-sha256"), TEST_MODEL_SHA[..12]);
         assert_eq!(header(&resp, "x-camelid-worker-threads"), "6");
+        // A stream is the one surface where the body field does not exist, so
+        // the header is the only place a streaming client can read the posture.
+        assert_eq!(header(&resp, "x-camelid-posture"), "bit-identical");
         assert_eq!(read_body(resp).await, SSE_BODY);
     }
 
@@ -1021,6 +1162,7 @@ mod tests {
         assert_eq!(header(&resp, "x-camelid-model-sha256"), TEST_MODEL_SHA[..12]);
         assert_eq!(header(&resp, "x-camelid-admission-sha256"), TEST_ADMISSION_SHA[..12]);
         assert_eq!(header(&resp, "x-camelid-worker-threads"), "6");
+        assert_eq!(header(&resp, "x-camelid-posture"), "bit-identical");
         // The manufactured 500 must itself be a well-formed, labeled JSON error.
         assert_eq!(header(&resp, "content-type"), "application/json");
         let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
@@ -1036,9 +1178,9 @@ mod tests {
 
     /// With receipts enabled, each request appends exactly one JSONL line
     /// carrying method, path, status, lane, the full config digest, the full
-    /// admission digest, the full model digest, host, worker width, a numeric
-    /// timestamp, and the gateway correlation id — `null` here, because these
-    /// requests did not come through the gateway.
+    /// admission digest, the full model digest, host, worker width, numeric
+    /// posture, a numeric timestamp, and the gateway correlation id — `null`
+    /// here, because these requests did not come through the gateway.
     ///
     /// Driven concurrently: every line must be complete and independently
     /// parseable, with no truncation and no interleaving between simultaneous
@@ -1079,6 +1221,7 @@ mod tests {
             assert_eq!(r["model_sha256"], TEST_MODEL_SHA);
             assert_eq!(r["host"], TEST_HOST);
             assert_eq!(r["worker_threads"], serde_json::json!(TEST_THREADS));
+            assert_eq!(r["posture"], "bit-identical");
             assert_eq!(r["status"], 200);
             assert!(r["ts"].is_number(), "ts must be numeric: {r}");
             assert!(

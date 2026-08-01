@@ -1,7 +1,7 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
 use camelid_enterprise::{
-    apply_deterministic, replica_router, Attribution, ModelIdentity, WorkerThreads,
+    apply_deterministic, replica_router, Attribution, ModelIdentity, NumericPosture, WorkerThreads,
 };
 use camelid_enterprise_gateway::{
     router_with_model_catalog, GatewayAuth, GatewayLog, ModelCatalog, ModelSelectionLimits,
@@ -114,6 +114,7 @@ async fn real_model_routes_through_a_verified_static_catalog() {
         model: ModelIdentity::of_file(&model).expect("the model file must be readable"),
         host: Arc::new("gateway-catalog-model-test/host".to_string()),
         workers: WorkerThreads::resolved(rayon::current_num_threads()),
+        posture: NumericPosture::BitIdentical,
         receipts: Some(Arc::new(receipt_path.clone())),
     };
     let loaded_model = LoadedModel::load(&model)

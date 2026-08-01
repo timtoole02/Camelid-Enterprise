@@ -2,7 +2,8 @@
 //!
 //! The in-tree engine owns generation and the public request/response schemas.
 //! This crate owns the deployment contract around it: the declared route
-//! surface, deterministic-lane configuration, and response attribution.
+//! surface, deterministic-lane configuration, and response attribution —
+//! including the numeric posture of the kernel that produced the tokens.
 //!
 //! Everything a replica *is* lives here rather than in the binary, so the
 //! contract tests and the model-backed conformance harness are written against
@@ -26,6 +27,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use attribution::{Attribution, ModelIdentity, WorkerThreads};
+/// Re-exported beside [`Attribution`] so every constructor of that struct takes
+/// the posture vocabulary from the crate it takes the struct from, rather than
+/// reaching separately into engine-core for one field.
+pub use engine_core::posture::NumericPosture;
 pub use lane::{apply_deterministic, ConfigVector, ENGINE_PIN};
 pub use surface::ServedModel;
 

@@ -101,7 +101,11 @@ Every replica response, including errors and streams, carries:
 ```text
 x-camelid-lane: deterministic
 x-camelid-config-sha256: <first 12 hex characters of the config digest>
+x-camelid-admission-sha256: <first 12 hex characters of the admission digest>
+x-camelid-model-sha256: <first 12 hex characters of the weights digest>
 x-camelid-host: <hardware-class summary>
+x-camelid-worker-threads: <resolved global worker-pool width>
+x-camelid-posture: <numeric contract of the path that produced these tokens>
 ```
 
 For non-streaming JSON objects returned by `/v1/completions` and
@@ -110,9 +114,26 @@ For non-streaming JSON objects returned by `/v1/completions` and
 ```json
 {
   "camelid_lane": "deterministic",
-  "camelid_config_sha256": "<12-character digest>"
+  "camelid_config_sha256": "<12-character digest>",
+  "camelid_admission_sha256": "<12-character digest>",
+  "camelid_model_sha256": "<12-character digest>",
+  "camelid_host": "<hardware-class summary>",
+  "camelid_worker_threads": <number>,
+  "camelid_posture": "<numeric contract>"
 }
 ```
+
+This section previously listed three of the shipped headers and two of the
+shipped body fields; it is brought current here rather than left to imply that
+the set is smaller than it is.
+
+`x-camelid-posture` and `camelid_posture` are the newest of them: the numeric
+contract the kernel that produced these tokens holds to, published because
+acceleration will not always be bit-identical. Every kernel shipped today is
+`bit-identical` to the portable reference; a path admitted under a declared
+tolerance publishes `tolerance-conformant` instead. `CONTRACT_ID` stays
+`camelid-enterprise-replica-http-v1`: an added response header and an added
+body key are additive, and no v1 client breaks on either.
 
 Original response fields remain present. Non-object JSON and non-JSON bodies are
 not rewritten. SSE bodies are never buffered or rewritten.
