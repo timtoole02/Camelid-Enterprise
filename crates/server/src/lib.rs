@@ -35,10 +35,15 @@ pub use surface::ServedModel;
 /// Model ownership is the control plane: there is no HTTP load/unload route and
 /// no second model registry. The identity computed before loading is rechecked
 /// against the loaded model's source before the listener serves this router.
+/// `generation_slots` is how many generations the replica runs at once. It is a
+/// throughput and admission property only: every generation owns its decoder
+/// and KV cache over read-only weights, so a request's tokens do not depend on
+/// the width or on what is running beside it.
 pub fn replica_router(
     model: LoadedModel,
     requested: &Path,
     identity: Attribution,
+    generation_slots: usize,
 ) -> Result<(Router, String), Box<dyn std::error::Error>> {
     identity
         .model
@@ -73,7 +78,7 @@ pub fn replica_router(
         &canonical,
         requested,
     ));
-    let served = in_tree::router(Arc::new(backend))
+    let served = in_tree::router(Arc::new(backend), generation_slots)
         .layer(middleware::from_fn_with_state(
             served_model,
             surface::pin_generation_to_the_served_model,

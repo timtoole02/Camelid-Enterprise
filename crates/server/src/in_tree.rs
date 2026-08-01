@@ -215,15 +215,20 @@ struct ApiState {
     generation_worker: GenerationWorker,
 }
 
-/// Build the in-tree public API around one completion backend.
+/// Build the in-tree public API around one completion backend, running
+/// `generation_slots` generations at once.
 ///
 /// This lower-level function intentionally does not attach deployment identity
 /// or surface filters. Production composition belongs to
 /// [`crate::replica_router`]; focused adapter tests use this function directly.
-pub fn router(backend: Arc<dyn CompletionBackend>) -> Router {
+///
+/// The width changes throughput and admission, never output: each generation
+/// owns its decoder and KV cache over read-only weights, so a request emits the
+/// same tokens whatever the replica is doing beside it.
+pub fn router(backend: Arc<dyn CompletionBackend>, generation_slots: usize) -> Router {
     let state = ApiState {
         backend,
-        generation_worker: GenerationWorker::spawn(),
+        generation_worker: GenerationWorker::spawn(generation_slots),
     };
     Router::new()
         .route("/v1/health", get(health))
@@ -252,6 +257,12 @@ struct HealthResponse {
     active_model_id: String,
     backend: &'static str,
     engine_queue_depth: usize,
+    /// Generations this replica runs at once. Published because
+    /// `engine_queue_depth` alone cannot distinguish a replica that is busy
+    /// from one that is saturated: a depth of four is comfortable at eight
+    /// slots and queueing at one, and a client choosing between replicas needs
+    /// the denominator rather than a number whose scale it has to guess.
+    engine_generation_slots: usize,
 }
 
 async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {
@@ -263,6 +274,7 @@ async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {
         active_model_id: state.backend.descriptor().id.clone(),
         backend: "engine-core",
         engine_queue_depth: state.generation_worker.depth(),
+        engine_generation_slots: state.generation_worker.slots(),
     })
 }
 
@@ -1294,9 +1306,12 @@ mod tests {
     }
 
     fn app() -> Router {
-        router(Arc::new(FakeBackend {
-            descriptor: test_descriptor(),
-        }))
+        router(
+            Arc::new(FakeBackend {
+                descriptor: test_descriptor(),
+            }),
+            1,
+        )
     }
 
     fn test_descriptor() -> ModelDescriptor {
@@ -1527,7 +1542,7 @@ mod tests {
             },
             prompt: Arc::clone(&captured),
         });
-        let response = router(backend)
+        let response = router(backend, 1)
             .oneshot(post_chat(json!({
                 "model": "test-model",
                 "messages": [
@@ -1662,10 +1677,13 @@ mod tests {
                 unk_token: String::new(),
             }),
         ] {
-            let app = router(Arc::new(TemplateBackend {
-                descriptor: test_descriptor(),
-                template,
-            }));
+            let app = router(
+                Arc::new(TemplateBackend {
+                    descriptor: test_descriptor(),
+                    template,
+                }),
+                1,
+            );
             let response = app
                 .oneshot(post_chat(json!({
                     "messages":[{"role":"user","content":"hi"}]
@@ -1807,10 +1825,13 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_backpressured_stream_cancels_generation() {
         let produced = Arc::new(AtomicUsize::new(0));
-        let app = router(Arc::new(StreamingBackend {
-            descriptor: test_descriptor(),
-            produced: Arc::clone(&produced),
-        }));
+        let app = router(
+            Arc::new(StreamingBackend {
+                descriptor: test_descriptor(),
+                produced: Arc::clone(&produced),
+            }),
+            1,
+        );
         let response = app
             .clone()
             .oneshot(post(json!({"prompt":"hi","max_tokens":100,"stream":true})))
@@ -1859,20 +1880,27 @@ mod tests {
     async fn generation_queue_is_bounded_and_reports_its_depth() {
         let started = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
-        let app = router(Arc::new(BlockingBackend {
-            descriptor: ModelDescriptor {
-                id: "test-model".to_string(),
-                architecture: "llama".to_string(),
-                context_length: 8,
-                embedding_length: 2,
-                vocab_size: 32,
-                file_type: None,
-                size_bytes: None,
-            },
-            started: Arc::clone(&started),
-            release: Arc::clone(&release),
-            block_first: Arc::new(AtomicBool::new(true)),
-        }));
+        // Pinned to one slot: this test asserts the exact depth at which the
+        // queue refuses, and that number is `slots + QUEUE_DEPTH`. Letting it
+        // take the host's default width would make the assertion a fact about
+        // the runner rather than about admission.
+        let app = router(
+            Arc::new(BlockingBackend {
+                descriptor: ModelDescriptor {
+                    id: "test-model".to_string(),
+                    architecture: "llama".to_string(),
+                    context_length: 8,
+                    embedding_length: 2,
+                    vocab_size: 32,
+                    file_type: None,
+                    size_bytes: None,
+                },
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+                block_first: Arc::new(AtomicBool::new(true)),
+            }),
+            1,
+        );
 
         let first_app = app.clone();
         let first = tokio::spawn(async move {
@@ -1924,6 +1952,162 @@ mod tests {
             assert_eq!(response.unwrap().status(), StatusCode::OK);
         }
         assert_eq!(health_depth(app).await, 0);
+    }
+
+    /// Counts how many generations are inside the engine at once, and makes
+    /// each one wait for a second before returning so overlap is observed
+    /// rather than hoped for.
+    struct ConcurrencyProbe {
+        descriptor: ModelDescriptor,
+        inside: Mutex<usize>,
+        changed: std::sync::Condvar,
+        maximum: Arc<AtomicUsize>,
+    }
+
+    impl CompletionBackend for ConcurrencyProbe {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn complete(&self, _prompt: &str, _max_new_tokens: usize) -> EngineResult<Completion> {
+            let mut inside = self.inside.lock().unwrap();
+            *inside += 1;
+            self.maximum.fetch_max(*inside, Ordering::SeqCst);
+            self.changed.notify_all();
+            // Bounded, so one slot times out and reports one instead of
+            // hanging the suite. Two slots satisfy the wait immediately.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while *inside < 2 && std::time::Instant::now() < deadline {
+                let (guard, _) = self
+                    .changed
+                    .wait_timeout(inside, std::time::Duration::from_millis(25))
+                    .unwrap();
+                inside = guard;
+                self.maximum.fetch_max(*inside, Ordering::SeqCst);
+            }
+            *inside -= 1;
+            Ok(Completion {
+                prompt_tokens: vec![10],
+                generated_tokens: vec![20],
+                text: "x".to_string(),
+                finish_reason: FinishReason::Length,
+            })
+        }
+
+        fn complete_incremental(
+            &self,
+            prompt: &str,
+            max_new_tokens: usize,
+            on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+        ) -> EngineResult<IncrementalGeneration> {
+            let completion = self.complete(prompt, max_new_tokens)?;
+            if on_token(TokenDelta {
+                token_id: 20,
+                text: "x".to_string(),
+            }) == GenerationControl::Cancel
+            {
+                return Ok(IncrementalGeneration::Cancelled);
+            }
+            Ok(IncrementalGeneration::Completed(completion))
+        }
+
+        fn chat_template(&self) -> Option<ChatTemplate> {
+            None
+        }
+
+        fn complete_prompt(
+            &self,
+            prompt: &str,
+            _add_special: bool,
+            _parse_special: bool,
+            max_new_tokens: usize,
+        ) -> EngineResult<Completion> {
+            self.complete(prompt, max_new_tokens)
+        }
+
+        fn complete_prompt_incremental(
+            &self,
+            prompt: &str,
+            _add_special: bool,
+            _parse_special: bool,
+            max_new_tokens: usize,
+            on_token: &mut dyn FnMut(TokenDelta) -> GenerationControl,
+        ) -> EngineResult<IncrementalGeneration> {
+            self.complete_incremental(prompt, max_new_tokens, on_token)
+        }
+    }
+
+    /// Two clients, two requests, one replica — the property the width exists
+    /// to provide, asserted end to end through the HTTP surface rather than at
+    /// the worker.
+    ///
+    /// Both widths are driven so the test pins the difference rather than one
+    /// side of it: at one slot the second request cannot start until the first
+    /// returns, which is the behavior this replaces, and at two slots both are
+    /// inside the engine together. A regression that quietly serialized the
+    /// pool again would still pass an assertion written only about two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_clients_are_served_at_once_only_at_width_two() {
+        async fn observed_overlap(slots: usize) -> usize {
+            let maximum = Arc::new(AtomicUsize::new(0));
+            let app = router(
+                Arc::new(ConcurrencyProbe {
+                    descriptor: test_descriptor(),
+                    inside: Mutex::new(0),
+                    changed: std::sync::Condvar::new(),
+                    maximum: Arc::clone(&maximum),
+                }),
+                slots,
+            );
+
+            let mut clients = tokio::task::JoinSet::new();
+            for client in 0..2 {
+                let app = app.clone();
+                clients.spawn(async move {
+                    app.oneshot(post(json!({
+                        "prompt": format!("client-{client}"),
+                        "max_tokens": 1
+                    })))
+                    .await
+                    .unwrap()
+                    .status()
+                });
+            }
+            while let Some(status) = clients.join_next().await {
+                assert_eq!(status.unwrap(), StatusCode::OK);
+            }
+            maximum.load(Ordering::SeqCst)
+        }
+
+        assert_eq!(
+            observed_overlap(1).await,
+            1,
+            "one slot must still admit exactly one generation at a time"
+        );
+        assert_eq!(
+            observed_overlap(2).await,
+            2,
+            "two slots must serve two clients concurrently"
+        );
+    }
+
+    /// The denominator a client needs to read `engine_queue_depth`.
+    #[tokio::test]
+    async fn health_publishes_the_generation_width() {
+        let app = router(
+            Arc::new(FakeBackend {
+                descriptor: test_descriptor(),
+            }),
+            3,
+        );
+        let response = app
+            .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let health: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(health["engine_generation_slots"], 3);
+        assert_eq!(health["engine_queue_depth"], 0);
     }
 
     #[tokio::test]

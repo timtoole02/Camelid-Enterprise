@@ -49,7 +49,7 @@ fn apply_deterministic_end_to_end() {
     assert_eq!(clean.sha256, compute_config_sha256());
     assert_eq!(clean.short(), "30d77c260803");
     assert_eq!(clean.admission_sha256, compute_admission_sha256());
-    assert_eq!(clean.admission_short(), "45121fb83fef");
+    assert_eq!(clean.admission_short(), "318fb6d65c0f");
     for (key, value) in CANONICAL {
         assert_eq!(
             std::env::var(key).ok().as_deref(),

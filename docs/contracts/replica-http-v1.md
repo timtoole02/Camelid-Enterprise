@@ -136,9 +136,17 @@ model loaded before the replica begins serving:
   "generation_ready": true,
   "active_model_id": "<loaded GGUF model id>",
   "backend": "engine-core",
-  "engine_queue_depth": 0
+  "engine_queue_depth": 0,
+  "engine_generation_slots": 8
 }
 ```
+
+`engine_generation_slots` is how many generations the replica runs at once, and
+is the denominator for `engine_queue_depth`: without it a depth cannot be told
+apart from a saturation. It reflects `--max-concurrency`, which defaults to the
+host's available parallelism. Two replicas that differ only in this width apply
+the same configuration vector and publish the same two digests — the width
+changes how many clients are served at once, never what any one of them gets.
 
 A listening socket is not readiness. A replica is ready for client traffic only
 when `/v1/models` is non-empty and `/v1/health` reports
@@ -195,9 +203,11 @@ Contractual no-model errors:
 | Messages API unavailable | `501` | `not_implemented` | `unsupported_messages` |
 | Reranking unavailable | `501` | `not_implemented` | `unsupported_reranking` |
 
-When the bounded generation queue rejects a job, the in-tree server returns HTTP
-`503`, error code `engine_queue_full`, and `Retry-After: 1`. This is the
-backpressure signal; callers must not assume automatic retry by the gateway.
+A replica admits `engine_generation_slots` running generations plus eight
+queued. When the bounded generation queue rejects a job past that, the in-tree
+server returns HTTP `503`, error code `engine_queue_full`, and `Retry-After: 1`.
+This is the backpressure signal; callers must not assume automatic retry by the
+gateway.
 
 **Evidence:** malformed JSON and no-model errors are executable without a
 model. Queue saturation, `Retry-After`, attributed error shape, and depth

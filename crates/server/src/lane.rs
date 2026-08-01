@@ -295,6 +295,16 @@ const PERMITTED: &[Permit] = &[
                  differently are told apart from the outside",
     },
     Permit {
+        rule: Match::Exact("CAMELID_ENTERPRISE_MAX_CONCURRENCY"),
+        reason: "generations run at once (--max-concurrency). Admitted with a claim made, \
+                 unlike the width above it: every generation owns its decoder and KV cache over \
+                 read-only weights and is never fused with another, so a request emits the same \
+                 tokens at any width. It is published on /v1/health as engine_generation_slots \
+                 and enters neither digest, because two replicas differing only here apply the \
+                 same configuration vector and would refuse the same environment — they differ \
+                 in how many clients they serve at once, not in what any one of them gets",
+    },
+    Permit {
         rule: Match::Exact("CAMELID_ENTERPRISE_TEST_MODEL"),
         reason: "local GGUF for this workspace's gated tests; read only under #[cfg(test)] and \
                  never on the serving path — permitted so one shell can run both the tests and \
@@ -865,7 +875,7 @@ mod tests {
     fn admission_sha256_is_pinned() {
         assert_eq!(
             compute_admission_sha256(),
-            "45121fb83fef631f8464c32dada6100b23f0a0af80347031f812803ee9ec2a09",
+            "318fb6d65c0fb2cd3630594b08cc70a1bc3ae0bca7b8bd15c121458e651959f6",
         );
     }
 

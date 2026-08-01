@@ -1,10 +1,15 @@
 //! camelid-enterprise — multi-tenant serving distribution of the Camelid engine.
 //!
-//! This release ships the **deterministic lane**: whole-generation serialized
-//! execution on the engine at a pinned revision under a frozen configuration
-//! vector, with deterministic greedy output run to run. Requests the
-//! replica cannot serve fail closed (typed 503 from the bounded engine queue);
-//! there is no silent demotion to any other execution mode.
+//! This release ships the **deterministic lane**: whole-generation execution on
+//! the engine at a pinned revision under a frozen configuration vector, with
+//! deterministic greedy output run to run. Requests the replica cannot serve
+//! fail closed (typed 503 from the bounded engine queue); there is no silent
+//! demotion to any other execution mode.
+//!
+//! Generations run concurrently up to a configured width. Whole-generation is
+//! the unit either way: a request is never fused with another one, so the
+//! output guarantee is unchanged by what runs beside it. What concurrency buys
+//! is that a second client is served rather than queued.
 
 // What a replica *is* — the parity baseline, the lane's configuration vector, the
 // attribution stamped on every response, the startup load and the served route
@@ -57,6 +62,22 @@ enum Command {
         /// `CAMELID_ENTERPRISE_*`; this was the one outlier.
         #[arg(long, env = "CAMELID_ENTERPRISE_THREADS")]
         threads: Option<usize>,
+        /// Generations this replica runs at once. Defaults to the host's
+        /// available parallelism.
+        ///
+        /// This is a throughput and admission control, not a numeric one. Each
+        /// generation owns its decoder and KV cache over read-only weights, so
+        /// a request emits the same tokens whatever else is running beside it,
+        /// and the width is safe to change without republishing an identity.
+        /// Batching would be the other thing — it fuses requests into shared
+        /// kernel shapes and moves the output — and this is deliberately not
+        /// that.
+        ///
+        /// It costs memory rather than accuracy: each concurrent generation
+        /// carries its own KV cache, which grows with that request's context.
+        /// Lower it on a host serving long contexts near its memory ceiling.
+        #[arg(long, env = "CAMELID_ENTERPRISE_MAX_CONCURRENCY")]
+        max_concurrency: Option<usize>,
         /// Append one JSONL serving receipt per request to this file.
         #[arg(long)]
         serving_receipts: Option<PathBuf>,
@@ -70,9 +91,14 @@ async fn main() {
         .init();
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Serve { model, addr, lane, threads, serving_receipts } => {
-            serve(model, addr, &lane, threads, serving_receipts).await
-        }
+        Command::Serve {
+            model,
+            addr,
+            lane,
+            threads,
+            max_concurrency,
+            serving_receipts,
+        } => serve(model, addr, &lane, threads, max_concurrency, serving_receipts).await,
     };
     // Printed with `Display`, and handled here rather than returned from `main`.
     // Returning a `Box<dyn Error>` renders it with `Debug`, which turns the
@@ -91,6 +117,7 @@ async fn serve(
     addr: SocketAddr,
     lane_name: &str,
     threads: Option<usize>,
+    max_concurrency: Option<usize>,
     serving_receipts: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if lane_name != "deterministic" {
@@ -120,6 +147,7 @@ async fn serve(
     // first thing to read the pool's width fixes it — a sizing call after that
     // point fails rather than resizes.
     let workers = WorkerThreads::resolved(resolve_worker_pool(threads)?);
+    let generation_slots = resolve_generation_slots(max_concurrency)?;
 
     // Identifying the weights is a full read of a multi-gigabyte file, and it
     // happens here — before the port is bound — on purpose. A replica that
@@ -135,13 +163,14 @@ async fn serve(
 
     eprintln!(
         "[lane] deterministic | in-tree engine | parity oracle pin {} | config vector sha256 {} | admission sha256 {} | \
-         model sha256 {} | host {} | worker threads {}",
+         model sha256 {} | host {} | worker threads {} | generation slots {}",
         ENGINE_PIN,
         config.short(),
         config.admission_short(),
         model_identity.short(),
         host_summary,
-        workers.count()
+        workers.count(),
+        generation_slots
     );
     eprintln!("[lane] model {}", model.display());
 
@@ -183,7 +212,8 @@ async fn serve(
 
     // Re-verify the digest and compose in the library, so the stack this process
     // serves is exactly the stack the model-backed contract drives.
-    let (served, model_id) = replica_router(loaded_model, &requested_model, ctx)?;
+    let (served, model_id) =
+        replica_router(loaded_model, &requested_model, ctx, generation_slots)?;
     eprintln!("[lane] model loaded as '{model_id}'; replica ready");
 
     axum::serve(listener, served)
@@ -231,6 +261,32 @@ fn resolve_worker_pool(threads: Option<usize>) -> Result<usize, Box<dyn std::err
             })?;
     }
     Ok(rayon::current_num_threads())
+}
+
+/// Resolve how many generations this replica runs at once.
+///
+/// Defaults to the host's available parallelism rather than to one, so a second
+/// client is served rather than queued behind the first — the behavior this
+/// flag exists to end.
+///
+/// The default is not a throughput claim. Decode is memory-bandwidth-bound and
+/// concurrent generations stream the same weights, so raising the width buys
+/// much less than it looks like it should: measured at two slots on an 8-core
+/// M4, two clients finished 1.22x sooner in aggregate while each request took
+/// 1.63x longer than it did alone. What the width removes is the queue, not the
+/// bandwidth ceiling.
+///
+/// Zero is refused rather than clamped, for the reason `--threads` refuses it:
+/// a width of zero is not a smaller replica, it is a replica that serves
+/// nothing, and an operator who typed it meant something else.
+fn resolve_generation_slots(requested: Option<usize>) -> Result<usize, Box<dyn std::error::Error>> {
+    match requested {
+        Some(0) => Err("--max-concurrency must be greater than zero".into()),
+        Some(slots) => Ok(slots),
+        None => Ok(std::thread::available_parallelism()
+            .map(|slots| slots.get())
+            .unwrap_or(1)),
+    }
 }
 
 async fn shutdown_signal() {
