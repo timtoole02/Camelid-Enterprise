@@ -4,6 +4,7 @@
 //!
 //! Three locations, so no consumer misses it:
 //! - `x-camelid-lane` / `x-camelid-config-sha256` / `x-camelid-admission-sha256`
+//! - `x-camelid-posture` / `x-camelid-engine-sha256`
 //!   / `x-camelid-model-sha256` / `x-camelid-host` / `x-camelid-worker-threads`
 //!   headers on every response (including streams);
 //! - `camelid_lane` / `camelid_config_sha256` / `camelid_admission_sha256` /
@@ -345,6 +346,13 @@ impl Attribution {
         if let Ok(value) = HeaderValue::from_str(self.admission_short()) {
             headers.insert("x-camelid-admission-sha256", value);
         }
+        headers.insert(
+            "x-camelid-posture",
+            HeaderValue::from_static(crate::lane::EXECUTION_POSTURE),
+        );
+        if let Ok(value) = HeaderValue::from_str(&crate::lane::ENGINE_DIGEST[..12]) {
+            headers.insert("x-camelid-engine-sha256", value);
+        }
         if let Ok(value) = HeaderValue::from_str(self.host.as_str()) {
             headers.insert("x-camelid-host", value);
         }
@@ -373,6 +381,14 @@ impl Attribution {
         obj.insert("camelid_lane".into(), self.lane.into());
         obj.insert("camelid_config_sha256".into(), self.short().into());
         obj.insert("camelid_admission_sha256".into(), self.admission_short().into());
+        obj.insert(
+            "camelid_posture".into(),
+            crate::lane::EXECUTION_POSTURE.into(),
+        );
+        obj.insert(
+            "camelid_engine_sha256".into(),
+            crate::lane::ENGINE_DIGEST[..12].into(),
+        );
         obj.insert("camelid_model_sha256".into(), self.model.short().into());
         obj.insert("camelid_host".into(), self.host.as_str().into());
         obj.insert("camelid_worker_threads".into(), self.workers.count.into());
@@ -407,6 +423,8 @@ impl Attribution {
             "lane": self.lane,
             "config_sha256": self.config_sha256.as_str(),
             "admission_sha256": self.admission_sha256.as_str(),
+            "posture": crate::lane::EXECUTION_POSTURE,
+            "engine_sha256": crate::lane::ENGINE_DIGEST,
             "model_sha256": self.model.sha256.as_str(),
             "host": self.host.as_str(),
             "worker_threads": self.workers.count,

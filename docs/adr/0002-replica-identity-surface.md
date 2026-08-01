@@ -87,10 +87,10 @@ trailing newline. It means: **this replica wrote this vector, for this engine
 build.** Today it is
 
 ```
-30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7
+b62869e991172aadb0204c526ff41fd7486434320884bda323e36cff6e13b00d
 ```
 
-published as its first twelve characters, `30d77c260803`, on headers and in
+published as its first twelve characters, `b62869e99117`, on headers and in
 completion bodies, and in full on serving receipts.
 
 The admission policy is **not** in that preimage. It is hashed separately, as
@@ -540,7 +540,7 @@ The reason is cross-host comparability, and it cuts the way that is easy to get
 backwards.
 
 A digest is worth publishing only if it is *constant across every conforming
-replica*. That constancy is what lets a client say "digest `30d77c260803` means
+replica*. That constancy is what lets a client say "digest `b62869e99117` means
 the configuration I audited" without knowing anything about the fleet. Fold in
 the pool width or the host and the digest becomes `f(configuration, machine)`: an
 8-core and a 16-core replica running an identical, audited configuration publish
@@ -578,7 +578,7 @@ questions.
 
 Both digests hash their inputs in **declaration order**, never sorted. Sorting the
 canonical vector — identical keys, identical values, identical framing — yields
-`42c63ead830c…` against the published `30d77c260803…`.
+`42c63ead830c…` against the published `b62869e99117…`.
 
 That asymmetry is the whole risk. A tidy-up that sorts a list, changing nothing
 about what any replica applies, would silently mint a new public identity for
@@ -848,7 +848,7 @@ after the gate deserves the same treatment rather than a footnote here.
   `CAMELID_*` variables exported for the engine's own CLI can no longer start a
   replica from that shell. This is correct, and the "false positive" framing is
   wrong: the alternative is not "it works", it is a replica publishing
-  `30d77c260803` while emitting different tokens. The costs are asymmetric — a
+  `b62869e99117` while emitting different tokens. The costs are asymmetric — a
   refusal costs one failed start and an error naming the variable; the other
   outcome costs a published result that is quietly untrue.
 - **A pre-set canonical key is now refused even at the canonical value.** Nothing

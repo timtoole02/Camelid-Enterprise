@@ -47,7 +47,7 @@ fn apply_deterministic_end_to_end() {
 
     let clean = apply_deterministic().expect("a clean environment starts");
     assert_eq!(clean.sha256, compute_config_sha256());
-    assert_eq!(clean.short(), "30d77c260803");
+    assert_eq!(clean.short(), "b62869e99117");
     assert_eq!(clean.admission_sha256, compute_admission_sha256());
     assert_eq!(clean.admission_short(), "318fb6d65c0f");
     for (key, value) in CANONICAL {

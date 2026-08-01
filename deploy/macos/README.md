@@ -151,7 +151,7 @@ Review before starting:
 ## What a healthy start looks like
 
 ```console
-[lane] deterministic | in-tree engine | parity oracle pin b4e3a9056567ed8145fc4fa29850d6f1f261ac2b | config vector sha256 30d77c260803 | admission sha256 318fb6d65c0f | model sha256 3f8a1c04b7e2 | host macos/aarch64 cores=8 simd=dotprod+i8mm+neon | worker threads 8 | generation slots 8
+[lane] deterministic | in-tree engine | parity oracle pin b4e3a9056567ed8145fc4fa29850d6f1f261ac2b | config vector sha256 b62869e99117 | admission sha256 318fb6d65c0f | model sha256 3f8a1c04b7e2 | host macos/aarch64 cores=8 simd=dotprod+i8mm+neon | worker threads 8 | generation slots 8
 [lane] model /usr/local/var/camelid-enterprise/models/model.gguf
 [lane] listening on http://127.0.0.1:8181
 [lane] loading model; nothing is served until the load completes
@@ -207,7 +207,7 @@ same request:
 H="$(mktemp)"; B="$(mktemp)"
 curl -fsS --max-time 3 -D "$H" -o "$B" http://127.0.0.1:8181/v1/health \
   && grep -qi '^x-camelid-lane: deterministic'            "$H" \
-  && grep -qi '^x-camelid-config-sha256: 30d77c260803'    "$H" \
+  && grep -qi '^x-camelid-config-sha256: b62869e99117'    "$H" \
   && grep -qi '^x-camelid-admission-sha256: 318fb6d65c0f' "$H" \
   && grep -qi '^x-camelid-model-sha256: <first 12 hex>'   "$H" \
   && grep -qi '^x-camelid-worker-threads: 8'              "$H" \
@@ -226,7 +226,7 @@ worth pinning:
 | `x-camelid-worker-threads` | a replica at the wrong pool width |
 
 Get the model value with `shasum -a 256 <your GGUF> | cut -c1-12`. The
-configuration digest is `30d77c260803` at engine pin
+configuration digest is `b62869e99117` at engine pin
 `b4e3a9056567ed8145fc4fa29850d6f1f261ac2b`; it changes at a pin bump. The
 admission digest is `318fb6d65c0f`, and it does *not* change at a pin bump —
 only when the allow list or the foreign-refusal list does.
