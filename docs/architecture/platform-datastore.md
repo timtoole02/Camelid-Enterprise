@@ -1,6 +1,7 @@
 # Platform datastore
 
-**Status:** decided, not built. Resolves the §7 open question *"What datastore
+**Status:** decided; the store exists and owns shared quota state. Aggregation
+and metering are not built. Resolves the §7 open question *"What datastore
 satisfies both 'one box under a desk' and 'data center scale' without an
 external managed dependency?"*
 
@@ -134,12 +135,36 @@ because identity already uses it".
 ## 6. What this unblocks
 
 - Phase 6 durable store and log aggregation
-- Durable, shared quota state — closing the `4 x limit` gap
+- Durable, shared quota state — **built**, in `crates/platform-store`, behind
+  `--platform-database-url`. One row per organization per window, incremented
+  by a single atomic statement, windows anchored to the database clock so every
+  replica computes the same `Retry-After`, and fail-closed when the store
+  cannot answer. The `4 x limit` gap is closed for deployments that configure
+  it; the in-process counter remains the default and remains correct only for
+  one process.
 - Metering built on the usage log's terminal records rather than on head status
+
+## 6.1 What the first slice settled in practice
+
+Measured while building it, and worth not rediscovering:
+
+- Admissions for one organization serialize on one row, so the pool size that
+  matters is small: at 256 concurrent admissions, 32 and 64 connections were
+  both slower than 8. A single organization's admission ceiling is one row's
+  commit rate, not the pool.
+- Concurrent pods migrating at startup collide without a `pg_advisory_xact_lock`
+  — 7 of 8 fail. This is the same class of defect as the identity store's
+  migration race, and the argument in §2 above is what predicted it.
+- rustls verifies the chain and the hostname and rejects a self-signed leaf
+  certificate outright, which libpq accepts. Operators must present a real
+  CA-issued end-entity certificate. `tokio-postgres` also has no
+  `sslmode=verify-full`; verification belongs to the connector, so `require`
+  plus rustls *is* full verification.
 
 ## 7. Bounds
 
-- Nothing here is built. This is a decision, not an implementation.
+- Only shared quota state is built. Aggregation, metering rollups and receipt
+  joins are not, and nothing here makes the gateway's logs durable on their own.
 - Postgres does not make the gateway's logs durable on its own. Those writers
   are best-effort by design, and no shutdown behaviour turns a record the
   gateway dropped while running into one an aggregator can read. Aggregation

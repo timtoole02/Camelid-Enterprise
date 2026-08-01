@@ -22,6 +22,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use identity::{AuthenticatedContext, IdentityError, OrganizationId, SqliteIdentityStore};
 use pin_project_lite::pin_project;
+use platform_store::{PlatformQuota, QuotaRefusal};
 use replica_contract::{HttpMethod, RouteSpec};
 use serde::Deserialize;
 use std::borrow::Cow;
@@ -789,22 +790,69 @@ struct GatewayState {
 /// one organization may consume in a fixed window, so one oversubscribed or
 /// misbehaving tenant cannot starve every other tenant's share of it.
 ///
-/// State is in-memory and per-process: it resets on restart and is not
-/// shared across gateway replicas behind the same Service. That is
-/// consistent with this gateway's other non-durable state (the request audit
-/// log): a fixed-window approximation is enough to stop one tenant from
-/// monopolizing shared capacity, it is not a durable metering or billing
-/// substrate. The quota is charged after successful authentication but before
-/// admission and forwarding, so a request that later receives a gateway `503`
-/// or an upstream `502` still counts: this is an anti-starvation control for
-/// gateway work, not a record of successful inference.
+/// The quota is charged after successful authentication but before admission
+/// and forwarding, so a request that later receives a gateway `503` or an
+/// upstream `502` still counts: this is an anti-starvation control for gateway
+/// work, not a record of successful inference.
 ///
 /// Authentication necessarily resolves the bearer token in SQLite before the
 /// gateway knows which organization to charge. Consequently, this quota does
 /// not bound per-request identity-store work from an over-budget valid token.
 /// A token cache would change token-revocation semantics, so it needs its own
 /// bounded, invalidation-aware design rather than an implicit fast path here.
-pub struct OrgQuota {
+///
+/// Two implementations, chosen by whether a platform database is configured:
+///
+/// - [`OrgQuota::new`] counts in this process. Correct for one box, and wrong
+///   for a replica set: each pod admits `limit` requests per window, so the
+///   shipped two-replica manifest admits up to `2 x limit` per window.
+/// - [`OrgQuota::platform`] counts in PostgreSQL, so the limit belongs to the
+///   deployment. Every failure to reach it is a refusal; there is deliberately
+///   no fallback to per-pod counting, because silently degrading to the
+///   behaviour this replaces is worse than refusing.
+///
+/// Their window semantics differ, and the difference is deliberate. The
+/// in-process window starts at an organization's first request; the platform
+/// window is anchored to the database clock so that every pod computes the
+/// same window and therefore the same `Retry-After`. One process has nothing
+/// to agree with, so aligning it would change shipped single-box behaviour for
+/// no benefit.
+pub enum OrgQuota {
+    InProcess(InProcessQuota),
+    Platform(Arc<PlatformQuota>),
+}
+
+impl OrgQuota {
+    /// Allows at most `limit` requests per organization in every fixed window
+    /// of `window_seconds`, counted in this process only.
+    pub fn new(limit: NonZeroU32, window_seconds: NonZeroU64) -> Self {
+        Self::InProcess(InProcessQuota::new(limit, window_seconds))
+    }
+
+    /// Allows at most `limit` requests per organization across every gateway
+    /// replica sharing one platform database.
+    pub fn platform(quota: Arc<PlatformQuota>) -> Self {
+        Self::Platform(quota)
+    }
+
+    async fn admit(&self, organization: &OrganizationId) -> Result<(), QuotaRefusal> {
+        match self {
+            Self::InProcess(quota) => quota
+                .admit(organization)
+                .map_err(|retry_after| QuotaRefusal::Exceeded { retry_after }),
+            Self::Platform(quota) => quota.admit(organization.as_str()).await,
+        }
+    }
+}
+
+/// The in-process half of [`OrgQuota`].
+///
+/// State is in-memory and per-process: it resets on restart and is not shared
+/// across gateway replicas behind the same Service. That is consistent with
+/// this gateway's other non-durable state (the request audit log): a
+/// fixed-window approximation is enough to stop one tenant from monopolizing
+/// shared capacity, it is not a durable metering or billing substrate.
+pub struct InProcessQuota {
     limit: NonZeroU32,
     window: Duration,
     windows: Mutex<HashMap<String, OrgWindow>>,
@@ -877,7 +925,7 @@ struct OrgWindow {
     count: u32,
 }
 
-impl OrgQuota {
+impl InProcessQuota {
     /// Allows at most `limit` requests per organization in every fixed window
     /// of `window_seconds`. A nonzero type makes a configuration that resets
     /// on every request impossible.
@@ -1238,25 +1286,50 @@ async fn proxy_request(
     // admission permit. A request the gateway rejects must never first take a
     // permit meant for traffic that can reach a replica.
     if let (Some(identity), Some(quota)) = (identity.as_ref(), quota.as_ref()) {
-        if let Err(retry_after) = quota.admit(identity.organization_id()) {
-            let response = quota_exceeded(retry_after);
-            return audited(
-                &state,
-                AuditedRequest {
-                    request_id: &request_id,
-                    identity: Some(identity),
-                    reason: Some("organization_quota_exceeded"),
-                    method: &method,
-                    path: &path,
-                    model_id: route.model_id(),
-                    usage: None,
-                    request_metrics: None,
-                    connection_termination: connection_termination.clone(),
-                    started_ts,
-                    started_at,
-                },
-                response,
-            );
+        match quota.admit(identity.organization_id()).await {
+            Ok(()) => {}
+            Err(QuotaRefusal::Exceeded { retry_after }) => {
+                return audited(
+                    &state,
+                    AuditedRequest {
+                        request_id: &request_id,
+                        identity: Some(identity),
+                        reason: Some("organization_quota_exceeded"),
+                        method: &method,
+                        path: &path,
+                        model_id: route.model_id(),
+                        usage: None,
+                        request_metrics: None,
+                        connection_termination: connection_termination.clone(),
+                        started_ts,
+                        started_at,
+                    },
+                    quota_exceeded(retry_after),
+                );
+            }
+            Err(QuotaRefusal::Unavailable(error)) => {
+                // Fail closed. Falling back to this pod's own counter would
+                // restore exactly the per-pod over-admission the shared quota
+                // exists to remove, and would do it silently.
+                tracing::warn!(%error, "platform quota store unavailable; refusing the request");
+                return audited(
+                    &state,
+                    AuditedRequest {
+                        request_id: &request_id,
+                        identity: Some(identity),
+                        reason: Some("quota_store_unavailable"),
+                        method: &method,
+                        path: &path,
+                        model_id: route.model_id(),
+                        usage: None,
+                        request_metrics: None,
+                        connection_termination: connection_termination.clone(),
+                        started_ts,
+                        started_at,
+                    },
+                    overloaded("gateway quota store unavailable"),
+                );
+            }
         }
     }
 
@@ -2748,7 +2821,7 @@ mod tests {
 
     #[test]
     fn org_quota_admits_up_to_the_limit_then_rejects() {
-        let quota = OrgQuota::new(NonZeroU32::new(2).unwrap(), NonZeroU64::new(60).unwrap());
+        let quota = InProcessQuota::new(NonZeroU32::new(2).unwrap(), NonZeroU64::new(60).unwrap());
         let organization = OrganizationId::new("org_acme".to_string());
         assert!(quota.admit(&organization).is_ok());
         assert!(quota.admit(&organization).is_ok());
@@ -2758,7 +2831,7 @@ mod tests {
 
     #[test]
     fn org_quota_tracks_organizations_independently() {
-        let quota = OrgQuota::new(NonZeroU32::new(1).unwrap(), NonZeroU64::new(60).unwrap());
+        let quota = InProcessQuota::new(NonZeroU32::new(1).unwrap(), NonZeroU64::new(60).unwrap());
         let acme = OrganizationId::new("org_acme".to_string());
         let globex = OrganizationId::new("org_globex".to_string());
         assert!(quota.admit(&acme).is_ok());
@@ -2769,7 +2842,7 @@ mod tests {
 
     #[test]
     fn org_quota_resets_once_the_window_elapses() {
-        let quota = OrgQuota::new(NonZeroU32::new(1).unwrap(), NonZeroU64::new(1).unwrap());
+        let quota = InProcessQuota::new(NonZeroU32::new(1).unwrap(), NonZeroU64::new(1).unwrap());
         let organization = OrganizationId::new("org_acme".to_string());
         assert!(quota.admit(&organization).is_ok());
         assert!(quota.admit(&organization).is_err());

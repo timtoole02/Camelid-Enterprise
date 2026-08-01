@@ -7,6 +7,7 @@ members = [
     "crates/engine-windows",
     "crates/gateway",
     "crates/identity",
+    "crates/platform-store",
     "crates/replica-contract",
     "crates/server",
 ]
@@ -26,6 +27,7 @@ engine-macos = { path = "crates/engine-macos", package = "camelid-enterprise-eng
 engine-linux = { path = "crates/engine-linux", package = "camelid-enterprise-engine-linux" }
 engine-windows = { path = "crates/engine-windows", package = "camelid-enterprise-engine-windows" }
 identity = { path = "crates/identity", package = "camelid-enterprise-identity" }
+platform-store = { path = "crates/platform-store", package = "camelid-enterprise-platform-store" }
 replica-contract = { path = "crates/replica-contract", package = "camelid-enterprise-replica-contract" }
 minijinja = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }

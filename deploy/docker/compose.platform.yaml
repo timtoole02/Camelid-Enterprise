@@ -1,0 +1,46 @@
+# PostgreSQL for the platform store, sized for one box under a desk.
+#
+# The shared organization quota needs a database every gateway process can
+# reach. On a single box that is this file; on Kubernetes it is a database you
+# already operate. Nothing here is required unless you set
+# CAMELID_GATEWAY_PLATFORM_DATABASE_URL on the gateway.
+#
+#   docker compose -f deploy/docker/compose.platform.yaml up -d
+#   camelid-enterprise-gateway serve \
+#     --upstream http://127.0.0.1:8181 \
+#     --identity-db /var/lib/camelid/identity.sqlite \
+#     --org-request-quota 600 \
+#     --org-request-quota-window-seconds 60
+#   # with CAMELID_GATEWAY_PLATFORM_DATABASE_URL exported from a file you own,
+#   # not typed on the command line -- it carries the password.
+#
+# The gateway creates and migrates its own schema on first start.
+#
+# Bound to loopback on purpose: this connection is cleartext. If the database
+# and the gateway are not on the same host, give PostgreSQL a server
+# certificate issued by a CA you control and point the gateway at that CA with
+# CAMELID_GATEWAY_PLATFORM_DATABASE_CA_FILE. A self-signed leaf will not do:
+# the gateway verifies the chain and the hostname.
+services:
+  platform-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: camelid
+      POSTGRES_DB: camelid_platform
+      # Set POSTGRES_PASSWORD in an .env file next to this one, or in your
+      # shell. It is deliberately not defaulted: a default password on a
+      # database holding tenancy state is not a convenience.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - platform-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U camelid -d camelid_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  platform-db:
