@@ -11,10 +11,15 @@
 //! contract. The dot is bit-identical to the portable reference for every
 //! input: the integer block product is exact in i32 (order-independent) and the
 //! per-block f32 terms are reduced over a single accumulator in ascending block
-//! order. The quantizer agrees with the portable reference on every input that
-//! yields a nonzero stored scale — i.e. every input that can contribute to an
-//! output; the one exception is documented on [`quantize_q8_0_block`] and is
-//! numerically inert.
+//! order, seeded at `-0.0` because that — not `0.0` — is where std's float
+//! `Sum` folds from, and the difference is visible in the sign bit of any row
+//! whose terms are all `-0.0`.
+//!
+//! The quantizer agrees with the portable reference on every input, with no
+//! exception. It had one — the degenerate scale band described on
+//! [`quantize_q8_0_block`] — tolerated because it was inert. It stops being
+//! inert once the dot reduces from the reference's `-0.0` seed, so it is closed
+//! rather than documented.
 
 use engine_core::tensor::{Q8_0Block, Q8_0_BLOCK_VALUES};
 
@@ -72,23 +77,30 @@ pub fn q8_0_dot_rows(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
 ///
 /// On `aarch64` this uses the NEON convert path; on other targets it delegates
 /// to [`engine_core::tensor::quantize_q8_0_block`]. The two paths produce the
-/// identical [`Q8_0Block`] whenever the block's stored scale is nonzero, which
-/// covers every input that can affect a dot result. The sole exception is a
-/// block whose largest magnitude is so small the f16 scale rounds to zero:
-/// there the NEON and scalar convert paths may choose different quant bytes,
-/// but the zero scale makes both dequantize to all-zero, so the result is
-/// unaffected (see the `degenerate_scale_band_is_numerically_inert` test).
+/// identical [`Q8_0Block`] for every input, with no exception — the nonzero-scale
+/// qualifier this once carried is gone, because the case it excused is fixed.
+/// The convert clamps in f32 before
+/// `FCVTAS` exactly as the reference clamps before its cast, so a block whose
+/// largest magnitude is small enough to overflow `1.0 / unrounded_scale` to
+/// infinity — once the sole divergent case — now produces the scalar path's
+/// bytes (see `degenerate_scale_band_matches_byte_for_byte`).
+///
+/// The length check is a real branch, not only a debug assertion. The portable
+/// reference is driven by the slice — a short block yields zeros in the tail
+/// rather than reading past the end — while the NEON path loads 32 floats
+/// unconditionally, the last of them from `block.as_ptr().add(28)`. Delegating
+/// the wrong-length case keeps this safe function memory-safe in release for any
+/// slice, which the `debug_assert` alone would not: it is compiled out exactly
+/// where it would matter. In-workspace callers all arrive through
+/// `chunks_exact`, so this closes an API-surface hole rather than a live defect.
 pub fn quantize_q8_0_block(block: &[f32]) -> Q8_0Block {
     #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is baseline on aarch64; the kernel loads exactly the 32
-        // values the debug assertion requires the block to hold.
+    if block.len() == Q8_0_BLOCK_VALUES {
+        // SAFETY: the length is exactly the 32 values the kernel loads, and
+        // NEON is baseline on aarch64.
         return unsafe { neon::quantize_q8_0_block(block) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        engine_core::tensor::quantize_q8_0_block(block)
-    }
+    engine_core::tensor::quantize_q8_0_block(block)
 }
 
 /// Quantize a flat f32 slice into Q8_0 blocks, one per [`Q8_0_BLOCK_VALUES`]
@@ -201,12 +213,18 @@ mod neon {
 
     /// Dot two rows of Q8_0 blocks using the SDOT block kernel, reducing the
     /// per-block f32 terms into one accumulator in ascending block order.
+    ///
+    /// The accumulator is seeded at `-0.0`, matching the reference: std's float
+    /// `Sum` folds from `-0.0`, not `0.0`. A `0.0` seed agrees on every row with
+    /// a nonzero term and differs on the rows where every term is `-0.0` — two
+    /// empty rows, or a row pairing zero integer sums with negative scales,
+    /// which the wire format's f16 sign bit permits.
     #[target_feature(enable = "dotprod")]
     pub(super) unsafe fn q8_0_dot_rows_neon_dotprod(
         weight: &[Q8_0Block],
         input: &[Q8_0Block],
     ) -> f32 {
-        let mut total_sum = 0.0_f32;
+        let mut total_sum = -0.0_f32;
         for (w_block, i_block) in weight.iter().zip(input) {
             // SAFETY: each block owns 32 contiguous quant bytes, and the
             // dot-product feature is enabled for this function.
@@ -218,9 +236,10 @@ mod neon {
     }
 
     /// Dot two rows of Q8_0 blocks using the `vmull` block kernel, reducing the
-    /// per-block f32 terms into one accumulator in ascending block order.
+    /// per-block f32 terms into one accumulator in ascending block order, seeded
+    /// at `-0.0` for the reason given on the SDOT kernel above.
     pub(super) unsafe fn q8_0_dot_rows_neon_mul(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
-        let mut total_sum = 0.0_f32;
+        let mut total_sum = -0.0_f32;
         for (w_block, i_block) in weight.iter().zip(input) {
             // SAFETY: each block owns 32 contiguous quant bytes.
             let int_sum =
@@ -239,7 +258,8 @@ mod neon {
     pub(super) unsafe fn quantize_q8_0_block(block: &[f32]) -> Q8_0Block {
         use std::arch::aarch64::{
             vabsq_f32, vcombine_s16, vcombine_s8, vcvtaq_s32_f32, vdupq_n_f32, vget_high_f32,
-            vget_lane_f32, vget_low_f32, vld1q_f32, vmax_f32, vmaxq_f32, vmovn_s32, vmulq_f32,
+            vget_lane_f32, vget_low_f32, vld1q_f32, vmax_f32, vmaxq_f32, vminq_f32, vmovn_s32,
+            vmulq_f32,
             vqmovn_s16, vst1q_s8,
         };
 
@@ -298,14 +318,31 @@ mod neon {
             let scaled6 = vmulq_f32(v6, v_inv_scale);
             let scaled7 = vmulq_f32(v7, v_inv_scale);
 
-            let int0 = vcvtaq_s32_f32(scaled0);
-            let int1 = vcvtaq_s32_f32(scaled1);
-            let int2 = vcvtaq_s32_f32(scaled2);
-            let int3 = vcvtaq_s32_f32(scaled3);
-            let int4 = vcvtaq_s32_f32(scaled4);
-            let int5 = vcvtaq_s32_f32(scaled5);
-            let int6 = vcvtaq_s32_f32(scaled6);
-            let int7 = vcvtaq_s32_f32(scaled7);
+            // Clamp in f32 before the convert, which is what makes this exact
+            // rather than merely close. The reference is
+            // `.round().clamp(-128.0, 127.0)`, so its clamp happens in float and
+            // the cast never sees an out-of-range value. `FCVTAS` instead
+            // saturates such a value to `i32::MIN`/`i32::MAX`, and `vmovn_s32`
+            // then truncates that to a wrong `i16` — which is exactly how the
+            // degenerate scale band came to pick different bytes from the scalar
+            // path. That band reaches it by overflowing `1.0 / unrounded_scale`
+            // to infinity, so every product is infinite; but any product leaving
+            // the i8 range takes the same wrong turn, which is why this clamps
+            // rather than special-casing the band.
+            //
+            // NaN needs no exception here: `FMAX` and `FMIN` propagate it and
+            // `FCVTAS` converts NaN to 0, which is what `NaN as i8` does after
+            // the reference's clamp passes NaN through.
+            let lo = vdupq_n_f32(-128.0);
+            let hi = vdupq_n_f32(127.0);
+            let int0 = vcvtaq_s32_f32(vminq_f32(vmaxq_f32(scaled0, lo), hi));
+            let int1 = vcvtaq_s32_f32(vminq_f32(vmaxq_f32(scaled1, lo), hi));
+            let int2 = vcvtaq_s32_f32(vminq_f32(vmaxq_f32(scaled2, lo), hi));
+            let int3 = vcvtaq_s32_f32(vminq_f32(vmaxq_f32(scaled3, lo), hi));
+            let int4 = vcvtaq_s32_f32(vminq_f32(vmaxq_f32(scaled4, lo), hi));
+            let int5 = vcvtaq_s32_f32(vminq_f32(vmaxq_f32(scaled5, lo), hi));
+            let int6 = vcvtaq_s32_f32(vminq_f32(vmaxq_f32(scaled6, lo), hi));
+            let int7 = vcvtaq_s32_f32(vminq_f32(vmaxq_f32(scaled7, lo), hi));
 
             let i16_0 = vmovn_s32(int0);
             let i16_1 = vmovn_s32(int1);
@@ -499,36 +536,96 @@ mod tests {
         assert_eq!(dispatched.to_bits(), reference.to_bits());
     }
 
-    /// A block whose largest magnitude is far below the smallest representable
-    /// f16 scale is the one case where the NEON convert path and the portable
-    /// scalar path pick different quant bytes. The NEON `1/unrounded_scale`
-    /// overflows to infinity, so the float-to-int convert saturates and narrows
-    /// differently from the scalar `(v * inv).round().clamp(..)`. This is inert:
-    /// the stored scale rounds to exactly 0.0 in both paths, so every quant byte
-    /// dequantizes to 0 and the block contributes exactly 0.0 to any dot. The
-    /// NEON path is kept byte-for-byte as the accelerated convert rather than
-    /// "corrected" to match the scalar bytes, because that reproduces what the
-    /// same convert does on this hardware — the property the deterministic lane
-    /// actually depends on. Pinned here so the divergence stays understood.
+    /// The sign of zero the reduction returns, which is the one property the
+    /// fuzz above cannot reach: it never generates a zero-length row and its
+    /// scales are strictly positive, so every row it builds has a nonzero term
+    /// and the accumulator's seed is erased before it can be observed.
+    ///
+    /// `Iterator::sum` folds from `-0.0`, so the reference returns `-0.0` for
+    /// two empty rows and for any row whose every term is `-0.0` — a zero
+    /// integer sum against a negative scale, which the wire format's f16 sign
+    /// bit permits. Both NEON kernels seed the same way. `-0.0` and `+0.0`
+    /// compare equal and print the same, so this has to be asserted on bits.
     #[test]
-    fn degenerate_scale_band_is_numerically_inert() {
+    fn negative_zero_rows_keep_the_reference_sign_of_zero() {
+        let dotprod = neon::aarch64_dotprod_enabled();
+
+        let zeroed = |scale: f32| Q8_0Block {
+            scale,
+            quants: [0_i8; 32],
+        };
+        let empty: [Q8_0Block; 0] = [];
+        let weight = [zeroed(-1.0), zeroed(-2.0)];
+        let input = [zeroed(1.0), zeroed(1.0)];
+
+        for (w, i) in [(&empty[..], &empty[..]), (&weight[..], &input[..])] {
+            let reference = engine_core::tensor::q8_0_dot_rows(w, i);
+            assert_eq!(reference.to_bits(), (-0.0_f32).to_bits());
+            assert_eq!(q8_0_dot_rows(w, i).to_bits(), reference.to_bits());
+
+            // SAFETY: NEON is baseline on aarch64.
+            let vmull = unsafe { neon::q8_0_dot_rows_neon_mul(w, i) };
+            assert_eq!(vmull.to_bits(), reference.to_bits());
+
+            if dotprod {
+                // SAFETY: the host advertises the dot-product feature.
+                let sdot = unsafe { neon::q8_0_dot_rows_neon_dotprod(w, i) };
+                assert_eq!(sdot.to_bits(), reference.to_bits());
+            }
+        }
+    }
+
+    /// A block whose largest magnitude is far below the smallest representable
+    /// f16 scale used to be the one case where the NEON convert and the portable
+    /// scalar path picked different quant bytes: `1.0 / unrounded_scale`
+    /// overflows to infinity there, and `FCVTAS` saturates the infinite product
+    /// to `i32::MAX` where the reference clamps in f32 first. The convert clamps
+    /// in f32 now too, so the bytes agree and this asserts equality where it once
+    /// asserted difference.
+    ///
+    /// The divergence was tolerated on the grounds that it was inert — a zero
+    /// stored scale makes every contribution zero — and that reasoning held only
+    /// while the dot's accumulator seeded at `+0.0`. Seeded at `-0.0`, which is
+    /// what `Iterator::sum` actually does, the divergent bytes give a negative
+    /// integer sum, so the term is `-0.0` and the row returns `-0.0` where the
+    /// scalar bytes return `+0.0`. The byte choice became visible in the sign
+    /// bit, which is why the band is closed rather than re-documented: an
+    /// exception whose justification has expired is a defect.
+    #[test]
+    fn degenerate_scale_band_matches_byte_for_byte() {
         let block = [1e-40_f32; 32];
         let neon = quantize_q8_0_block(&block);
         let scalar = engine_core::tensor::quantize_q8_0_block(&block);
 
-        // Both stores round the scale to exactly zero.
+        // Both stores round the scale to exactly zero, which is what made the
+        // old divergence look harmless.
         assert_eq!(neon.scale.to_bits(), 0);
         assert_eq!(scalar.scale.to_bits(), 0);
-        // The quant bytes are allowed to differ in this band...
-        assert_ne!(neon.quants, scalar.quants);
+        assert_eq!(
+            neon.quants, scalar.quants,
+            "the degenerate band is no longer allowed to pick its own bytes"
+        );
 
-        // ...but a zero scale makes any dot contribution exactly zero, so the
-        // observable result is identical regardless of the byte choice.
+        // And the dot agrees on the sign of zero, which is the observable the
+        // old arrangement lost. Asserted on bits: -0.0 == +0.0 compares true, so
+        // a value comparison here would pass either way.
         let weight =
             quantize_q8_0_blocks(&(0..32).map(|i| (i as f32) - 15.0).collect::<Vec<_>>());
         let d_neon = q8_0_dot_rows(&weight, std::slice::from_ref(&neon));
         let d_scalar = engine_core::tensor::q8_0_dot_rows(&weight, std::slice::from_ref(&scalar));
-        assert_eq!(d_neon.to_bits(), 0);
-        assert_eq!(d_scalar.to_bits(), 0);
+        assert_eq!(d_neon.to_bits(), d_scalar.to_bits());
+
+        // A mixed-sign block in the same band, so the case is not carried by one
+        // uniform vector whose lanes cannot disagree with each other.
+        let mut mixed = [1e-40_f32; 32];
+        for (idx, value) in mixed.iter_mut().enumerate() {
+            if idx % 3 == 0 {
+                *value = -*value;
+            }
+        }
+        assert_eq!(
+            quantize_q8_0_block(&mixed).quants,
+            engine_core::tensor::quantize_q8_0_block(&mixed).quants
+        );
     }
 }
