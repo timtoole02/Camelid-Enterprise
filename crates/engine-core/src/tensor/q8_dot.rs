@@ -19,6 +19,13 @@ use super::blocks::{f16_bits_to_f32, f32_to_f16_bits, Q8_0Block, Q8_0_BLOCK_VALU
 /// an accelerated implementation with the identical result and pass it wherever
 /// the forward pass takes a `Q8DotRows`, so acceleration is chosen by the caller
 /// without `engine-core` ever depending on a platform crate.
+///
+/// A crate supplying a kernel through this seam also declares a
+/// [`crate::posture::NumericPosture`] for it, next to the kernel, so the claim
+/// cannot drift from the code making it. [`q8_0_dot_rows`] below is
+/// `NumericPosture::BitIdentical` by definition rather than by measurement: it
+/// is the definition every other posture in this workspace is stated against,
+/// not a kernel compared to something else.
 pub type Q8DotRows = fn(&[Q8_0Block], &[Q8_0Block]) -> f32;
 
 /// Quantize one chunk of exactly [`Q8_0_BLOCK_VALUES`] f32 values into a
@@ -83,9 +90,15 @@ fn block_int_dot(weight: &[i8; Q8_0_BLOCK_VALUES], input: &[i8; Q8_0_BLOCK_VALUE
 ///
 /// Each block contributes `(int_sum as f32) * weight.scale * input.scale`,
 /// left-associated, and the terms are summed into a single f32 accumulator in
-/// ascending block order (`Iterator::sum` is a left fold from `0.0`). The
-/// integer block dot is exact; the only rounding is in the per-block scale
-/// multiplies and the running sum.
+/// ascending block order. The integer block dot is exact; the only rounding is
+/// in the per-block scale multiplies and the running sum.
+///
+/// `Iterator::sum` is a left fold from `-0.0`, not from `0.0` — `-0.0` is the
+/// additive identity for f32, since `0.0 + -0.0` is `+0.0` while `-0.0 + -0.0`
+/// is `-0.0`. The seed is observable: two empty rows return `-0.0`, as does any
+/// row whose every term is `-0.0`, and a platform kernel that seeds `0.0`
+/// instead is bit-identical everywhere else and wrong there. Pinned by
+/// `empty_and_all_negative_zero_rows_keep_the_sign_of_zero`.
 pub fn q8_0_dot_rows(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
     weight
         .iter()
@@ -235,9 +248,46 @@ mod tests {
         assert_eq!(got.to_bits(), expected.to_bits());
     }
 
+    /// The sign of zero the reduction hands back, which is `-0.0` and not
+    /// `+0.0`. It is the seed of `Iterator::sum`'s float fold, it survives to
+    /// the caller on any row whose every term is `-0.0`, and it is the one
+    /// property of this function a platform kernel is most likely to reproduce
+    /// wrong while passing every other bit-identity check.
+    #[test]
+    fn empty_and_all_negative_zero_rows_keep_the_sign_of_zero() {
+        assert_eq!(q8_0_dot_rows(&[], &[]).to_bits(), (-0.0_f32).to_bits());
+
+        // A zero integer sum against a negative scale is `-0.0` per block; the
+        // wire format's f16 sign bit permits a negative scale.
+        let zeroed = |scale: f32| Q8_0Block {
+            scale,
+            quants: [0_i8; Q8_0_BLOCK_VALUES],
+        };
+        let weight = [zeroed(-1.0), zeroed(-2.0)];
+        let input = [zeroed(1.0), zeroed(1.0)];
+        assert_eq!(
+            q8_0_dot_rows(&weight, &input).to_bits(),
+            (-0.0_f32).to_bits()
+        );
+
+        // One nonzero term is enough to erase the seed's sign, which is why a
+        // `0.0`-seeded kernel passes everything but the two cases above.
+        let mut ones = [0_i8; Q8_0_BLOCK_VALUES];
+        ones[0] = 1;
+        let nonzero = [Q8_0Block {
+            scale: 1.0,
+            quants: ones,
+        }];
+        assert_eq!(
+            q8_0_dot_rows(&nonzero, &nonzero).to_bits(),
+            1.0_f32.to_bits()
+        );
+    }
+
     #[test]
     fn dot_accumulates_ascending_single_accumulator() {
-        // Multiple blocks: result equals the explicit left fold from 0.0.
+        // Multiple blocks: result equals the explicit left fold from -0.0,
+        // which is the seed `Iterator::sum` uses.
         let mut flat_w = Vec::new();
         let mut flat_i = Vec::new();
         for b in 0..3 {
@@ -249,7 +299,7 @@ mod tests {
         let w = quantize_q8_0_blocks(&flat_w);
         let i = quantize_q8_0_blocks(&flat_i);
 
-        let mut acc = 0.0_f32;
+        let mut acc = -0.0_f32;
         for (wb, ib) in w.iter().zip(&i) {
             let int_sum = block_int_dot(&wb.quants, &ib.quants);
             acc += int_sum as f32 * wb.scale * ib.scale;

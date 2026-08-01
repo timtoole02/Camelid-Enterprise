@@ -1,7 +1,24 @@
 //! Windows engine backend.
 //!
-//! Everything Windows-specific lives in this crate. The macOS and Linux ports
-//! land first; this crate currently provides capability detection only.
+//! Everything Windows-specific lives in this crate: host capability detection,
+//! and the x86-64 AVX2 Q8_0 matmul kernel in [`q8_dot`], which the serving
+//! binary passes to engine-core through its Q8_0 dot seam. The Linux port is
+//! still capability detection only; the two x86-64 kernels will be duplicated
+//! rather than shared, for the same reason the vocabularies below are — no home
+//! exists that both platform crates may take code from without inverting the
+//! crate boundary. That duplication is deliberate, not an oversight.
+//!
+//! This crate now selects a kernel on `avx2` itself, so that name is part of
+//! *this crate's* routing identity and not only the pinned engine's. The
+//! selection is between an accelerated kernel and the portable reference, both
+//! of which produce the same bits, so a host that routes differently still
+//! answers identically — which is why it does not disturb what the reported
+//! feature list below has to say.
+//!
+//! That output-invariance is exactly what [`POSTURE`] states, and it is the
+//! kernel's posture rather than the crate's: it describes what [`q8_0_dot_rows`]
+//! holds to, and a second kernel supplied from here later would have to declare
+//! its own rather than inherit this one.
 //!
 //! The reported feature list is part of the replica's published identity — it
 //! answers "which kernels could have run here?" — so under-reporting lets two
@@ -13,6 +30,10 @@
 //! would be tighter still, but it would have to live somewhere both platform
 //! crates can see, and neither may depend on the other without inverting the
 //! boundary that keeps one platform's code out of another's build.
+
+pub mod q8_dot;
+
+pub use q8_dot::{q8_0_dot_rows, quantize_q8_0_block, quantize_q8_0_blocks, POSTURE};
 
 use engine_core::host::HostCapabilities;
 
