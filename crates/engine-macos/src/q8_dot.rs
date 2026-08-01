@@ -11,10 +11,14 @@
 //! contract. The dot is bit-identical to the portable reference for every
 //! input: the integer block product is exact in i32 (order-independent) and the
 //! per-block f32 terms are reduced over a single accumulator in ascending block
-//! order. The quantizer agrees with the portable reference on every input that
-//! yields a nonzero stored scale — i.e. every input that can contribute to an
-//! output; the one exception is documented on [`quantize_q8_0_block`] and is
-//! numerically inert.
+//! order, seeded at `-0.0` because that — not `0.0` — is where std's float
+//! `Sum` folds from, and the difference is visible in the sign bit of any row
+//! whose terms are all `-0.0`.
+//!
+//! The quantizer agrees with the portable reference on every input that yields a
+//! nonzero stored scale — i.e. every input that can contribute to an output; the
+//! one exception is documented on [`quantize_q8_0_block`] and is numerically
+//! inert.
 
 use engine_core::tensor::{Q8_0Block, Q8_0_BLOCK_VALUES};
 
@@ -54,17 +58,23 @@ pub fn q8_0_dot_rows(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
 /// there the NEON and scalar convert paths may choose different quant bytes,
 /// but the zero scale makes both dequantize to all-zero, so the result is
 /// unaffected (see the `degenerate_scale_band_is_numerically_inert` test).
+///
+/// The length check is a real branch, not only a debug assertion. The portable
+/// reference is driven by the slice — a short block yields zeros in the tail
+/// rather than reading past the end — while the NEON path loads 32 floats
+/// unconditionally, the last of them from `block.as_ptr().add(28)`. Delegating
+/// the wrong-length case keeps this safe function memory-safe in release for any
+/// slice, which the `debug_assert` alone would not: it is compiled out exactly
+/// where it would matter. In-workspace callers all arrive through
+/// `chunks_exact`, so this closes an API-surface hole rather than a live defect.
 pub fn quantize_q8_0_block(block: &[f32]) -> Q8_0Block {
     #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is baseline on aarch64; the kernel loads exactly the 32
-        // values the debug assertion requires the block to hold.
+    if block.len() == Q8_0_BLOCK_VALUES {
+        // SAFETY: the length is exactly the 32 values the kernel loads, and
+        // NEON is baseline on aarch64.
         return unsafe { neon::quantize_q8_0_block(block) };
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        engine_core::tensor::quantize_q8_0_block(block)
-    }
+    engine_core::tensor::quantize_q8_0_block(block)
 }
 
 /// Quantize a flat f32 slice into Q8_0 blocks, one per [`Q8_0_BLOCK_VALUES`]
@@ -177,12 +187,18 @@ mod neon {
 
     /// Dot two rows of Q8_0 blocks using the SDOT block kernel, reducing the
     /// per-block f32 terms into one accumulator in ascending block order.
+    ///
+    /// The accumulator is seeded at `-0.0`, matching the reference: std's float
+    /// `Sum` folds from `-0.0`, not `0.0`. A `0.0` seed agrees on every row with
+    /// a nonzero term and differs on the rows where every term is `-0.0` — two
+    /// empty rows, or a row pairing zero integer sums with negative scales,
+    /// which the wire format's f16 sign bit permits.
     #[target_feature(enable = "dotprod")]
     pub(super) unsafe fn q8_0_dot_rows_neon_dotprod(
         weight: &[Q8_0Block],
         input: &[Q8_0Block],
     ) -> f32 {
-        let mut total_sum = 0.0_f32;
+        let mut total_sum = -0.0_f32;
         for (w_block, i_block) in weight.iter().zip(input) {
             // SAFETY: each block owns 32 contiguous quant bytes, and the
             // dot-product feature is enabled for this function.
@@ -194,9 +210,10 @@ mod neon {
     }
 
     /// Dot two rows of Q8_0 blocks using the `vmull` block kernel, reducing the
-    /// per-block f32 terms into one accumulator in ascending block order.
+    /// per-block f32 terms into one accumulator in ascending block order, seeded
+    /// at `-0.0` for the reason given on the SDOT kernel above.
     pub(super) unsafe fn q8_0_dot_rows_neon_mul(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
-        let mut total_sum = 0.0_f32;
+        let mut total_sum = -0.0_f32;
         for (w_block, i_block) in weight.iter().zip(input) {
             // SAFETY: each block owns 32 contiguous quant bytes.
             let int_sum =
@@ -473,6 +490,45 @@ mod tests {
         let reference = engine_core::tensor::q8_0_dot_rows(&ref_blocks, &ref_blocks);
         let dispatched = q8_0_dot_rows(&neon_blocks, &neon_blocks);
         assert_eq!(dispatched.to_bits(), reference.to_bits());
+    }
+
+    /// The sign of zero the reduction returns, which is the one property the
+    /// fuzz above cannot reach: it never generates a zero-length row and its
+    /// scales are strictly positive, so every row it builds has a nonzero term
+    /// and the accumulator's seed is erased before it can be observed.
+    ///
+    /// `Iterator::sum` folds from `-0.0`, so the reference returns `-0.0` for
+    /// two empty rows and for any row whose every term is `-0.0` — a zero
+    /// integer sum against a negative scale, which the wire format's f16 sign
+    /// bit permits. Both NEON kernels seed the same way. `-0.0` and `+0.0`
+    /// compare equal and print the same, so this has to be asserted on bits.
+    #[test]
+    fn negative_zero_rows_keep_the_reference_sign_of_zero() {
+        let dotprod = neon::aarch64_dotprod_enabled();
+
+        let zeroed = |scale: f32| Q8_0Block {
+            scale,
+            quants: [0_i8; 32],
+        };
+        let empty: [Q8_0Block; 0] = [];
+        let weight = [zeroed(-1.0), zeroed(-2.0)];
+        let input = [zeroed(1.0), zeroed(1.0)];
+
+        for (w, i) in [(&empty[..], &empty[..]), (&weight[..], &input[..])] {
+            let reference = engine_core::tensor::q8_0_dot_rows(w, i);
+            assert_eq!(reference.to_bits(), (-0.0_f32).to_bits());
+            assert_eq!(q8_0_dot_rows(w, i).to_bits(), reference.to_bits());
+
+            // SAFETY: NEON is baseline on aarch64.
+            let vmull = unsafe { neon::q8_0_dot_rows_neon_mul(w, i) };
+            assert_eq!(vmull.to_bits(), reference.to_bits());
+
+            if dotprod {
+                // SAFETY: the host advertises the dot-product feature.
+                let sdot = unsafe { neon::q8_0_dot_rows_neon_dotprod(w, i) };
+                assert_eq!(sdot.to_bits(), reference.to_bits());
+            }
+        }
     }
 
     /// A block whose largest magnitude is far below the smallest representable
