@@ -519,8 +519,8 @@ declared set satisfies both bounds the fixture imposes today, but nothing enforc
 it, and macOS is the platform actually serving.
 
 Falsifiable: `attribution::tests::headers_on_every_response_body_untouched_off_completion_paths`
-pins all six headers — lane, config digest, admission digest, model digest, host
-and worker width; `the_worker_width_renders_the_same_in_both_encodings`
+pins all seven headers — lane, config digest, admission digest, model digest,
+host, worker width and numeric posture; `the_worker_width_renders_the_same_in_both_encodings`
 pins the number/string pair; `main::tests::an_unsized_pool_still_publishes_a_resolved_width`
 asserts the published width is read from rayon in the no-flag case too, and
 `a_zero_width_pool_is_refused_before_anything_is_built` asserts `--threads 0` is
@@ -846,10 +846,15 @@ after the gate deserves the same treatment rather than a footnote here.
 
 ### 9. The numeric posture is published, and is in neither digest
 
-Every kernel this workspace ships is bit-identical to the portable reference:
-the macOS NEON Q8_0 dot and the Windows AVX2 one are each admitted through
-engine-core's seam only against a bit-identity proof, so per-host kernel
-selection varies speed and not output. That will not stay true. A GPU lane is
+Every kernel this workspace ships *through the posture seam* is bit-identical to
+the portable reference: the macOS NEON Q8_0 dot and the Windows AVX2 one are
+each admitted through engine-core's seam only against a bit-identity proof, so
+per-host kernel selection varies speed and not output. The qualifier is not
+padding — engine-macos also exports a NEON quantizer that documents an inert
+divergence from the portable one in the band where the f16 scale rounds to zero,
+and no seam takes it, which is exactly why the posture describes the kernel that
+crosses the seam rather than everything a platform crate exports. That will not
+stay true. A GPU lane is
 planned, and it is expected to be admitted under its own numeric contract — a
 published maximum relative error against the CPU reference and a measured top-1
 agreement floor over a fixed prompt set — rather than under a claim of
@@ -876,10 +881,23 @@ precise thing §1 refuses to do to `admission_sha256`.
 
 It is likewise not operator-settable, by flag or by environment. A posture an
 operator can set is a replica declaring a numeric contract it did not prove; it
-is a compile-time constant declared by the crate that supplies the kernel, next
-to the kernel, so the claim cannot drift from the code making it. Giving it an
-admission permit would additionally move `admission_sha256`, which is the one
-way this change could have retired a digest.
+is a compile-time constant, chosen by target, and the intended home for it is
+beside the kernel it describes, so the claim cannot drift from the code making
+it. Giving it an admission permit would additionally move `admission_sha256`,
+which is the one way this change could have retired a digest.
+
+**Where the constant actually lives, since "beside the kernel" is not yet true
+everywhere.** `engine_windows::POSTURE` is declared beside the AVX2 dot and is
+the only copy of that claim. engine-macos declares none, so the macOS arm of
+`camelid_enterprise::kernel::selected` holds a literal instead — one literal, in
+the single place that pairs a kernel with a posture, replaced by
+`engine_macos::POSTURE` when that crate declares one. That selection is in the
+library rather than in `serve`, so it is reachable by tests:
+`kernel::tests::the_selected_posture_is_the_token_a_response_publishes` drives
+the selected posture through the attribution middleware to the header, and the
+model-backed harness publishes and loads through the same pair. Without that,
+every posture assertion in the tree would have been reading a literal the test
+itself wrote.
 
 **On all three surfaces, not the header alone.** Without the body field, a
 bit-identical replica and a tolerance-conformant one have byte-identical
@@ -1073,8 +1091,11 @@ own output:
 
 The **numeric posture** does not move at a pin bump. It describes the kernel this
 workspace supplies through the seam, not the pinned engine, so a bump changes it
-only if it changes which kernel is supplied — and then the constant beside that
-kernel is the one edit, because every published copy reads it.
+only if it changes which kernel is supplied — and then the single declaration for
+that kernel is the one edit, because every published copy reads
+`camelid_enterprise::kernel::selected`. For Windows that declaration is
+`engine_windows::POSTURE`; for macOS it is still the literal in that function,
+per §9.
 
 ---
 

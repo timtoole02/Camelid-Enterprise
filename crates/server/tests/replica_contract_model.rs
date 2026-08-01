@@ -14,7 +14,7 @@ use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
 use camelid_enterprise::in_tree::{router as in_tree_router, LoadedModelBackend};
 use camelid_enterprise::{
     apply_deterministic, load_startup_model, replica_router, Attribution, ModelIdentity,
-    NumericPosture, WorkerThreads,
+    WorkerThreads,
 };
 use engine_core::runtime::{GenerationControl, IncrementalGeneration, LoadedModel};
 use http_body_util::BodyExt;
@@ -93,9 +93,13 @@ fn post_json(path: &str, body: Value) -> Request<Body> {
 /// one path CI runs with a model loaded.
 ///
 /// The posture is asserted at its literal published value rather than against
-/// `expected`, because unlike the digests it is not something this harness
-/// computes: it is the constant the kernel that actually ran declares, and
-/// comparing it to a copy of itself would assert nothing.
+/// `expected`, and that only means anything because this harness does not write
+/// the value it asserts. It publishes `camelid_enterprise::kernel::selected()`,
+/// the same pair `serve` takes — and loads the model through the kernel half of
+/// that pair, so the constant asserted here is the one declared beside the
+/// kernel that actually ran. A harness that constructed `BitIdentical` itself
+/// and then asserted `"bit-identical"` would be comparing a copy of itself, and
+/// would stay green with the published claim weakened.
 fn assert_attribution(response: &axum::response::Response, expected: &Published) {
     assert_eq!(response.headers()["x-camelid-lane"], "deterministic");
     assert_eq!(
@@ -290,6 +294,12 @@ async fn real_model_conforms_to_replica_http_v1() {
         model: model_identity.short().to_string(),
         workers: workers.count(),
     };
+    // The kernel this build serves through and the posture it publishes, from
+    // the one place that pairs them. Both halves are used below — the dot to
+    // load with, the posture to publish — so this harness runs the platform
+    // kernel `serve` runs instead of the portable reference, and cannot assert a
+    // posture it wrote itself.
+    let (q8_dot, posture) = camelid_enterprise::kernel::selected();
     let identity = Attribution {
         lane: "deterministic",
         config_sha256: Arc::new(config.sha256),
@@ -297,10 +307,10 @@ async fn real_model_conforms_to_replica_http_v1() {
         model: model_identity,
         host: Arc::new(TEST_HOST.to_string()),
         workers,
-        posture: NumericPosture::BitIdentical,
+        posture,
         receipts: None,
     };
-    let loaded_model = LoadedModel::load(&model)
+    let loaded_model = LoadedModel::load_with_q8_dot(&model, q8_dot)
         .expect("the in-tree runtime must load the model it was pointed at");
     // One slot: this test asserts the exact depth at which the bounded queue
     // refuses, which is `slots + queue depth`. Taking the runner's default width

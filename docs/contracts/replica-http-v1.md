@@ -129,9 +129,13 @@ the set is smaller than it is.
 
 `x-camelid-posture` and `camelid_posture` are the newest of them: the numeric
 contract the kernel that produced these tokens holds to, published because
-acceleration will not always be bit-identical. Every kernel shipped today is
-`bit-identical` to the portable reference; a path admitted under a declared
-tolerance publishes `tolerance-conformant` instead. `CONTRACT_ID` stays
+acceleration will not always be bit-identical. Every kernel shipped through that
+seam today — the portable Q8_0 dot, the macOS NEON one and the Windows AVX2 one
+— is `bit-identical` to the portable reference; a path admitted under a declared
+tolerance publishes `tolerance-conformant` instead. The claim is scoped to the
+seam, not to every routine a platform crate exports: engine-macos's NEON
+quantizer, which no seam takes, documents an inert divergence of its own.
+`CONTRACT_ID` stays
 `camelid-enterprise-replica-http-v1`: an added response header and an added
 body key are additive, and no v1 client breaks on either.
 

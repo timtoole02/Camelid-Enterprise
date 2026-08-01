@@ -21,8 +21,7 @@
 // that happens, which is what keeps the surface a client meets and the surface
 // the tests drive from being two different things.
 use camelid_enterprise::{
-    apply_deterministic, replica_router, Attribution, ModelIdentity, NumericPosture, WorkerThreads,
-    ENGINE_PIN,
+    apply_deterministic, replica_router, Attribution, ModelIdentity, WorkerThreads, ENGINE_PIN,
 };
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
@@ -146,33 +145,18 @@ async fn serve(
     let host = engine_windows::probe();
     let host_summary = host.summary();
 
-    // The kernel and the numeric contract it holds to, bound as one pair.
+    // The kernel and the numeric contract it holds to, taken as one pair from
+    // the library rather than chosen here.
     //
-    // Two independent cfg cascades — one choosing the kernel, one choosing the
-    // posture — would let the published claim drift from the code making it,
-    // which is the whole reason a posture is declared beside its kernel rather
-    // than at the point of use. Binding them makes "take the kernel without its
-    // posture" impossible to express here. It also avoids doubling the
-    // shadowing hazard the loader comment below already warns about.
-    //
-    // The macOS arm writes `BitIdentical` here instead of taking
-    // `engine_macos::POSTURE`, because that crate is not editable in this lane.
-    // It is the same claim its kernel already makes — the NEON dot is tested
-    // bit-identical to the portable reference — and moving it into engine-macos
-    // later replaces this literal rather than leaving a second place to edit.
-    #[cfg(target_os = "macos")]
-    let (q8_dot, posture): (engine_core::tensor::Q8DotRows, NumericPosture) =
-        (engine_macos::q8_0_dot_rows, NumericPosture::BitIdentical);
-    #[cfg(target_os = "windows")]
-    let (q8_dot, posture): (engine_core::tensor::Q8DotRows, NumericPosture) =
-        (engine_windows::q8_0_dot_rows, engine_windows::POSTURE);
-    // The portable arm is the reference itself, so its posture is bit-identical
-    // by definition rather than by measurement.
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let (q8_dot, posture): (engine_core::tensor::Q8DotRows, NumericPosture) = (
-        engine_core::tensor::q8_0_dot_rows,
-        NumericPosture::BitIdentical,
-    );
+    // Both halves of that matter. One pair, because two independent selections —
+    // one for the kernel, one for the posture — is exactly how a published claim
+    // drifts from the code making it. In the library, because a choice made in
+    // this function is a choice nothing can drive: `serve` binds a listener and
+    // reads a multi-gigabyte file, so a posture selected here would reach the
+    // wire through the one path no test runs, while every test asserting it
+    // supplied its own literal. `kernel::selected` is what the model-backed
+    // conformance harness now loads and publishes through as well.
+    let (q8_dot, posture) = camelid_enterprise::kernel::selected();
 
     // Before the engine state, and before the listener: everything this replica
     // publishes about itself has to be settled before it can answer anything.
@@ -386,7 +370,9 @@ mod tests {
     /// production with the suite still green.
     ///
     /// The only thing supplied by hand is what a real start reads off the disk:
-    /// an identity and the key the engine reported for the loaded weights.
+    /// an identity and the key the engine reported for the loaded weights. The
+    /// posture is not among them — it is a compile-time constant, so this stack
+    /// takes it from the same selection `serve` does rather than restating it.
     fn served_stack() -> axum::Router {
         let ctx = Attribution {
             lane: "deterministic",
@@ -396,7 +382,7 @@ mod tests {
                 .expect("this crate's own manifest is readable"),
             host: Arc::new("test/host cores=1 simd=none".to_string()),
             workers: WorkerThreads::resolved(1),
-            posture: NumericPosture::BitIdentical,
+            posture: camelid_enterprise::kernel::selected().1,
             receipts: None,
         };
         let served_model = Arc::new(ServedModel::new(

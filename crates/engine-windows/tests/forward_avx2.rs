@@ -80,11 +80,15 @@ const EMBEDDING_WIDTH: usize = 2048;
 
 /// The negative control: this crate's kernel, off by exactly one ULP.
 ///
-/// `^ 1` rather than `f32::next_up` because `next_up` stabilized in 1.86 and
-/// this workspace pins `rust-version = "1.83"`. The XOR is total — it is defined
-/// on every bit pattern, cannot manufacture a NaN or an infinity from a finite
-/// input (reaching `0x7F800000` from a finite value would require flipping an
-/// exponent bit), and moves `-0.0` as readily as anything else.
+/// `^ 1` rather than `f32::next_up`, and the reason is totality rather than the
+/// manifest's `rust-version` — that pin is already unattainable, since this
+/// workspace calls `next_up` and `is_multiple_of` (1.86 and 1.87) and no job
+/// builds at the pinned version. The XOR is defined on every bit pattern and
+/// changes every one of them, where `next_up` is the identity on NaN and on
+/// `+inf`; it cannot manufacture a NaN or an infinity from a finite input
+/// (reaching `0x7F800000` from a finite value would require flipping an exponent
+/// bit); and it moves `-0.0` as readily as anything else, which matters here
+/// because the sign of zero is what this kernel's reduction is pinned on.
 ///
 /// **Every** call is perturbed, not one. Keys and values round through f16 on
 /// their way into the KV cache, so a single-site perturbation would usually be

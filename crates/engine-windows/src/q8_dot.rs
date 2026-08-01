@@ -336,10 +336,16 @@ mod x86 {
     /// `1.0`, and truncates to `1` where `f32::round` gives `0`. Instead this
     /// rounds to nearest-even and then adds `copysign(1.0, x)` on the lanes
     /// where `x - r == copysign(0.5, x)`. `x - r` is exact for every input
-    /// (`|d| <= 0.5`, and Sterbenz covers `|x| >= 1` while `r = 0` makes it
-    /// trivial below), and that equality is precisely the case where
-    /// ties-to-even rounded toward zero — the only case the two rules disagree
-    /// on.
+    /// (`|d| <= 0.5`; `r = 0` makes the subtraction trivial, and every lane where
+    /// `r` is nonzero has `|x| >= 0.5`, which is where Sterbenz applies —
+    /// `|r|/2 <= |x| <= 2|r|` holds for every such lane, `x = 0.75` with `r = 1`
+    /// included), and that equality is precisely the case where ties-to-even
+    /// rounded toward zero — the only case the two rules disagree on.
+    ///
+    /// The bound is `0.5` and not `1`: an inv_scale of exactly `1.0` — a block
+    /// whose max magnitude is exactly `127.0` — delivers lanes in `(0.5, 1)` to
+    /// this function, and those round to `±1` rather than to `0`. Stating it as
+    /// `|x| >= 1` would leave that interval covered by neither half.
     ///
     /// `_MM_FROUND_TO_NEAREST_INT` also has the "use MXCSR" bit clear, so the
     /// mode is architectural rather than inherited from whatever a host process

@@ -151,12 +151,16 @@ consumer that compares one of them has checked one of them.
 
 Non-streaming completion bodies carry the same facts as `camelid_lane`,
 `camelid_config_sha256`, `camelid_admission_sha256`, `camelid_model_sha256`,
-`camelid_host`, `camelid_worker_threads` and `camelid_posture`, and each serving receipt carries them (as `posture` for the last) with the digests
-at full length. The gateway does not strip them — it removes only hop-by-hop
-headers and the names a `Connection` header nominates — so a probe *through* the
-gateway still sees the replica's own identity. Its contract tests pin that for
-`x-camelid-lane`, `x-camelid-config-sha256` and `x-camelid-host`; the other three
-pass through by the same name-agnostic rule but are not yet asserted.
+`camelid_host`, `camelid_worker_threads` and `camelid_posture`, and each serving
+receipt carries them with the digests at full length and without the `camelid_`
+prefix — `lane`, `config_sha256`, `admission_sha256`, `model_sha256`, `host`,
+`worker_threads`, `posture`. The gateway does not strip them — it removes only
+hop-by-hop headers and the names a `Connection` header nominates — so a probe
+*through* the gateway still sees the replica's own identity. Its contract tests
+pin that for `x-camelid-lane`, `x-camelid-config-sha256` and `x-camelid-host`;
+the other four — `x-camelid-admission-sha256`, `x-camelid-model-sha256`,
+`x-camelid-worker-threads` and `x-camelid-posture` — pass through by the same
+name-agnostic rule but are not yet asserted.
 
 A receipt carries one field the replica did not mint: `request_id`, the
 correlation id the gateway stamps on every request it forwards, recorded verbatim

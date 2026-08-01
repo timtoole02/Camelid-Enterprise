@@ -12,11 +12,15 @@
 //! supplies the CLI, the host probe, the worker pool, the listener and shutdown,
 //! and composes nothing of its own. That is deliberate — a filter deleted from
 //! the served stack has to be a change to code the tests drive, not a change to
-//! a composition only production runs.
+//! a composition only production runs. The Q8_0 kernel and the posture it
+//! publishes are chosen in [`kernel`] here for the same reason: chosen in the
+//! binary, the one wire value nothing else derives would have been published
+//! only by a function no test can call.
 
 pub mod attribution;
 pub mod contract;
 pub mod in_tree;
+pub mod kernel;
 mod lane;
 pub mod surface;
 

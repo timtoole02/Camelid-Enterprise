@@ -3,9 +3,13 @@
 //!
 //! Acceleration is not always bit-identical, and this vocabulary exists so the
 //! replica can say which it is serving under rather than leave a client to
-//! assume. Every CPU kernel in this workspace today — the portable reference,
-//! engine-macos's NEON, engine-windows's AVX2 — is [`NumericPosture::BitIdentical`],
-//! so the published value is the same everywhere. A GPU lane admitted under a
+//! assume. Every Q8_0 dot supplied through [`crate::tensor::Q8DotRows`] today —
+//! the portable reference, engine-macos's NEON, engine-windows's AVX2 — declares
+//! [`NumericPosture::BitIdentical`], so the published value is the same
+//! everywhere. A posture is a claim about the kernel that crosses a seam, not
+//! about everything the crate supplying it exports: engine-macos also has a NEON
+//! quantizer that documents an inert divergence from the portable one, and no
+//! seam takes it, so it declares nothing here. A GPU lane admitted under a
 //! published tolerance would be the first path that is not, and the field is
 //! shipped now, at the value it truthfully has, so that arrival is a value
 //! change on an existing field rather than a new surface bolted on at the

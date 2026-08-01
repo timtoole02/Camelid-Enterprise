@@ -116,12 +116,14 @@ Windows crates each supply one Q8_0 kernel through an explicit seam, proven
 bit-identical to the portable one, so they vary speed and not output). A GPU
 backend is planned for macOS/Metal and for Windows and Linux.
 
-Per-host kernel selection is not the trigger, and it already exists: each
-platform crate picks between an accelerated kernel and the portable reference at
-runtime, on `dotprod` or on `avx2`. It is output-invariant by construction — the
-accelerated kernel is admitted only against a bit-identity proof — so two hosts
-that route differently still answer identically, which is exactly why it does not
-need a published discriminator. A GPU backend is different: it would introduce
+Per-host kernel selection is not the trigger, and it already exists: engine-macos
+picks between two NEON block kernels on `dotprod`, and engine-windows between its
+AVX2 kernel and the portable reference on `avx2`. (engine-linux supplies no dot
+yet, so nothing is selected there — the sentence is about the two crates that do,
+not about all three.) It is output-invariant by construction — every arm is
+admitted only against a bit-identity proof against the same portable reference —
+so two hosts that route differently still answer identically, which is exactly
+why it does not need a published discriminator. A GPU backend is different: it would introduce
 the first execution posture this replica can vary its *output* on — device
 present or not, resident versus host-side execution, a reduction order the
 hardware picks rather than the source. That is precisely the material a

@@ -175,7 +175,8 @@ refused?* — because under deny-by-default the allow list is the admission
 surface, and a build that quietly gained one permit would otherwise publish
 exactly what a clean replica publishes. **Two replicas can publish the same
 `config_sha256` and still emit different tokens.** That is the digest's scope
-rather than a defect, and the other four fields are what distinguish them.
+rather than a defect, and the other five fields — admission policy, weights,
+machine, pool width and numeric posture — are what distinguish them.
 [ADR 0002](docs/adr/0002-replica-identity-surface.md) states each claim and its
 limits in full.
 
@@ -293,7 +294,7 @@ Reproducibility holds for greedy decoding (`temperature: 0`), per hardware class
 
 The scope is drawn conservatively on purpose — where the results are known to hold rather than one step past it. Thread count is the honest example: the engine documents its prefill matmul as parallelizing over independent output rows with serial per-row accumulation, so *that kernel* is bit-exact across widths, and the claim is still scoped away from differing widths because the same has not been established for the whole forward pass. A scope is worth something only if it is never widened by assertion.
 
-Five published fields are what make the scope checkable rather than a footnote: the configuration digest for the vector and parity baseline, the admission digest for what the replica would have refused, the model digest for the weights, and the host summary and worker width for the machine and the width. A client that cares compares all five.
+Six published fields are what make the scope checkable rather than a footnote: the configuration digest for the vector and parity baseline, the admission digest for what the replica would have refused, the model digest for the weights, the host summary and worker width for the machine and the width, and `camelid_posture` for the numeric contract the kernel that produced the tokens holds to. A client that cares compares all six. The posture belongs in that list rather than beside it: a path admitted under a declared tolerance is reproducible on its own terms and not against a bit-identical replica, and it is the one field that would move while the other five matched.
 
 ## Repository layout
 
