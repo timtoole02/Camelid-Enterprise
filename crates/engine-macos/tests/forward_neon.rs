@@ -44,7 +44,7 @@ fn neon_accelerated_forward_matches_known_good_tokens() {
 
     // Drive engine-core's forward with the NEON dot injected through the seam.
     let mut decoder =
-        Decoder::with_q8_dot(&config, &weights, engine_macos::q8_0_dot_rows).unwrap();
+        Decoder::with_q8_projection(&config, &weights, engine_macos::q8_0_project_rows).unwrap();
 
     let started = Instant::now();
     let generated = decoder.generate(&prompt, expected.len()).unwrap();

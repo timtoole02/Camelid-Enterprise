@@ -51,14 +51,12 @@ enum Command {
         /// Worker threads. Sizes this replica's global data-parallel pool, and
         /// the width it actually resolves to is published on every response.
         ///
-        /// Since the engine cutover the pool it sizes has no reader on the
-        /// serving path: `engine-core`'s forward pass is single-threaded and
-        /// contains no `rayon`. The flag still refuses a zero width and still
-        /// publishes the width it resolved, so it remains an honest report of
-        /// the process it describes — but it does not currently change how a
-        /// request is executed. See docs/adr/0003-identity-after-the-engine-cutover.md;
-        /// whether this flag names anything is settled there, with the GPU
-        /// backend, rather than piecemeal.
+        /// This is the pool the linear projections run their output rows over,
+        /// so the published width describes work that actually happens. It was
+        /// briefly not: between the engine cutover and the parallel projection
+        /// the pool had no reader on the serving path, which
+        /// docs/adr/0003-identity-after-the-engine-cutover.md records and this
+        /// closes.
         ///
         /// Bound to `CAMELID_ENTERPRISE_THREADS` and not `CAMELID_THREADS`. The
         /// pinned engine reads that second name for its own purposes — and reads
@@ -212,9 +210,9 @@ async fn serve(
     // is proven bit-identical to the portable implementation. Model ownership
     // remains in-tree and in-process; no load/unload control-plane router exists.
     #[cfg(target_os = "macos")]
-    let loaded_model = engine_core::runtime::LoadedModel::load_with_q8_dot(
+    let loaded_model = engine_core::runtime::LoadedModel::load_with_q8_projection(
         &model,
-        engine_macos::q8_0_dot_rows,
+        engine_macos::q8_0_project_rows,
     )?;
     #[cfg(not(target_os = "macos"))]
     let loaded_model = engine_core::runtime::LoadedModel::load(&model)?;

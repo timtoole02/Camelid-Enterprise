@@ -8,7 +8,7 @@
 
 pub mod q8_dot;
 
-pub use q8_dot::{q8_0_dot_rows, quantize_q8_0_block, quantize_q8_0_blocks};
+pub use q8_dot::{q8_0_dot_rows, q8_0_project_rows, quantize_q8_0_block, quantize_q8_0_blocks};
 
 use engine_core::host::HostCapabilities;
 

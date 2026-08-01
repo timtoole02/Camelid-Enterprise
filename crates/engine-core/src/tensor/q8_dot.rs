@@ -11,15 +11,88 @@
 //! f32 terms over a single accumulator in ascending block order with no fused
 //! multiply-add and no reassociation, so results are bit-deterministic.
 
+use rayon::prelude::*;
+
 use super::blocks::{f16_bits_to_f32, f32_to_f16_bits, Q8_0Block, Q8_0_BLOCK_VALUES};
 
 /// A Q8_0 row-dot function: weight-row blocks against input-row blocks -> f32.
 ///
 /// [`q8_0_dot_rows`] is the portable reference. A per-platform crate can supply
-/// an accelerated implementation with the identical result and pass it wherever
-/// the forward pass takes a `Q8DotRows`, so acceleration is chosen by the caller
-/// without `engine-core` ever depending on a platform crate.
+/// an accelerated implementation with the identical result. This is the *leaf*
+/// kernel; the seam the forward pass takes is [`Q8Projection`], one call per
+/// projection rather than one per row.
 pub type Q8DotRows = fn(&[Q8_0Block], &[Q8_0Block]) -> f32;
+
+/// A whole Q8_0 linear projection: every weight row dotted against one
+/// already-quantized input row, written into `out`.
+///
+/// This is the seam a platform crate accelerates. It is deliberately coarser
+/// than [`Q8DotRows`]: the vocabulary head of a small model is over 128,000
+/// rows, so a per-row seam costs that many indirect calls per token and cannot
+/// be given to a device that dispatches work in bulk. One call per projection
+/// costs one, and leaves the implementation free to choose how it divides the
+/// rows.
+///
+/// Arguments are `(weight_blocks, blocks_per_row, input_blocks, out)`.
+/// `weight_blocks` is row-major with `blocks_per_row` blocks per row, and
+/// `out.len()` is the row count.
+pub type Q8Projection = fn(&[Q8_0Block], usize, &[Q8_0Block], &mut [f32]);
+
+/// Output rows below this are computed on the calling thread. A projection of a
+/// few hundred rows finishes faster than a pool can be woken for it; the wide
+/// ones — the FFN pair and the vocabulary head — are where the work is.
+///
+/// Measured on an M4 (10 cores) with `Llama-3.2-1B-Instruct-Q8_0`, interleaved
+/// in one thermal state: 256 -> 41.1, **1024 -> 42.4**, 4096 -> 38.5 tok/s.
+/// Lowering it adds dispatches on the 512-row K/V projections for no gain;
+/// raising it drops the 2048-row ones.
+pub const PARALLEL_LINEAR_MIN_OUTPUTS: usize = 1024;
+
+/// Run `dot` over every row of a Q8_0 projection, in parallel above
+/// [`PARALLEL_LINEAR_MIN_OUTPUTS`].
+///
+/// Generic over the leaf kernel rather than taking a [`Q8DotRows`] pointer, so
+/// the kernel monomorphizes into the loop and can inline. A platform crate
+/// builds its [`Q8Projection`] by calling this with its own kernel, which is
+/// what keeps the row-splitting policy in one place instead of copied per host.
+///
+/// The split is across **independent output rows**: one output element is one
+/// weight row dotted against the same input, and no accumulation crosses rows,
+/// so the result is bit-identical at any pool width. Splitting a single row's
+/// accumulation would reorder that row's fold and is deliberately not done —
+/// see the module header's determinism claim.
+pub fn project_rows<F>(
+    weight_blocks: &[Q8_0Block],
+    blocks_per_row: usize,
+    input_blocks: &[Q8_0Block],
+    out: &mut [f32],
+    dot: F,
+) where
+    F: Fn(&[Q8_0Block], &[Q8_0Block]) -> f32 + Sync,
+{
+    debug_assert_eq!(weight_blocks.len(), out.len() * blocks_per_row);
+    let row_of = |o: usize, out_value: &mut f32| {
+        let row = &weight_blocks[o * blocks_per_row..(o + 1) * blocks_per_row];
+        *out_value = dot(row, input_blocks);
+    };
+    if out.len() >= PARALLEL_LINEAR_MIN_OUTPUTS {
+        out.par_iter_mut()
+            .enumerate()
+            .for_each(|(o, v)| row_of(o, v));
+    } else {
+        out.iter_mut().enumerate().for_each(|(o, v)| row_of(o, v));
+    }
+}
+
+/// The portable [`Q8Projection`]: [`project_rows`] over [`q8_0_dot_rows`].
+pub fn q8_0_project_rows(
+    weight_blocks: &[Q8_0Block],
+    blocks_per_row: usize,
+    input_blocks: &[Q8_0Block],
+    out: &mut [f32],
+) {
+    project_rows(weight_blocks, blocks_per_row, input_blocks, out, q8_0_dot_rows)
+}
 
 /// Quantize one chunk of exactly [`Q8_0_BLOCK_VALUES`] f32 values into a
 /// [`Q8_0Block`].

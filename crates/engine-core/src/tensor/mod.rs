@@ -20,7 +20,10 @@ use blocks::{
 pub use blocks::{
     f16_bits_to_f32, f32_to_f16_bits, Q8_0Block, RuntimeDType, TensorShape, Q8_0_BLOCK_VALUES,
 };
-pub use q8_dot::{q8_0_dot_rows, quantize_q8_0_block, quantize_q8_0_blocks, Q8DotRows};
+pub use q8_dot::{
+    project_rows, q8_0_dot_rows, q8_0_project_rows, quantize_q8_0_block, quantize_q8_0_blocks,
+    Q8DotRows, Q8Projection, PARALLEL_LINEAR_MIN_OUTPUTS,
+};
 pub use store::{cpu_tensor_from_gguf_bytes, TensorStore};
 
 /// A CPU-resident tensor. Activations and float-sourced weights carry
