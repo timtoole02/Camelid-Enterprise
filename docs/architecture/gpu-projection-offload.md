@@ -35,6 +35,13 @@ result. So the first question is not "how fast" but **"can a GPU kernel be
 bit-identical to the portable reference"**, and for the Q8_0 projection the
 answer is yes — for reasons specific enough to be worth writing down.
 
+> **The project has since chosen not to require it** (see *Decision 1* below):
+> the GPU path is a second declared posture. This section is retained because it
+> is what makes that a *choice* rather than a concession — bit-identity was
+> available and was traded for kernel freedom — and because Phase 0 still
+> preserves it, and it remains the fallback if the second posture proves more
+> expensive to publish than it is worth.
+
 The reference (`crates/engine-core/src/tensor/q8_dot.rs`) is:
 
 ```rust
@@ -111,9 +118,15 @@ only phase I would start without further decisions.
 **Phase 1 — Metal projection kernel.** A new `engine-macos` path that uploads
 the Q8_0 weight blocks once at load (Apple Silicon is unified-memory, so
 "upload" is page-aligned residency, not a copy — Camelid's `CAMELID_METAL_NOCOPY`
-does exactly this) and dispatches one thread per output row per projection.
-Contraction off. Verified by a bit-identity test against the portable reference
-over the real weights, plus the existing model-backed parity gate.
+does exactly this) and dispatches a projection at a time. Under Decision 1 the
+reduction shape is unconstrained — pick whatever is fastest — subject only to
+being *fixed and data-independent*, with no float atomics, so the posture stays
+reproducible run to run.
+
+Verified by: a **restart-reproducibility** test (same request twice across a full
+process restart, byte-identical), a comparison against the CPU posture on a
+committed prompt pack to quantify the divergence the posture is declaring, and
+the existing model-backed parity gate still passing **on the CPU posture**.
 **Estimate: the bulk of the work.** Device/buffer/pipeline lifecycle, MSL source,
 and the residency question of when weights are uploaded relative to
 `LoadedModel::load`.
@@ -131,13 +144,63 @@ builds Windows but deliberately does not run the workspace suite there
 (`.github/workflows/ci.yml`, `windows-check`), so a CUDA path arrives with less
 test coverage than the Metal one.
 
-## Decisions this needs before Phase 1
+## Decision 1: a second declared posture — DECIDED
 
-1. **Does the GPU lane have to be bit-identical, or may it be a second declared
-   posture?** Bit-identity looks achievable and is assumed above, but it
-   constrains the kernel to one-thread-per-row and forbids the tree reductions a
-   GPU would otherwise prefer. Accepting a *separate* posture would allow a
-   faster kernel at the cost of a second identity to publish and defend.
+**The GPU path is a second declared posture, not a bit-identical replacement.**
+
+The kernel is therefore free of the one-thread-per-row constraint above. It may
+use whatever reduction shape is fastest — threadgroup tree reductions, SIMD-group
+sums, wider tiles — and the FMA-contraction hazard stops being a correctness
+issue and becomes a performance choice. That is the point of the decision, and it
+is what makes a GPU kernel worth writing rather than a GPU-shaped CPU kernel.
+
+### What the decision does NOT relax
+
+**Reproducibility within the posture.** "Not identical to the CPU path" is not
+"not deterministic". The lane's published result is that the same greedy request
+yields the identical token stream on every run, *including across process
+restarts* — that claim is per-posture and survives this decision intact. The GPU
+kernel must therefore avoid the sources of **run-to-run** variance, which are
+different from the sources of CPU-difference:
+
+- **no float atomics.** An `atomic_fetch_add` over f32 accumulates in whatever
+  order the threadgroups happen to retire, which varies run to run. This is the
+  single most common way a GPU kernel becomes irreproducible, and it is easy to
+  reach for.
+- **a fixed, data-independent reduction order.** A tree reduction is fine — it
+  just has to be the *same* tree every time, so threadgroup size and tile shape
+  must not depend on runtime conditions such as device occupancy.
+- **no dependence on dispatch order** between projections that write shared
+  state.
+
+A kernel meeting those is reproducible without being CPU-identical, which is
+exactly the posture being declared.
+
+### What it costs
+
+Two things now need building that bit-identity would have given for free:
+
+1. **A second identity to publish and defend.** Two replicas serving the same
+   weights on different postures produce different tokens, and a client must be
+   able to tell them apart *before* it compares outputs. This is no longer
+   optional — see the ADR 0003 section below.
+2. **An acceptance criterion for the GPU posture.** The model-backed parity gate
+   (`in_tree_generation_matches_pinned_engine`) asserts token-identity against
+   the pinned oracle. That gate now belongs to the **CPU posture**. The GPU
+   posture needs its own, and "token-identical to the oracle" is no longer
+   available as the bar. The sibling engine's answer is an evidence bundle with
+   the divergence measured and disclosed rather than adjudicated — worth copying
+   in shape, since the alternative is a lane whose quality is unstated.
+
+**Open: what the GPU posture's acceptance bar actually is.** Candidates: token
+identity against the *CPU posture* over a committed prompt pack at fixed depths;
+a disclosed divergence budget in the manner of the sibling engine's bundles; or
+top-1 agreement above a stated threshold. This wants deciding before Phase 1
+ships, not before it starts — Phase 1 can be measured against the CPU posture
+while the bar is chosen.
+
+## Remaining decisions before Phase 1
+
 2. **Where does residency live?** Uploading at `LoadedModel::load` makes the
    runtime own a device handle and ends `engine-core`'s current property of being
    platform-free. Uploading lazily at first projection keeps that property and
@@ -153,8 +216,21 @@ This is the trigger [ADR 0003](../adr/0003-identity-after-the-engine-cutover.md)
 names: *"the first change that gives `engine-core` more than one execution
 path for the same model on the same host."* A GPU backend means a replica can serve
 the same weights two ways, which is the first execution posture worth putting in
-a configuration vector since the cutover. The identity correction ADR 0003 defers
-should land with Phase 1, not after it — decision 1 above is the same decision.
+a configuration vector since the cutover.
+
+**Decision 1 promotes that from "should" to "must".** While both paths were going
+to be bit-identical, a replica that failed to say which one it ran produced the
+same tokens either way, so the stale digest was an honesty problem rather than a
+correctness one. A second *declared* posture is only declared if something
+declares it: two replicas serving the same weights now emit different tokens, and
+a client that cannot tell them apart before comparing outputs will read a posture
+difference as a bug in one of them.
+
+So the identity correction ADR 0003 defers is no longer deferrable past Phase 1.
+Concretely, the versioned change must land in the same release: publish an engine
+identity, re-scope `config_sha256` so it distinguishes the two postures, and
+retire the fourteen `CAMELID_*` keys that describe neither. ADR 0003's own list
+of every published copy of both digests is the checklist for that change.
 
 ## What this scope does not cover
 
@@ -163,7 +239,8 @@ should land with Phase 1, not after it — decision 1 above is the same decision
   faster, not many streams cheaper.
 - Prefill. Phase 1 accelerates the projection used by both prefill and decode,
   but a batched prefill kernel — processing many positions per dispatch — is a
-  separate design with its own bit-identity question.
+  separate design, and one whose reduction shape would have to be pinned against
+  the *position count* to stay reproducible.
 - Any quantisation other than Q8_0. The wire formats `CpuTensor` carries
   (`q4_k_wire_bytes`, `q5_k_wire_bytes`, `q6_k_wire_bytes`, `tq2_0_wire_bytes`,
   `iq4_xs_wire_bytes`) are out of scope; the seam is Q8_0's.
