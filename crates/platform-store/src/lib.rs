@@ -26,6 +26,11 @@
 //! - **Fail-closed.** Every failure to reach or query the store is a refusal.
 //!   There is no fallback to per-pod counting: silently degrading to the very
 //!   behaviour this exists to replace is worse than a `503`.
+//!
+//! The database must belong to one gateway deployment. Quota state is keyed by
+//! organization and window and by nothing else, so two deployments pointed at
+//! one database share every counter — quietly, if they also agree on the
+//! window. Give staging its own database.
 
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
@@ -46,7 +51,13 @@ pub const PLATFORM_SCHEMA_VERSION: i32 = 1;
 /// schema exists — the ordering problem `CREATE TABLE IF NOT EXISTS` cannot
 /// solve, because concurrent creates of the same table still collide in the
 /// system catalog.
-const ADVISORY_LOCK_KEY: i64 = 0x0043_414d_454c_4944;
+const SCHEMA_LOCK_KEY: i64 = 0x0043_414d_454c_4944;
+
+/// Distinct from [`SCHEMA_LOCK_KEY`] on purpose. Sharing one key coupled
+/// housekeeping to startup: a sweep that held the lock made every *new* pod
+/// block on it and then die of `statement_timeout`, reporting a timeout rather
+/// than a lock.
+const SWEEP_LOCK_KEY: i64 = 0x0043_414d_454c_5357;
 
 /// How many elapsed windows of quota rows to keep before the sweeper removes
 /// them. Rows are tiny and admission never reads an elapsed window, so this is
@@ -54,9 +65,14 @@ const ADVISORY_LOCK_KEY: i64 = 0x0043_414d_454c_4944;
 /// this tenant throttled" query possible.
 const RETENTION_WINDOWS: i64 = 3;
 
-/// Upper bound on rows one sweep may delete, so the sweeper cannot turn into a
-/// long transaction that blocks admission.
+/// Upper bound on rows one `DELETE` may remove, so no single statement runs
+/// long enough to matter.
 const SWEEP_BATCH_ROWS: i64 = 10_000;
+
+/// Batches one sweep may run. One bounded batch per sweep could not keep up
+/// with a deployment producing more than `SWEEP_BATCH_ROWS` organization
+/// windows per window: the backlog would grow faster than it drained.
+const SWEEP_MAX_BATCHES: usize = 32;
 
 /// Admission. One statement, one row, no transaction.
 ///
@@ -65,6 +81,13 @@ const SWEEP_BATCH_ROWS: i64 = 10_000;
 /// refusal cannot race an admission. `Retry-After` comes from the same `now()`
 /// as the window arithmetic — `now()` is transaction time, so both CTEs see one
 /// instant.
+///
+/// The limit is read from `quota_config` rather than bound from this process,
+/// so it is the deployment's and not the pod's. A pod still running an older
+/// limit therefore enforces the current one from the moment a newer pod records
+/// it, instead of over-admitting for the rest of the window. If that row were
+/// ever missing the comparison is `NULL`, which is not true, so the conflict
+/// path refuses — fail-closed, like every other unanswerable case here.
 const ADMIT_SQL: &str = "\
 WITH t AS (
   SELECT floor(extract(epoch FROM now()) / $2::bigint)::bigint * $2::bigint AS window_start,
@@ -74,7 +97,7 @@ WITH t AS (
   SELECT $1::text, window_start, 1 FROM t
   ON CONFLICT (organization_id, window_start_epoch)
   DO UPDATE SET request_count = q.request_count + 1
-  WHERE q.request_count < $3::bigint
+  WHERE q.request_count < (SELECT request_limit FROM quota_config)
   RETURNING q.request_count
 )
 SELECT (SELECT count(*) FROM admitted) = 1 AS admitted,
@@ -105,6 +128,10 @@ CREATE TABLE quota_windows (
   request_count      bigint NOT NULL,
   PRIMARY KEY (organization_id, window_start_epoch)
 );
+-- The primary key leads with the organization, so the sweeper's predicate on
+-- the window alone cannot use it and would sequentially scan a growing table.
+CREATE INDEX quota_windows_window_start_epoch_idx
+  ON quota_windows (window_start_epoch);
 INSERT INTO platform_schema_version (version) VALUES (1);";
 
 /// How a gateway reaches the platform store.
@@ -183,8 +210,8 @@ pub enum PlatformStoreError {
     /// about the window write to different rows and therefore enforce the
     /// *sum* of their limits — precisely the defect a shared counter exists to
     /// remove — so this is fatal rather than a warning. A limit that differs is
-    /// not: pods sharing a row converge on the largest configured limit, which
-    /// is a degraded rollout, not a broken one.
+    /// not: the limit lives in the store and every pod reads it there, so the
+    /// deployment converges on the most recently recorded one.
     QuotaWindowMismatch { configured: u64, stored: i64 },
 }
 
@@ -203,7 +230,10 @@ impl std::fmt::Display for PlatformStoreError {
                 f,
                 "platform store quota window is {stored}s but this gateway is configured for \
                  {configured}s; every replica must use the same \
-                 --org-request-quota-window-seconds or the shared limit is not shared"
+                 --org-request-quota-window-seconds or the shared limit is not shared. To \
+                 change it, roll out the new value with --reconfigure-quota-window set on the \
+                 replicas, which rewrites the stored window and discards the counters measured \
+                 against the old one."
             ),
         }
     }
@@ -244,6 +274,20 @@ pub enum QuotaConfiguration {
     Initialized,
     Unchanged,
     LimitChanged { previous: u64 },
+    WindowChanged { previous: u64 },
+}
+
+/// What to do about a stored quota window that differs from this pod's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotaWindowChange {
+    /// Refuse to start. The right default: a pod that disagrees about the
+    /// window silently doubles the deployment's effective limit.
+    Refuse,
+    /// Rewrite the stored window, discarding counters measured against the old
+    /// one. An operator has to ask for this, because during the rollout that
+    /// carries it the replicas still running the previous window are the split
+    /// counter this refuses to become by accident.
+    Reconfigure,
 }
 
 /// What one sweep did.
@@ -286,7 +330,7 @@ impl PlatformStore {
         let mut client = self.client().await?;
         let transaction = client.transaction().await.map_err(database_error)?;
         transaction
-            .execute("SELECT pg_advisory_xact_lock($1)", &[&ADVISORY_LOCK_KEY])
+            .execute("SELECT pg_advisory_xact_lock($1)", &[&SCHEMA_LOCK_KEY])
             .await
             .map_err(database_error)?;
 
@@ -312,13 +356,14 @@ impl PlatformStore {
         &self,
         limit: NonZeroU32,
         window_seconds: NonZeroU64,
+        on_window_change: QuotaWindowChange,
     ) -> Result<QuotaConfiguration, PlatformStoreError> {
         let window = window_seconds_as_i64(window_seconds)?;
         let limit = i64::from(limit.get());
         let mut client = self.client().await?;
         let transaction = client.transaction().await.map_err(database_error)?;
         transaction
-            .execute("SELECT pg_advisory_xact_lock($1)", &[&ADVISORY_LOCK_KEY])
+            .execute("SELECT pg_advisory_xact_lock($1)", &[&SCHEMA_LOCK_KEY])
             .await
             .map_err(database_error)?;
 
@@ -345,12 +390,31 @@ impl PlatformStore {
                 let stored_limit: i64 = row.get(0);
                 let stored_window: i64 = row.get(1);
                 if stored_window != window {
-                    return Err(PlatformStoreError::QuotaWindowMismatch {
-                        configured: window_seconds.get(),
-                        stored: stored_window,
-                    });
-                }
-                if stored_limit == limit {
+                    if on_window_change == QuotaWindowChange::Refuse {
+                        return Err(PlatformStoreError::QuotaWindowMismatch {
+                            configured: window_seconds.get(),
+                            stored: stored_window,
+                        });
+                    }
+                    transaction
+                        .execute(
+                            "UPDATE quota_config \
+                             SET request_limit = $1, window_seconds = $2, updated_at = now()",
+                            &[&limit, &window],
+                        )
+                        .await
+                        .map_err(database_error)?;
+                    // Every stored counter was measured against window starts
+                    // the new length does not produce. Keeping them would leave
+                    // rows no admission can ever reach again.
+                    transaction
+                        .execute("DELETE FROM quota_windows", &[])
+                        .await
+                        .map_err(database_error)?;
+                    QuotaConfiguration::WindowChanged {
+                        previous: stored_window.unsigned_abs(),
+                    }
+                } else if stored_limit == limit {
                     QuotaConfiguration::Unchanged
                 } else {
                     transaction
@@ -373,59 +437,98 @@ impl PlatformStore {
     /// Deletes quota rows for windows that ended more than a few windows ago,
     /// if no other pod is already doing it.
     ///
-    /// `pg_try_advisory_lock` rather than the blocking form: a pod that finds
-    /// the sweep in progress has nothing to wait for.
+    /// `pg_try_advisory_xact_lock` rather than the session-scoped form: a
+    /// session lock outlives a cancelled or panicked sweep, because a pooled
+    /// connection is recycled without resetting session state, and a leaked one
+    /// is invisible to the pod that leaked it. A transaction lock is released
+    /// by commit, rollback, drop and cancellation alike. `try` rather than
+    /// blocking, because a pod that finds a sweep in progress has nothing to
+    /// wait for.
     pub async fn sweep(
         &self,
         window_seconds: NonZeroU64,
     ) -> Result<SweepOutcome, PlatformStoreError> {
-        let window = window_seconds_as_i64(window_seconds)?;
-        let client = self.client().await?;
-        let acquired: bool = client
-            .query_one("SELECT pg_try_advisory_lock($1)", &[&ADVISORY_LOCK_KEY])
+        let retention = window_seconds_as_i64(window_seconds)?.saturating_mul(RETENTION_WINDOWS);
+        let mut client = self.client().await?;
+        let transaction = client.transaction().await.map_err(database_error)?;
+        let acquired: bool = transaction
+            .query_one("SELECT pg_try_advisory_xact_lock($1)", &[&SWEEP_LOCK_KEY])
             .await
             .map_err(database_error)?
             .get(0);
         if !acquired {
             return Ok(SweepOutcome::SkippedLockHeld);
         }
-        let deleted = client
-            .execute(
-                SWEEP_SQL,
-                &[&window.saturating_mul(RETENTION_WINDOWS), &SWEEP_BATCH_ROWS],
-            )
-            .await;
-        client
-            .execute("SELECT pg_advisory_unlock($1)", &[&ADVISORY_LOCK_KEY])
-            .await
-            .map_err(database_error)?;
-        Ok(SweepOutcome::Deleted(deleted.map_err(database_error)?))
+
+        let mut deleted = 0;
+        for _ in 0..SWEEP_MAX_BATCHES {
+            let batch = transaction
+                .execute(SWEEP_SQL, &[&retention, &SWEEP_BATCH_ROWS])
+                .await
+                .map_err(database_error)?;
+            deleted += batch;
+            if batch < SWEEP_BATCH_ROWS as u64 {
+                break;
+            }
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(SweepOutcome::Deleted(deleted))
     }
 }
 
-/// The gateway's shared quota: a [`PlatformStore`] plus the limit and window it
-/// was started with.
+/// The gateway's shared quota: a [`PlatformStore`] plus the window it was
+/// started with. The *limit* is deliberately not held here — it lives in the
+/// store, so a pod cannot enforce one the deployment has moved on from.
 pub struct PlatformQuota {
     store: PlatformStore,
-    limit: i64,
     window_seconds: i64,
     window: NonZeroU64,
 }
 
 impl PlatformQuota {
     /// Connects, migrates, and reconciles this pod's quota configuration with
-    /// whatever the store already holds.
+    /// whatever the store already holds, refusing a stored window that differs
+    /// from this pod's.
     pub async fn connect(
         config: &PlatformStoreConfig,
         limit: NonZeroU32,
         window_seconds: NonZeroU64,
     ) -> Result<(Self, QuotaConfiguration), PlatformStoreError> {
+        Self::open(config, limit, window_seconds, QuotaWindowChange::Refuse).await
+    }
+
+    /// As [`Self::connect`], but rewrites a stored window that differs instead
+    /// of refusing it. Spelled out rather than passed as a flag because it is
+    /// the destructive one: it discards every counter measured against the old
+    /// window, and the replicas still running that window are, until they
+    /// restart, the split counter [`Self::connect`] refuses to become.
+    pub async fn connect_reconfiguring_window(
+        config: &PlatformStoreConfig,
+        limit: NonZeroU32,
+        window_seconds: NonZeroU64,
+    ) -> Result<(Self, QuotaConfiguration), PlatformStoreError> {
+        Self::open(
+            config,
+            limit,
+            window_seconds,
+            QuotaWindowChange::Reconfigure,
+        )
+        .await
+    }
+
+    async fn open(
+        config: &PlatformStoreConfig,
+        limit: NonZeroU32,
+        window_seconds: NonZeroU64,
+        on_window_change: QuotaWindowChange,
+    ) -> Result<(Self, QuotaConfiguration), PlatformStoreError> {
         let store = PlatformStore::connect(config).await?;
-        let configuration = store.configure_quota(limit, window_seconds).await?;
+        let configuration = store
+            .configure_quota(limit, window_seconds, on_window_change)
+            .await?;
         Ok((
             Self {
                 store,
-                limit: i64::from(limit.get()),
                 window_seconds: window_seconds_as_i64(window_seconds)?,
                 window: window_seconds,
             },
@@ -448,10 +551,7 @@ impl PlatformQuota {
             .await
             .map_err(QuotaRefusal::Unavailable)?;
         let row = client
-            .query_one(
-                ADMIT_SQL,
-                &[&organization, &self.window_seconds, &self.limit],
-            )
+            .query_one(ADMIT_SQL, &[&organization, &self.window_seconds])
             .await
             .map_err(|error| QuotaRefusal::Unavailable(database_error(error)))?;
         let admitted: bool = row.get(0);
@@ -523,8 +623,21 @@ fn build_pool(config: &PlatformStoreConfig) -> Result<Pool, PlatformStoreError> 
     let manager_config = ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
     };
+    // Whether the connection is encrypted is decided by the CA file, because
+    // rustls cannot verify anything without one. What the URL asked for still
+    // has to be honoured or refused, never quietly overridden: an operator who
+    // wrote `sslmode=require` and got cleartext learns nothing from a warning
+    // that says the connection is cleartext.
+    let requested = pg_config.get_ssl_mode();
     let manager = match &config.ca_file {
         Some(ca_file) => {
+            if matches!(requested, SslMode::Disable) {
+                return Err(PlatformStoreError::Config(
+                    "the platform database url asks for sslmode=disable but a certificate \
+                     authority was supplied; drop one of the two"
+                        .to_string(),
+                ));
+            }
             // `require` and not `verify-full`: tokio-postgres has no such mode,
             // because verification belongs to the connector. rustls always
             // verifies the chain and the hostname, so this *is* full
@@ -533,6 +646,14 @@ fn build_pool(config: &PlatformStoreConfig) -> Result<Pool, PlatformStoreError> 
             Manager::from_config(pg_config, tls_connector(ca_file)?, manager_config)
         }
         None => {
+            if matches!(requested, SslMode::Require) {
+                return Err(PlatformStoreError::Config(
+                    "the platform database url asks for sslmode=require but no certificate \
+                     authority was supplied, and TLS without one cannot be verified; supply \
+                     the CA that signed the database's server certificate"
+                        .to_string(),
+                ));
+            }
             pg_config.ssl_mode(SslMode::Disable);
             Manager::from_config(pg_config, NoTls, manager_config)
         }
@@ -627,5 +748,38 @@ mod tests {
         assert_eq!(config.max_connections, 8);
         assert_eq!(config.acquire_timeout, Duration::from_millis(500));
         assert_eq!(config.statement_timeout, Duration::from_millis(1_000));
+    }
+
+    /// Forcing the mode down to cleartext because no CA was supplied handed an
+    /// operator who asked for TLS an unencrypted connection, and said so only
+    /// as a warning about cleartext that never mentioned being overruled.
+    #[test]
+    fn a_url_that_asks_for_tls_without_a_certificate_authority_is_refused() {
+        let config = PlatformStoreConfig::new(
+            "postgresql://camelid@db.internal/platform?sslmode=require".to_string(),
+        );
+        let Err(error) = build_pool(&config) else {
+            panic!("sslmode=require without a CA cannot be honoured");
+        };
+        assert!(matches!(error, PlatformStoreError::Config(_)));
+        assert!(error.to_string().contains("sslmode=require"));
+    }
+
+    #[test]
+    fn a_certificate_authority_with_tls_switched_off_is_refused() {
+        let mut config = PlatformStoreConfig::new(
+            "postgresql://camelid@db.internal/platform?sslmode=disable".to_string(),
+        );
+        config.ca_file = Some(PathBuf::from("ca.pem"));
+        assert!(matches!(
+            build_pool(&config),
+            Err(PlatformStoreError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn a_url_that_says_nothing_about_tls_still_connects_in_cleartext() {
+        let config = PlatformStoreConfig::new("postgresql://camelid@db.internal/platform".into());
+        assert!(build_pool(&config).is_ok());
     }
 }

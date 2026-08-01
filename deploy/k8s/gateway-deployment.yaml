@@ -16,13 +16,17 @@
 #
 # The organization quota is per gateway process unless
 # CAMELID_GATEWAY_PLATFORM_DATABASE_URL points every replica at one PostgreSQL
-# database. Because this manifest runs two replicas, the in-process counter
-# admits up to 2x the configured limit per window. If you configure the shared
-# counter, every replica must use the same database AND the same
+# database, dedicated to this deployment -- quota rows are keyed by organization
+# and window only, so a second deployment on the same database spends the same
+# budget. Because this manifest runs two replicas, the in-process counter admits
+# up to 2x the configured limit per window. If you configure the shared counter,
+# every replica must use the same database AND the same
 # CAMELID_GATEWAY_ORG_REQUEST_QUOTA_WINDOW_SECONDS -- a pod whose window
 # disagrees with the recorded one refuses to start, because pods that disagree
-# enforce the sum of their limits. Supply the URL from a Secret: it carries a
-# password. See deploy/README.md, "Shared quota (PostgreSQL)".
+# enforce the sum of their limits. To change the window, roll out
+# CAMELID_GATEWAY_RECONFIGURE_QUOTA_WINDOW=true with the new value, then drop
+# it. Supply the URL from a Secret: it carries a password. See
+# deploy/README.md, "Shared quota (PostgreSQL)".
 apiVersion: apps/v1
 kind: Deployment
 metadata:

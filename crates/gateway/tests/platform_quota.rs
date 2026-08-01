@@ -78,6 +78,9 @@ impl TestDatabase {
     fn config(&self) -> PlatformStoreConfig {
         let mut config = PlatformStoreConfig::new(self.url.clone());
         config.acquire_timeout = Duration::from_secs(5);
+        // These tests run concurrently against one server, each holding its own
+        // pool; the production default of 8 would exhaust `max_connections`.
+        config.max_connections = 2;
         config
     }
 

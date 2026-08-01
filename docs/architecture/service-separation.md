@@ -369,7 +369,14 @@ tokens for one model"; everything multi-user is layered on top.
   `quota_store_unavailable`, distinct from a spent quota's `429`, and never
   falls back to per-pod counting. Every replica must use the same database and
   the same window: a pod whose window disagrees with the recorded one refuses
-  to start, because pods that disagree enforce the sum of their limits. With `--usage-log` plus `--identity-db`, each authenticated,
+  to start, because pods that disagree enforce the sum of their limits, and
+  changing the window is an explicit `--reconfigure-quota-window` rollout that
+  discards the counters measured against the old one. The limit is read from
+  the store on every admission rather than bound from the process, so a lowered
+  limit binds every replica as soon as one records it instead of after the last
+  one restarts. The database has to be dedicated: rows are keyed by
+  organization and window and by nothing else, so two deployments sharing one
+  database share every counter. With `--usage-log` plus `--identity-db`, each authenticated,
   quota-admitted request also produces a separate best-effort terminal JSONL
   record with `started_ts`, `duration_ms`, `response_head_status`, opaque
   request/response byte counts, and a `stream_outcome`: `completed`,

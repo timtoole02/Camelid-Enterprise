@@ -3,7 +3,9 @@
 # The shared organization quota needs a database every gateway process can
 # reach. On a single box that is this file; on Kubernetes it is a database you
 # already operate. Nothing here is required unless you set
-# CAMELID_GATEWAY_PLATFORM_DATABASE_URL on the gateway.
+# CAMELID_GATEWAY_PLATFORM_DATABASE_URL on the gateway. Give each deployment its
+# own database: quota rows are keyed by organization and window and by nothing
+# else, so two deployments sharing one database share every counter.
 #
 #   docker compose -f deploy/docker/compose.platform.yaml up -d
 #   camelid-enterprise-gateway serve \

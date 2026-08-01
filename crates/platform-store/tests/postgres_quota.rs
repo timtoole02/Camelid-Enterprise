@@ -58,6 +58,10 @@ impl TestDatabase {
     fn config(&self) -> PlatformStoreConfig {
         let mut config = PlatformStoreConfig::new(self.url.clone());
         config.acquire_timeout = Duration::from_secs(5);
+        // Every test in this file runs concurrently against one server, each
+        // holding its own pool. The production default of 8 would exhaust
+        // `max_connections` and surface as unrelated failures.
+        config.max_connections = 2;
         config
     }
 
@@ -219,10 +223,9 @@ async fn a_window_rollover_resets_the_counter_and_retry_after_stays_inside_the_w
     // The window is aligned to the database clock, so waiting out the refusal's
     // own answer is enough: it names the boundary every pod would name.
     tokio::time::sleep(retry_after + Duration::from_millis(250)).await;
-    assert!(
-        quota.admit("org_roll").await.is_ok(),
-        "the window named by retry_after must have rolled over"
-    );
+    if let Err(refusal) = quota.admit("org_roll").await {
+        panic!("the window named by retry_after must have rolled over: {refusal:?}");
+    }
 
     let windows: i64 = database
         .client()
@@ -463,5 +466,184 @@ async fn the_sweeper_removes_only_windows_past_retention() {
         .map(|row| row.get(0))
         .collect();
     assert_eq!(remaining, vec!["org_live", "org_recent"]);
+    database.drop_database().await;
+}
+
+/// A session-scoped sweep lock survived a cancelled sweep on a recycled
+/// connection, and because it shared a key with the schema lock, every later
+/// pod blocked on it and died reporting a statement timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sweep_releases_its_lock_and_does_not_hold_the_schema_lock() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let (quota, _) = PlatformQuota::connect(&database.config(), limit(10), window(60))
+        .await
+        .expect("store");
+    quota.admit("org_a").await.expect("admit");
+
+    for _ in 0..3 {
+        assert!(
+            matches!(
+                quota.sweep().await.expect("sweep"),
+                SweepOutcome::Deleted(_)
+            ),
+            "a sweep that found the lock held would mean the previous one leaked it"
+        );
+    }
+
+    let held: i64 = database
+        .client()
+        .await
+        .query_one(
+            "SELECT count(*) FROM pg_locks
+             WHERE locktype = 'advisory'
+               AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            &[],
+        )
+        .await
+        .expect("advisory locks")
+        .get(0);
+    assert_eq!(
+        held, 0,
+        "no advisory lock may outlive the sweep that took it"
+    );
+
+    // Startup takes the schema lock. A sweeper sharing that key would make this
+    // block until it timed out.
+    PlatformStore::connect(&database.config())
+        .await
+        .expect("a later pod must still be able to start");
+    database.drop_database().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sweeper_drains_more_than_one_batch() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let (quota, _) = PlatformQuota::connect(&database.config(), limit(10), window(60))
+        .await
+        .expect("store");
+    let client = database.client().await;
+    client
+        .execute(
+            "INSERT INTO quota_windows (organization_id, window_start_epoch, request_count)
+             SELECT 'org_' || i, floor(extract(epoch FROM now()))::bigint - 6000 - i, 1
+             FROM generate_series(1, 15000) AS i",
+            &[],
+        )
+        .await
+        .expect("seed a backlog larger than one batch");
+
+    assert_eq!(
+        quota.sweep().await.expect("sweep"),
+        SweepOutcome::Deleted(15_000),
+        "one bounded batch per sweep could never drain a backlog that grows faster"
+    );
+    database.drop_database().await;
+}
+
+/// The sweeper's predicate is on the second column of the primary key, so
+/// without its own index it degrades to a sequential scan as the table grows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sweep_predicate_has_an_index() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    PlatformStore::connect(&database.config())
+        .await
+        .expect("store");
+    let indexed: bool = database
+        .client()
+        .await
+        .query_one(
+            "SELECT count(*) = 1 FROM pg_indexes
+             WHERE tablename = 'quota_windows' AND indexdef LIKE '%(window_start_epoch)'",
+            &[],
+        )
+        .await
+        .expect("indexes")
+        .get(0);
+    assert!(indexed);
+    database.drop_database().await;
+}
+
+/// The store holds the limit, so a pod cannot go on enforcing one the
+/// deployment has moved off. Without this, lowering a limit over a rolling
+/// update leaves every not-yet-restarted pod admitting against its old, higher
+/// value for the rest of the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_limit_is_the_stores_and_not_the_pods() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let (quota, _) = PlatformQuota::connect(&database.config(), limit(100), window(3600))
+        .await
+        .expect("store");
+    database
+        .client()
+        .await
+        .execute("UPDATE quota_config SET request_limit = 2", &[])
+        .await
+        .expect("another pod records a lower limit");
+
+    assert!(quota.admit("org_lowered").await.is_ok());
+    assert!(quota.admit("org_lowered").await.is_ok());
+    assert!(
+        matches!(
+            quota.admit("org_lowered").await,
+            Err(QuotaRefusal::Exceeded { .. })
+        ),
+        "a pod started with limit 100 must enforce the store's 2"
+    );
+    database.drop_database().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_window_can_be_reconfigured_but_only_on_purpose() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let config = database.config();
+    let (quota, _) = PlatformQuota::connect(&config, limit(10), window(60))
+        .await
+        .expect("first pod");
+    quota.admit("org_a").await.expect("admit");
+
+    assert!(
+        PlatformQuota::connect(&config, limit(10), window(30))
+            .await
+            .is_err(),
+        "changing the window must not happen by restarting with a new value"
+    );
+
+    let (_, outcome) = PlatformQuota::connect_reconfiguring_window(&config, limit(10), window(30))
+        .await
+        .expect("an explicit reconfiguration must be possible");
+    assert_eq!(outcome, QuotaConfiguration::WindowChanged { previous: 60 });
+
+    let client = database.client().await;
+    let stored: i64 = client
+        .query_one("SELECT window_seconds FROM quota_config", &[])
+        .await
+        .expect("window")
+        .get(0);
+    assert_eq!(stored, 30);
+    let stale: i64 = client
+        .query_one("SELECT count(*) FROM quota_windows", &[])
+        .await
+        .expect("counters")
+        .get(0);
+    assert_eq!(
+        stale, 0,
+        "counters measured against window starts the new length cannot produce are unreachable"
+    );
+
+    // And the deployment is usable again on the new value.
+    let (_, outcome) = PlatformQuota::connect(&config, limit(10), window(30))
+        .await
+        .expect("a pod on the new window must start normally");
+    assert_eq!(outcome, QuotaConfiguration::Unchanged);
     database.drop_database().await;
 }

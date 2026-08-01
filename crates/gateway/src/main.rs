@@ -186,6 +186,22 @@ enum Command {
             requires = "platform_database_url"
         )]
         platform_database_statement_timeout_ms: u64,
+        /// Rewrite the platform store's recorded quota window with this
+        /// gateway's, discarding the counters measured against the old one.
+        ///
+        /// Without this, a gateway whose window differs from the recorded one
+        /// refuses to start, because replicas that disagree about the window
+        /// enforce the sum of their limits. Changing the window is therefore an
+        /// explicit act: roll this flag out with the new value, then drop it.
+        /// Replicas still running the previous window during that rollout are
+        /// the split counter the refusal exists to prevent, so drain first if
+        /// the deployment cannot tolerate it.
+        #[arg(
+            long,
+            env = "CAMELID_GATEWAY_RECONFIGURE_QUOTA_WINDOW",
+            requires = "platform_database_url"
+        )]
+        reconfigure_quota_window: bool,
     },
     /// Create a user and its personal organization, then print the principal id.
     CreateUser {
@@ -343,6 +359,7 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             platform_database_max_connections,
             platform_database_acquire_timeout_ms,
             platform_database_statement_timeout_ms,
+            reconfigure_quota_window,
         } => {
             serve(ServeArgs {
                 upstream,
@@ -368,6 +385,7 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
                     max_connections: platform_database_max_connections,
                     acquire_timeout_ms: platform_database_acquire_timeout_ms,
                     statement_timeout_ms: platform_database_statement_timeout_ms,
+                    reconfigure_quota_window,
                 },
             })
             .await
@@ -428,6 +446,7 @@ struct PlatformDatabaseArgs {
     max_connections: usize,
     acquire_timeout_ms: u64,
     statement_timeout_ms: u64,
+    reconfigure_quota_window: bool,
 }
 
 /// Append-only gateway telemetry sinks. Audit remains a response-head and
@@ -563,14 +582,24 @@ async fn open_org_quota(
         );
     }
 
-    let (quota, configuration) = PlatformQuota::connect(&config, limit, window_seconds).await?;
+    let (quota, configuration) = if platform_database.reconfigure_quota_window {
+        PlatformQuota::connect_reconfiguring_window(&config, limit, window_seconds).await?
+    } else {
+        PlatformQuota::connect(&config, limit, window_seconds).await?
+    };
     match configuration {
         QuotaConfiguration::Initialized | QuotaConfiguration::Unchanged => {}
         QuotaConfiguration::LimitChanged { previous } => tracing::warn!(
             previous,
             limit = limit.get(),
-            "platform quota limit changed; replicas still running the previous limit enforce \
-             theirs against the same shared counter until they restart"
+            "platform quota limit changed; every replica reads the limit from the store, so \
+             this takes effect immediately for all of them"
+        ),
+        QuotaConfiguration::WindowChanged { previous } => tracing::warn!(
+            previous,
+            window_seconds = window_seconds.get(),
+            "platform quota window rewritten and existing counters discarded; replicas still \
+             running the previous window count against a different one until they restart"
         ),
     }
     tracing::info!(
@@ -1263,6 +1292,7 @@ mod tests {
         let Command::Serve {
             platform_database_url,
             platform_database_max_connections,
+            reconfigure_quota_window,
             ..
         } = cli.command
         else {
@@ -1270,6 +1300,22 @@ mod tests {
         };
         assert_eq!(platform_database_url, None);
         assert_eq!(platform_database_max_connections, 8);
+        assert!(
+            !reconfigure_quota_window,
+            "rewriting a deployment's recorded quota window must be asked for"
+        );
+    }
+
+    #[test]
+    fn reconfiguring_the_quota_window_requires_the_database_that_records_it() {
+        let result = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+            "--reconfigure-quota-window",
+        ]);
+        assert!(result.is_err());
     }
 
     #[test]

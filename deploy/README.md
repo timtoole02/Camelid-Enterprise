@@ -503,9 +503,22 @@ Adjust before applying:
     about the window write to different rows and enforce the *sum* of their
     limits, which is the defect this removes — so a pod whose window differs
     from the one already recorded refuses to start rather than quietly
-    doubling the limit. The limit itself may differ during a rolling change:
-    pods share one counter, so the effective limit is the largest one running,
-    and the new pod logs a warning naming both.
+    doubling the limit. To change the window, roll the new value out with
+    `CAMELID_GATEWAY_RECONFIGURE_QUOTA_WINDOW=true`, which rewrites the stored
+    window and discards the counters measured against the old one, then drop
+    the flag. During that rollout the replicas still on the previous window are
+    the split counter the refusal exists to prevent, so drain first if the
+    deployment cannot tolerate it.
+  - **The limit lives in the database, not in the pod.** Each replica records
+    its configured limit at startup and every replica enforces whatever is
+    recorded, so lowering a limit takes effect across the deployment as soon as
+    the first new pod starts rather than after the last old one restarts.
+    Replicas configured with different limits therefore converge on the most
+    recently started one; the new pod logs a warning naming both.
+  - **The database must be dedicated to one deployment.** Quota state is keyed
+    by organization and window and by nothing else, so a staging gateway
+    pointed at the production database silently spends production's budget.
+    Give each deployment its own database.
   - **The gateway fails closed.** If the database cannot be reached or does not
     answer within `CAMELID_GATEWAY_PLATFORM_DATABASE_ACQUIRE_TIMEOUT_MS`, the
     request is refused with `503 gateway quota store unavailable` and audited
@@ -522,11 +535,17 @@ Adjust before applying:
     both the certificate chain and the hostname are verified; the server
     certificate must be a normal end-entity certificate issued by that CA, not
     a self-signed leaf. Without it the connection is cleartext, which is only
-    defensible when the database shares a host with the gateway.
+    defensible when the database shares a host with the gateway — and a URL
+    whose `sslmode=require` asks for TLS without a CA is refused at startup
+    rather than quietly downgraded.
   - **Sizing.** `CAMELID_GATEWAY_PLATFORM_DATABASE_MAX_CONNECTIONS` defaults to
     8. Admissions for one organization serialize on one row, so raising it does
     not raise a tenant's admission rate — measured at 256 concurrent
-    admissions, 32 and 64 connections were both slower than 8.
+    admissions, 32 and 64 connections were both slower than 8. Budget for the
+    round trip itself: every authenticated request now waits on one, about
+    1.4 ms against a database on the same host, and the tail grows with the
+    concurrency contending for a single organization's row and with the
+    distance to the database.
   - **Retention.** Rows for elapsed windows are deleted by a periodic sweep
     that runs off the request path, in whichever replica takes a database
     advisory lock first. Nothing needs to be scheduled by the operator.
