@@ -66,6 +66,9 @@ engine-linux.workspace = true
 engine-windows.workspace = true
 
 [build-dependencies]
+# The engine digest is computed at build time, so the hash lands here rather
+# than in the normal graph.
+sha2 = "0.10"
 toml = "0.8"
 
 [dev-dependencies]

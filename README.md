@@ -31,7 +31,7 @@ It runs as a single Rust binary serving an OpenAI-compatible API — the same on
 
 ```console
 $ camelid-enterprise serve --model /srv/models/Llama-3.2-1B-Instruct-Q8_0.gguf
-[lane] deterministic | in-tree engine | parity oracle pin b4e3a9056567ed8145fc4fa29850d6f1f261ac2b | config vector sha256 30d77c260803 | admission sha256 318fb6d65c0f | model sha256 3f8a1c04b7e2 | host macos/aarch64 cores=8 simd=dotprod+i8mm+neon | worker threads 8 | generation slots 8
+[lane] deterministic | in-tree engine | parity oracle pin b4e3a9056567ed8145fc4fa29850d6f1f261ac2b | config vector sha256 b62869e99117 | admission sha256 318fb6d65c0f | model sha256 3f8a1c04b7e2 | host macos/aarch64 cores=8 simd=dotprod+i8mm+neon | worker threads 8 | generation slots 8
 [lane] model /srv/models/Llama-3.2-1B-Instruct-Q8_0.gguf
 [lane] listening on http://127.0.0.1:8181
 [lane] loading model; nothing is served until the load completes
@@ -41,7 +41,7 @@ $ curl -s http://127.0.0.1:8181/v1/chat/completions -d '{ … }' \
     | jq '{camelid_lane, camelid_config_sha256, camelid_admission_sha256, camelid_model_sha256, camelid_host, camelid_worker_threads}'
 {
   "camelid_lane": "deterministic",
-  "camelid_config_sha256": "30d77c260803",
+  "camelid_config_sha256": "b62869e99117",
   "camelid_admission_sha256": "318fb6d65c0f",
   "camelid_model_sha256": "3f8a1c04b7e2",
   "camelid_host": "macos/aarch64 cores=8 simd=dotprod+i8mm+neon",
@@ -72,7 +72,7 @@ A replica declares its lane at startup, and every response is attributable to it
 ## How the deterministic lane works
 
 - **Owned engine, pinned oracle.** The serving runtime lives in this workspace. The original engine remains pinned by exact revision only in `dev-dependencies`, where model-backed parity tests use it as a behavioral oracle.
-- **Frozen configuration.** At startup the lane refuses any `CAMELID_*` variable it has no rule for, then applies a canonical configuration vector and hashes it (SHA-256). The hash travels with every response. Since the engine cutover the in-tree engine reads no environment variable, so that vector no longer selects the forward pass — reproducibility comes from the engine being single-threaded with a fixed reduction order, and the digest is a stable build identity rather than a description of tunables. [ADR 0003](docs/adr/0003-identity-after-the-engine-cutover.md) records what each published digest does and does not claim, and when the surface gets corrected.
+- **Declared posture, identified engine.** At startup the lane refuses any `CAMELID_*` variable it has no rule for. Every response then carries three separate claims: `camelid_posture` (which forward-pass implementation ran), `camelid_engine_sha256` (which build of it), and `camelid_config_sha256` (the posture plus the parity-oracle pin). They are separate because they move at different rates — the engine digest changes with every engine edit, the config digest only when the posture set or the pin does. [ADR 0004](docs/adr/0004-engine-identity-and-execution-posture.md) defines each preimage.
 - **Identified weights.** The GGUF is hashed whole before the port is bound, and its digest rides on every response. Two replicas serving different files are told apart from the outside, which the engine's own model *name* cannot do.
 - **Whole-generation execution.** A request is executed end to end and is never fused with another, so its output never depends on what else is in flight. A replica runs several generations at once (`--max-concurrency`, default: host cores) and the width changes throughput only — each generation owns its decoder and KV cache over read-only weights, so the same request emits the same tokens at any width. Batching, which *would* move the output by fusing requests into shared kernel shapes, is the `throughput` lane's job and is deliberately not this one's.
 - **A declared surface.** The served routes are an allow list, and it is the contract's own registry rather than a second list this crate keeps privately. The in-tree router has no model-management, runtime-control, workspace, or Web UI fallback. The served-model filter also refuses a generation request whose `model` field names anything but this replica's own weights. Together these controls make the published model digest a claim about the whole process lifetime rather than about its first second.
@@ -152,7 +152,7 @@ Every response is attributable to the lane that produced it, in three places so 
 | **Serving receipt** (opt-in, `--serving-receipts <path>`) | one JSONL line per request, digests at full length, plus the gateway's `request_id` |
 
 ```json
-{"admission_sha256":"318fb6d65c0fb2cd3630594b08cc70a1bc3ae0bca7b8bd15c121458e651959f6","config_sha256":"30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7","host":"macos/aarch64 cores=8 simd=dotprod+i8mm+neon","lane":"deterministic","method":"POST","model_sha256":"3f8a1c04b7e2d95608f31a7c4be0d2593a6e18cf7b402d95e6c1380af472bb19","path":"/v1/chat/completions","request_id":"req_9f2c1ad4e7b30516","status":200,"ts":1784845685.882345,"worker_threads":8}
+{"admission_sha256":"318fb6d65c0fb2cd3630594b08cc70a1bc3ae0bca7b8bd15c121458e651959f6","config_sha256":"b62869e991172aadb0204c526ff41fd7486434320884bda323e36cff6e13b00d","host":"macos/aarch64 cores=8 simd=dotprod+i8mm+neon","lane":"deterministic","method":"POST","model_sha256":"3f8a1c04b7e2d95608f31a7c4be0d2593a6e18cf7b402d95e6c1380af472bb19","path":"/v1/chat/completions","request_id":"req_9f2c1ad4e7b30516","status":200,"ts":1784845685.882345,"worker_threads":8}
 ```
 
 `request_id` is the one receipt field the replica does not mint. It is the

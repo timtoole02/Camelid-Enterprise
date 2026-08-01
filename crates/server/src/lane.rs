@@ -40,6 +40,29 @@ use std::ffi::OsString;
 /// the shell. See `build.rs`.
 pub const ENGINE_PIN: &str = env!("ENTERPRISE_ENGINE_PIN");
 
+/// Identity of the engine that actually serves: a SHA-256 over every `.rs`
+/// source under `crates/engine-core/src`, path and bytes, in sorted order.
+///
+/// [`ENGINE_PIN`] names the parity *oracle*, not this. Since the in-tree
+/// cutover nothing published said which build of the engine produced a token,
+/// so two Enterprise builds with different forward passes were
+/// indistinguishable from outside — the gap
+/// `docs/adr/0003-identity-after-the-engine-cutover.md` calls larger than the
+/// stale vector it was written about. Computed in `build.rs`, so it is correct
+/// from a tarball and from a dirty tree, and it moves when and only when the
+/// engine's source does.
+pub const ENGINE_DIGEST: &str = env!("ENTERPRISE_ENGINE_DIGEST");
+
+/// How this replica executes: which forward-pass implementation served the
+/// token.
+///
+/// One value today. It exists now rather than when a second appears because
+/// adding a *field* to a published identity is the versioned change — adding a
+/// *value* to a field that already exists is not. A GPU backend will publish
+/// `metal` or `cuda` here without moving anyone's contract a second time. See
+/// `docs/architecture/gpu-projection-offload.md`.
+pub const EXECUTION_POSTURE: &str = "cpu";
+
 /// Namespace the engine and this distribution both draw their keys from. The
 /// scan claims the whole prefix: everything under it is refused unless
 /// [`PERMITTED`] names it.
@@ -123,18 +146,26 @@ const REFUSED_FOREIGN: &[(&str, &str)] = &[
 /// Keys the deterministic lane sets to canonical values before the engine
 /// reads any of them.
 ///
-/// **These no longer reach an engine.** They were written for the pinned
-/// engine, which read them: `CAMELID_DETERMINISTIC` pinned its forward pass to
-/// the order-stable CPU path, and the explicit `false` entries mirrored its
-/// CLI's deterministic-mode behavior. Since the in-tree cutover the serving
-/// engine is `engine-core`, which reads no environment variable on any serving
-/// path, so this loop writes fourteen keys nothing reads and the digest over
-/// them describes no tunable. The lane's output guarantee does not depend on
-/// them — it comes from `engine-core` being single-threaded with a fixed
-/// reduction order. Retiring the vector is a versioned identity change and is
-/// deliberately deferred; see
-/// `docs/adr/0003-identity-after-the-engine-cutover.md` for what the published
-/// digest still claims and what triggers the correction.
+/// **These no longer reach an engine, and no longer claim to.** They were
+/// written for the pinned engine, which read them: `CAMELID_DETERMINISTIC`
+/// pinned its forward pass to the order-stable CPU path, and the explicit
+/// `false` entries mirrored its CLI's deterministic-mode behavior. Since the
+/// in-tree cutover the serving engine is `engine-core`, which reads no
+/// environment variable on any serving path.
+///
+/// The vector was removed from the configuration digest's preimage when
+/// `config_sha256` was re-scoped onto [`EXECUTION_POSTURE`] and
+/// [`ENGINE_DIGEST`] — the two things that do determine how a token is
+/// produced. What remains here is an **admission** concern, and it is kept for
+/// that: these names belong to the engine's namespace, so the lane writing them
+/// is what lets `refuse_unpermitted` refuse an operator who pre-sets one *even
+/// at the canonical value*, with a message that says why. Deleting the list
+/// would leave those keys refused by the general deny-by-default rule with a
+/// less useful message, and would buy nothing.
+///
+/// So: editing this list changes what this replica **refuses**
+/// (`admission_sha256`), and no longer changes what it **is**
+/// (`config_sha256`).
 ///
 /// Editing this list mints a new public lane identity, and a pure reorder does
 /// it just as surely as a value change — see [`ConfigVector::sha256`] before
@@ -659,18 +690,29 @@ where
 }
 
 /// Compute the configuration-vector digest: SHA-256 over each `KEY=VALUE\n` of
-/// `CANONICAL` **in declaration order**, then `engine_pin=<ENGINE_PIN>`.
-/// Declaration order is part of the contract — reordering `CANONICAL` silently
-/// changes the published hash. Kept free of environment access so the digest can
-/// be pinned by a test without the fail-closed startup side effects.
+/// `posture=<EXECUTION_POSTURE>\n`, then `engine_pin=<ENGINE_PIN>`.
+///
+/// The canonical environment vector is deliberately absent — it configures no
+/// engine this replica runs, and hashing it made the digest a claim about
+/// nothing.
+///
+/// [`ENGINE_DIGEST`] is deliberately absent too, and for the opposite reason: it
+/// is a genuine identity but a *fast-moving* one, changing with every edit to
+/// the engine's source. Folding it in here would make this digest — a value
+/// pinned by a test and quoted in three published documents — move on every
+/// ordinary engine change, and a digest that churns is one nobody keeps
+/// accurate. So it is published beside this one rather than inside it, exactly
+/// as [`ConfigVector::admission_sha256`] is: same protection, and a client is
+/// additionally told *which* of the three moved. This digest therefore moves
+/// only when the posture set or the oracle pin does — both deliberate acts.
+///
+/// Kept free of environment access so the digest can be pinned by a test
+/// without the fail-closed startup side effects.
 pub(crate) fn compute_config_sha256() -> String {
     let mut hasher = Sha256::new();
-    for (key, value) in CANONICAL {
-        hasher.update(key.as_bytes());
-        hasher.update(b"=");
-        hasher.update(value.as_bytes());
-        hasher.update(b"\n");
-    }
+    hasher.update(b"posture=");
+    hasher.update(EXECUTION_POSTURE.as_bytes());
+    hasher.update(b"\n");
     hasher.update(b"engine_pin=");
     hasher.update(ENGINE_PIN.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -820,7 +862,7 @@ mod tests {
     fn config_sha256_is_pinned() {
         assert_eq!(
             compute_config_sha256(),
-            "30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7",
+            "b62869e991172aadb0204c526ff41fd7486434320884bda323e36cff6e13b00d",
         );
     }
 
@@ -986,16 +1028,15 @@ mod tests {
     #[test]
     fn the_two_digests_are_independent_claims() {
         assert_ne!(compute_config_sha256(), compute_admission_sha256());
-        // The configuration digest is a pure function of CANONICAL and the pin.
-        // If the admission policy leaked into it, this would not hold, because
-        // the local recomputation below knows nothing about PERMITTED.
+        // The configuration digest is a pure function of the posture and the
+        // pin. If the admission policy leaked into it, this would not hold,
+        // because the local recomputation below knows nothing about PERMITTED —
+        // and neither does it know about CANONICAL, which is now an admission
+        // concern and deliberately outside this preimage.
         let mut hasher = Sha256::new();
-        for (key, value) in CANONICAL {
-            hasher.update(key.as_bytes());
-            hasher.update(b"=");
-            hasher.update(value.as_bytes());
-            hasher.update(b"\n");
-        }
+        hasher.update(b"posture=");
+        hasher.update(EXECUTION_POSTURE.as_bytes());
+        hasher.update(b"\n");
         hasher.update(b"engine_pin=");
         hasher.update(ENGINE_PIN.as_bytes());
         assert_eq!(compute_config_sha256(), format!("{:x}", hasher.finalize()));

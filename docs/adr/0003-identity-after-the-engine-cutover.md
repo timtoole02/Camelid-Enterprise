@@ -39,7 +39,7 @@ surface was not revisited in the same change.
 `CAMELID_METAL_NOCOPY` — into the process environment, and hashes them into
 
 ```
-30d77c2608036f8475372ace9ec125ffc5fa16d8d63f0355a08c32c69f4449b7
+b62869e991172aadb0204c526ff41fd7486434320884bda323e36cff6e13b00d
 ```
 
 published on every response as `x-camelid-config-sha256` and
