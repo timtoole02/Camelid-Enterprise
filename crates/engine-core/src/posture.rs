@@ -95,46 +95,100 @@ pub enum NumericPosture {
     /// wire.
     ///
     /// What a kernel must show to declare it, so the variant is not a place to
-    /// hide: a measured maximum relative error against the CPU reference, and a
-    /// measured top-1 agreement floor over a *fixed* prompt set, both published.
-    /// Those numbers are not on the wire today — the header carries the bare
-    /// token `tolerance-conformant` — so the first kernel to declare this owes
-    /// the surface that publishes them as well. A token with no numbers behind it
-    /// is a claim without a contract, which is worse than no claim.
+    /// hide: the three measurements on [`Tolerance`], over a *fixed* prompt set,
+    /// all published. Those numbers are not on the wire today — the header
+    /// carries the bare token `tolerance-conformant` — so the first kernel to
+    /// declare this owes the surface that publishes them as well. A token with no
+    /// numbers behind it is a claim without a contract, which is worse than no
+    /// claim.
     Conformant(Tolerance),
 }
 
 /// The numeric contract a non-bit-identical kernel is admitted under.
 ///
 /// Constructed through [`Tolerance::new`] rather than by literal, because the
-/// type is `#[non_exhaustive]`: a third term (a per-token divergence bound, say)
-/// has to be addable without breaking every declaration site.
+/// type is `#[non_exhaustive]`: a fourth term has to be addable without breaking
+/// every declaration site.
+///
+/// # The shape is not arbitrary — it is what survived contact
+///
+/// The sibling engine ran this exact experiment on a windowed-attention defect
+/// and published the numbers, so this type is built to the amended bound rather
+/// than to the one that was pinned first. Two of its findings are load-bearing
+/// here, and both are the kind that look like over-engineering until the day
+/// they fire.
+///
+/// **A scalar bound alone is the weak half.** That campaign's first pin used one
+/// *absolute* number across tensors three orders of magnitude apart — caches at
+/// `1.4e2`, a final hidden at `3.3e4` — and it failed twice: once too loose to
+/// mean anything on the large tensor, once tighter than the arithmetic's own
+/// round-off floor on the small one. [`Self::max_relative_error`] is therefore
+/// relative to the compared tensor's own magnitude, and a conformance harness
+/// bounds each tensor on its own scale rather than sharing one number across
+/// them.
+///
+/// **The outlier term is the half with the power.** In their sharpest case a
+/// defect moved 287,743 elements while the *median* per-position divergence
+/// stayed exactly `0.0`, because only one or two positions of 513 clipped. No
+/// scalar bound sees that without being set absurdly tight;
+/// [`Self::outlier_factor`] sees it immediately. Their measured separation was
+/// 9.1x on the outlier term against 4.3x on the scalar.
+///
+/// **[`Self::top1_agreement`] is the outer gate, not the gate.** The same
+/// campaign measured argmax agreement at **0/9** against a real defect —
+/// including items built specifically to expose it — while numeric equivalence
+/// caught it 9/9. It is kept because it is what a client can check cheaply
+/// without a reference implementation, and it is named here as weak so nobody
+/// mistakes a high number for a strong claim.
 ///
 /// None of these fields reaches the wire yet; see [`NumericPosture::Conformant`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct Tolerance {
-    /// Largest relative error observed against the portable CPU reference over
-    /// the prompt set, as a fraction (`1e-3`, not `0.1%`).
+    /// Largest divergence from the portable CPU reference over the prompt set,
+    /// **relative to the compared tensor's own magnitude**, as a fraction
+    /// (`1e-3`, not `0.1%`).
+    ///
+    /// Relative and not absolute because an absolute bound cannot cover two
+    /// tensors of different scale at once, which is the failure recorded on the
+    /// type. A harness comparing several tensors applies this to each on its own
+    /// scale; it does not reduce them to one number first.
     pub max_relative_error: f32,
+    /// The most any single position may diverge, as a multiple of the *median*
+    /// per-position divergence over the same comparison.
+    ///
+    /// This is the term that catches a defect concentrated in a few positions,
+    /// which a scalar bound averages away — and it fires even when the median is
+    /// exactly zero, which is the case that motivated it. A conformance harness
+    /// that publishes only [`Self::max_relative_error`] has published the weaker
+    /// half.
+    pub outlier_factor: f32,
     /// Fraction of positions at which the accelerated path's argmax agreed with
-    /// the reference's, over the prompt set. A floor, not an average: it is the
-    /// number a client is entitled to hold the replica to.
+    /// the reference's, over the prompt set. A floor, not an average.
+    ///
+    /// Weak by measurement, not by reputation — see the type's docs. Publish it,
+    /// but never let it be the only thing gating a posture.
     pub top1_agreement: f32,
-    /// The fixed prompt set the two numbers were measured over. Named rather
-    /// than described, because a tolerance measured over a set nobody can
-    /// reproduce is not a contract.
+    /// The fixed prompt set the numbers were measured over. Named rather than
+    /// described, because a tolerance measured over a set nobody can reproduce
+    /// is not a contract.
     pub prompt_set: &'static str,
 }
 
 impl Tolerance {
+    /// Declare a tolerance. All three measurements are required together: a
+    /// caller that had only some of them would be declaring a contract it has
+    /// not measured, and the argument that any one of them is redundant is the
+    /// argument the amended bound on this type exists to refute.
     pub const fn new(
         max_relative_error: f32,
+        outlier_factor: f32,
         top1_agreement: f32,
         prompt_set: &'static str,
     ) -> Self {
         Self {
             max_relative_error,
+            outlier_factor,
             top1_agreement,
             prompt_set,
         }
@@ -166,7 +220,7 @@ mod tests {
     fn the_published_tokens_are_pinned() {
         assert_eq!(NumericPosture::BitIdentical.published(), "bit-identical");
         assert_eq!(
-            NumericPosture::Conformant(Tolerance::new(1e-3, 0.999, "fixture")).published(),
+            NumericPosture::Conformant(Tolerance::new(1e-3, 8.0, 0.999, "fixture")).published(),
             "tolerance-conformant"
         );
     }
@@ -177,23 +231,47 @@ mod tests {
     fn distinct_postures_render_distinctly() {
         assert_ne!(
             NumericPosture::BitIdentical.published(),
-            NumericPosture::Conformant(Tolerance::new(0.0, 1.0, "fixture")).published(),
+            NumericPosture::Conformant(Tolerance::new(0.0, 1.0, 1.0, "fixture")).published(),
         );
     }
 
     /// The tolerance terms survive construction. They are not on the wire yet,
     /// so this is the only thing standing between a declared contract and a
     /// constructor that quietly drops one of its arguments.
+    ///
+    /// The four values are deliberately distinct and none is a plausible
+    /// default: a constructor that transposed two of them, or dropped one and
+    /// shifted the rest, would fail here rather than silently declare a contract
+    /// nobody measured.
     #[test]
     fn a_tolerance_carries_the_numbers_it_was_declared_with() {
-        let tolerance = Tolerance::new(1.5e-3, 0.997, "eval/greedy-512");
+        let tolerance = Tolerance::new(1.5e-3, 8.0, 0.997, "eval/greedy-512");
         assert_eq!(tolerance.max_relative_error, 1.5e-3);
+        assert_eq!(tolerance.outlier_factor, 8.0);
         assert_eq!(tolerance.top1_agreement, 0.997);
         assert_eq!(tolerance.prompt_set, "eval/greedy-512");
         assert_eq!(
             NumericPosture::Conformant(tolerance),
-            NumericPosture::Conformant(Tolerance::new(1.5e-3, 0.997, "eval/greedy-512")),
+            NumericPosture::Conformant(Tolerance::new(1.5e-3, 8.0, 0.997, "eval/greedy-512")),
             "two declarations of the same contract are the same posture"
+        );
+    }
+
+    /// Two tolerances differing only in the outlier term are different
+    /// contracts.
+    ///
+    /// This is the term the amended bound on [`Tolerance`] says carries the
+    /// power, so it is the one most likely to be dropped by someone who reads
+    /// the scalar as sufficient. If it were ignored by the type — not stored,
+    /// or not compared — nothing else in this workspace would notice.
+    #[test]
+    fn the_outlier_term_distinguishes_two_contracts() {
+        let strict = Tolerance::new(2.0e-3, 8.0, 0.997, "eval/greedy-512");
+        let loose = Tolerance::new(2.0e-3, 41.0, 0.997, "eval/greedy-512");
+        assert_ne!(strict, loose);
+        assert_ne!(
+            NumericPosture::Conformant(strict),
+            NumericPosture::Conformant(loose)
         );
     }
 }

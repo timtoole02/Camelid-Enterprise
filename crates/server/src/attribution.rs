@@ -874,7 +874,7 @@ mod tests {
     #[tokio::test]
     async fn two_postures_render_differently_everywhere_they_are_published() {
         const TOLERANT: NumericPosture =
-            NumericPosture::Conformant(Tolerance::new(1e-3, 0.998, "eval/greedy-512"));
+            NumericPosture::Conformant(Tolerance::new(1e-3, 8.0, 0.998, "eval/greedy-512"));
 
         async fn responses(posture: NumericPosture) -> (String, serde_json::Value, String) {
             let dir = tempfile::tempdir().unwrap();
