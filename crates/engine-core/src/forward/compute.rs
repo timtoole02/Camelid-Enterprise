@@ -12,8 +12,23 @@ use crate::forward::kv_cache::{LlamaKvCache, LlamaKvCachePlan};
 use crate::forward::rope::apply_rope;
 use crate::model::config::DenseLlamaDims;
 use crate::model::{LlamaModelConfig, LlamaLayerWeights, LlamaWeights};
+use rayon::prelude::*;
+
 use crate::tensor::{dot_product, q8_0_dot_rows, quantize_q8_0_blocks, CpuTensor, Q8DotRows};
 use crate::{EngineError, Result};
+
+/// Output rows below this are computed on the calling thread. A projection of a
+/// few hundred rows finishes faster than a pool can be woken for it; the wide
+/// ones — the FFN pair and the vocabulary head — are where the work is.
+///
+/// Parallelism here is across **independent output elements**: one output row is
+/// one weight row dotted against the same input, and no accumulation ever
+/// crosses rows. The result is therefore bit-identical at any pool width, on any
+/// host, which is what lets the deterministic lane use it at all. Splitting a
+/// single row's accumulation across threads would *not* be bit-identical — it
+/// would reorder one reduction — and is deliberately not done. Anyone widening
+/// this must keep the split on this side of that line.
+const PARALLEL_LINEAR_MIN_OUTPUTS: usize = 1024;
 
 /// A single row-major linear projection: `out[o] = dot(input, weight_row_o)`.
 ///
@@ -48,9 +63,16 @@ fn linear_row(weight: &CpuTensor, input: &[f32], q8_dot: Q8DotRows) -> Result<Ve
         let out_width = blocks.len() / blocks_per_row;
         let input_blocks = quantize_q8_0_blocks(input);
         let mut out = vec![0.0_f32; out_width];
-        for (o, out_value) in out.iter_mut().enumerate() {
+        let row_of = |o: usize, out_value: &mut f32| {
             let row = &blocks[o * blocks_per_row..(o + 1) * blocks_per_row];
             *out_value = q8_dot(row, &input_blocks);
+        };
+        if out_width >= PARALLEL_LINEAR_MIN_OUTPUTS {
+            out.par_iter_mut()
+                .enumerate()
+                .for_each(|(o, v)| row_of(o, v));
+        } else {
+            out.iter_mut().enumerate().for_each(|(o, v)| row_of(o, v));
         }
         Ok(out)
     } else if !weight.data.is_empty() {
@@ -63,9 +85,16 @@ fn linear_row(weight: &CpuTensor, input: &[f32], q8_dot: Q8DotRows) -> Result<Ve
         }
         let out_width = weight.data.len() / in_width;
         let mut out = vec![0.0_f32; out_width];
-        for (o, out_value) in out.iter_mut().enumerate() {
+        let row_of = |o: usize, out_value: &mut f32| {
             let row = &weight.data[o * in_width..(o + 1) * in_width];
             *out_value = dot_product(row, input);
+        };
+        if out_width >= PARALLEL_LINEAR_MIN_OUTPUTS {
+            out.par_iter_mut()
+                .enumerate()
+                .for_each(|(o, v)| row_of(o, v));
+        } else {
+            out.iter_mut().enumerate().for_each(|(o, v)| row_of(o, v));
         }
         Ok(out)
     } else {
@@ -164,10 +193,10 @@ impl<'w> Decoder<'w> {
         let position = self.kv.position();
         self.kv.ensure_position_capacity(position + 1)?;
 
-        let mut hidden =
-            self.weights
-                .token_embedding
-                .embedding_lookup(&[token_id], "hidden")?;
+        let mut hidden = self
+            .weights
+            .token_embedding
+            .embedding_lookup(&[token_id], "hidden")?;
 
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             hidden = self.forward_layer(&hidden, layer, layer_idx, position)?;
@@ -327,7 +356,13 @@ impl<'w> Decoder<'w> {
 
         // (3) RoPE on Q (query heads) and K (kv heads).
         let rope_freqs = self.weights.rope_freqs.as_ref();
-        apply_rope(&mut q, position, attention_head_count, self.config, rope_freqs)?;
+        apply_rope(
+            &mut q,
+            position,
+            attention_head_count,
+            self.config,
+            rope_freqs,
+        )?;
         apply_rope(&mut k, position, kv_head_count, self.config, rope_freqs)?;
 
         // (4) Write RoPE'd K and raw V into the cache (one kv-head row at a time).
@@ -355,7 +390,8 @@ impl<'w> Decoder<'w> {
 
         // (6) Output projection and attention residual add.
         let attn_out_data = linear_row(&layer.attention_output, &context, self.q8_dot)?;
-        let attn_out = CpuTensor::from_f32("attn_out", vec![1, attn_out_data.len()], attn_out_data)?;
+        let attn_out =
+            CpuTensor::from_f32("attn_out", vec![1, attn_out_data.len()], attn_out_data)?;
         let residual = hidden.add(&attn_out, "residual")?;
 
         // (7) Post-attention RMS norm on the residual (NOT the layer input).
@@ -480,7 +516,93 @@ pub fn argmax(logits: &CpuTensor) -> Result<u32> {
 mod tests {
     use super::*;
     use crate::forward::kv_cache::LlamaKvCachePlan;
-    use crate::tensor::{q8_0_dot_rows as core_dot, quantize_q8_0_blocks as core_quant};
+    use crate::tensor::{
+        q8_0_dot_rows as core_dot, quantize_q8_0_blocks as core_quant, TensorShape,
+    };
+
+    /// A projection wide enough to cross `PARALLEL_LINEAR_MIN_OUTPUTS`, so the
+    /// parallel arm is the one under test.
+    fn wide_q8_projection() -> (CpuTensor, Vec<f32>) {
+        let in_width = 64_usize;
+        let out_width = PARALLEL_LINEAR_MIN_OUTPUTS + 37;
+        let mut rows = Vec::with_capacity(out_width * in_width / 32);
+        for o in 0..out_width {
+            let row: Vec<f32> = (0..in_width)
+                .map(|i| ((o * 31 + i * 7) % 251) as f32 * 0.017 - 2.0)
+                .collect();
+            rows.extend(core_quant(&row));
+        }
+        let weight = CpuTensor::from_q8_0_blocks(
+            "wide.weight",
+            TensorShape {
+                dims: vec![out_width, in_width],
+            },
+            rows,
+        )
+        .expect("the fixture is block aligned");
+        let input: Vec<f32> = (0..in_width)
+            .map(|i| (i % 19) as f32 * 0.11 - 1.0)
+            .collect();
+        (weight, input)
+    }
+
+    /// The pool width must not be able to move a single bit.
+    ///
+    /// This is the property the deterministic lane rests on once the projection
+    /// is parallel: the split is across independent output rows, so widening the
+    /// pool reorders nothing. A future change that split one row's accumulation
+    /// across threads would still pass every shape assertion in this file and
+    /// would fail here, which is the whole point of testing identity rather than
+    /// approximate equality.
+    #[test]
+    fn a_wide_projection_is_bit_identical_at_every_pool_width() {
+        let (weight, input) = wide_q8_projection();
+        let mut previous: Option<Vec<f32>> = None;
+        for threads in [1_usize, 2, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("a private pool of the requested width");
+            let out = pool
+                .install(|| linear_row(&weight, &input, core_dot))
+                .expect("the projection is well formed");
+            if let Some(reference) = &previous {
+                assert_eq!(
+                    out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    reference.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "pool width {threads} changed the projection's bits"
+                );
+            }
+            previous = Some(out);
+        }
+    }
+
+    /// The sequential arm and the parallel arm are the same function.
+    ///
+    /// Guards the threshold itself: a projection just under the cut and one just
+    /// over it must agree with the same rows computed one at a time.
+    #[test]
+    fn the_parallel_arm_agrees_with_the_sequential_one() {
+        let (weight, input) = wide_q8_projection();
+        let blocks = weight.q8_0_blocks.as_deref().expect("q8 fixture");
+        let blocks_per_row = input.len() / 32;
+        let input_blocks = core_quant(&input);
+        let expected: Vec<u32> = (0..blocks.len() / blocks_per_row)
+            .map(|o| {
+                core_dot(
+                    &blocks[o * blocks_per_row..(o + 1) * blocks_per_row],
+                    &input_blocks,
+                )
+                .to_bits()
+            })
+            .collect();
+        let actual: Vec<u32> = linear_row(&weight, &input, core_dot)
+            .expect("the projection is well formed")
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(actual, expected);
+    }
 
     /// Independent reference for the fused per-head kernel, recomputed from the
     /// rounded rows already in the cache. It mirrors the exact operation order —
@@ -560,7 +682,11 @@ mod tests {
         let ctx = attention_context(&q, &kv, 0, 1, head_dim, 1, 1).unwrap();
         let expected = reference_context(&q, &kv, 0, 1, head_dim, 1, 1);
         for (i, (&got, &want)) in ctx.iter().zip(&expected).enumerate() {
-            assert_eq!(got.to_bits(), want.to_bits(), "context lane {i} bit mismatch");
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "context lane {i} bit mismatch"
+            );
         }
     }
 
@@ -607,13 +733,17 @@ mod tests {
             *slot = ((i as f32) * 0.13) - 0.4;
         }
 
-        let ctx =
-            attention_context(&q, &kv, 0, 2, head_dim, kv_head_count, attention_head_count).unwrap();
+        let ctx = attention_context(&q, &kv, 0, 2, head_dim, kv_head_count, attention_head_count)
+            .unwrap();
         let expected =
             reference_context(&q, &kv, 0, 2, head_dim, kv_head_count, attention_head_count);
         assert_eq!(ctx.len(), attention_head_count * head_dim);
         for (i, (&got, &want)) in ctx.iter().zip(&expected).enumerate() {
-            assert_eq!(got.to_bits(), want.to_bits(), "gqa context lane {i} bit mismatch");
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "gqa context lane {i} bit mismatch"
+            );
         }
 
         // A query head mapped to kv head 1 must generally differ from the same
@@ -648,18 +778,20 @@ mod tests {
         let out = linear_row(&weight, &input, core_dot).unwrap();
         let input_blocks = core_quant(&input);
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].to_bits(), core_dot(&blocks[0..1], &input_blocks).to_bits());
-        assert_eq!(out[1].to_bits(), core_dot(&blocks[1..2], &input_blocks).to_bits());
+        assert_eq!(
+            out[0].to_bits(),
+            core_dot(&blocks[0..1], &input_blocks).to_bits()
+        );
+        assert_eq!(
+            out[1].to_bits(),
+            core_dot(&blocks[1..2], &input_blocks).to_bits()
+        );
     }
 
     #[test]
     fn linear_row_f32_matches_dot_product() {
-        let weight = CpuTensor::from_f32(
-            "w",
-            vec![2, 3],
-            vec![1.0, -2.0, 0.5, 3.0, 0.0, -1.0],
-        )
-        .unwrap();
+        let weight =
+            CpuTensor::from_f32("w", vec![2, 3], vec![1.0, -2.0, 0.5, 3.0, 0.0, -1.0]).unwrap();
         let input = [2.0_f32, 1.0, -4.0];
         let out = linear_row(&weight, &input, core_dot).unwrap();
         assert_eq!(out.len(), 2);
@@ -676,7 +808,8 @@ mod tests {
         let bad = CpuTensor::from_f32("logits", vec![1, 3], vec![1.0, f32::NAN, 2.0]).unwrap();
         assert!(argmax(&bad).is_err());
 
-        let wrong_shape = CpuTensor::from_f32("logits", vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let wrong_shape =
+            CpuTensor::from_f32("logits", vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         assert!(argmax(&wrong_shape).is_err());
     }
 }
