@@ -886,13 +886,14 @@ beside the kernel it describes, so the claim cannot drift from the code making
 it. Giving it an admission permit would additionally move `admission_sha256`,
 which is the one way this change could have retired a digest.
 
-**Where the constant actually lives, since "beside the kernel" is not yet true
-everywhere.** `engine_windows::POSTURE` is declared beside the AVX2 dot and is
-the only copy of that claim. engine-macos declares none, so the macOS arm of
-`camelid_enterprise::kernel::selected` holds a literal instead — one literal, in
-the single place that pairs a kernel with a posture, replaced by
-`engine_macos::POSTURE` when that crate declares one. That selection is in the
-library rather than in `serve`, so it is reachable by tests:
+**Where the constant actually lives.** Beside the kernel, on every arm that has
+one: `engine_windows::POSTURE` is declared beside the AVX2 dot and
+`engine_macos::POSTURE` beside the NEON dot, each the only copy of its claim.
+`camelid_enterprise::kernel::selected` reads them rather than restating them, so
+no arm holds a literal and `the_selected_posture_is_the_constant_the_supplying_crate_declares`
+asserts that per target. The remaining arm is the portable reference itself,
+whose posture is bit-identical by definition rather than by measurement. That
+selection is in the library rather than in `serve`, so it is reachable by tests:
 `kernel::tests::the_selected_posture_is_the_token_a_response_publishes` drives
 the selected posture through the attribution middleware to the header, and the
 model-backed harness publishes and loads through the same pair. Without that,

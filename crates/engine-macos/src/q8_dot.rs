@@ -21,7 +21,28 @@
 //! inert once the dot reduces from the reference's `-0.0` seed, so it is closed
 //! rather than documented.
 
+use engine_core::posture::NumericPosture;
 use engine_core::tensor::{Q8_0Block, Q8_0_BLOCK_VALUES};
+
+/// The numeric contract [`q8_0_dot_rows`] holds to, published by the replica
+/// that installs it.
+///
+/// It speaks for the dot and for nothing else, because the dot is the only thing
+/// in this module that crosses [`engine_core::tensor::Q8DotRows`]. The quantizer
+/// is exported for symmetry with the reference and is never reached through the
+/// seam — the forward pass calls engine-core's quantizer unconditionally. That
+/// narrowing is deliberate rather than convenient: it is the only claim the seam
+/// can make on this crate's behalf, and it would still hold if the quantizer
+/// ever diverged again. As it happens it does not, since
+/// `degenerate_scale_band_matches_byte_for_byte` closed its last exception.
+///
+/// Declared beside the kernel rather than at the point of use so the claim
+/// cannot drift from the code making it: the replica reads this constant, so
+/// weakening the dot and leaving the published value behind is not expressible.
+/// Both cases the contract turns on are asserted below —
+/// `negative_zero_rows_keep_the_reference_sign_of_zero` for the `-0.0` reduction
+/// seed, `neon_dot_is_bit_identical_to_portable_reference` for the block sums.
+pub const POSTURE: NumericPosture = NumericPosture::BitIdentical;
 
 /// Dot two rows of Q8_0 blocks.
 ///
@@ -603,5 +624,31 @@ mod tests {
             quantize_q8_0_block(&mixed).quants,
             engine_core::tensor::quantize_q8_0_block(&mixed).quants
         );
+    }
+}
+
+/// The declared posture, checked on every runner rather than only on aarch64.
+///
+/// Deliberately not inside the `target_arch = "aarch64"` test module above.
+/// Nothing here executes a NEON instruction — it reads a `const` and a
+/// `&'static str` — so gating it on the architecture would narrow a check that
+/// costs nothing to widen, and would leave the published token unasserted on the
+/// runners that build this crate without running its kernels.
+///
+/// What it proves: the token this crate puts on the wire is the one its contract
+/// documents. What it does not prove, and what only the aarch64 tests settle:
+/// that the kernel earns it.
+#[cfg(test)]
+mod declared_posture {
+    use super::POSTURE;
+    use engine_core::posture::NumericPosture;
+
+    /// The published token is a wire value with the same retirement cost as a
+    /// digest, and it sits in no digest preimage, so nothing else in the tree
+    /// would catch a rename.
+    #[test]
+    fn the_declared_posture_publishes_the_bit_identical_token() {
+        assert_eq!(POSTURE, NumericPosture::BitIdentical);
+        assert_eq!(POSTURE.published(), "bit-identical");
     }
 }

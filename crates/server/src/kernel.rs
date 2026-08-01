@@ -18,27 +18,19 @@
 use engine_core::posture::NumericPosture;
 use engine_core::tensor::Q8DotRows;
 
-/// macOS: engine-macos's NEON dot, with the posture written here as a literal.
+/// macOS: engine-macos's NEON dot, with the posture that crate declares beside
+/// it. No literal here, for the same reason as the Windows arm below.
 ///
-/// The one arm that does not read a constant from the crate supplying the
-/// kernel, and the exception is recorded rather than smoothed over: engine-macos
-/// exports no `POSTURE` today. When it declares one beside its dot, this literal
-/// is replaced by that constant and the arm stops being an exception — it is one
-/// edit, not a second place to keep in sync, which is why the pair is bound here
-/// rather than assembled by the caller.
-///
-/// What the literal is resting on, stated so it is not resting on nothing: the
-/// NEON dot has to reduce from the reference's `-0.0` seed —
-/// `empty_and_all_negative_zero_rows_keep_the_sign_of_zero` pins that for the
-/// reference, and `an_empty_reduction_keeps_the_reference_sign_of_zero` pins it
-/// for the Windows kernel. engine-macos's own bit-identity fuzz builds no
-/// zero-length row and emits no negative scale, so it cannot reach the case at
-/// all: this arm claims a property nothing on the macOS side asserts. That is a
-/// gap in engine-macos's tests to close, not a reason to publish a weaker claim
-/// from here.
+/// This arm was the exception until engine-macos declared `POSTURE` and closed
+/// the case its own claim rested on. The seam's contract turns on the `-0.0`
+/// reduction seed, which the reference pins with
+/// `empty_and_all_negative_zero_rows_keep_the_sign_of_zero`; engine-macos's
+/// bit-identity fuzz could not reach it, because it builds no zero-length row
+/// and emits no negative scale, and
+/// `negative_zero_rows_keep_the_reference_sign_of_zero` now covers exactly that.
 #[cfg(target_os = "macos")]
 const SELECTED: (Q8DotRows, NumericPosture) =
-    (engine_macos::q8_0_dot_rows, NumericPosture::BitIdentical);
+    (engine_macos::q8_0_dot_rows, engine_macos::POSTURE);
 
 /// Windows: engine-windows's AVX2 dot, with the posture that crate declares
 /// beside it. Nothing here restates the claim; `engine_windows::POSTURE` is the
@@ -127,12 +119,27 @@ mod tests {
         assert_eq!(response.headers()["x-camelid-posture"], "bit-identical");
     }
 
-    /// The Windows arm publishes the constant engine-windows declares beside its
-    /// kernel, not a copy of it made here. Target-gated because it is a statement
-    /// about that arm and can only be executed where that arm is compiled.
+    /// The platform arm publishes the constant the supplying crate declares, not
+    /// a copy of it made here. Target-gated because it is a statement about one
+    /// arm and can only be executed where that arm is compiled.
+    ///
+    /// It has a different power from the test above, and the difference matters:
+    /// this one cannot catch a change to the constant's *value* — both sides
+    /// move together — but it does catch the edit that replaces the constant
+    /// with a literal, which is how the macOS arm read until engine-macos
+    /// declared one. The test above is what holds the value.
     #[cfg(target_os = "windows")]
     #[test]
-    fn the_windows_posture_is_the_constant_the_supplying_crate_declares() {
+    fn the_selected_posture_is_the_constant_the_supplying_crate_declares() {
         assert_eq!(selected().1, engine_windows::POSTURE);
+    }
+
+    /// The macOS half of the check above; see it for what this does and does not
+    /// prove. Both arms now read their crate's constant, so neither is an
+    /// exception and both are asserted to be.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_selected_posture_is_the_constant_the_supplying_crate_declares() {
+        assert_eq!(selected().1, engine_macos::POSTURE);
     }
 }
