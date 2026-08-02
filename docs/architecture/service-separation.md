@@ -139,13 +139,15 @@ what the vision requires that is absent today:
 - **No application tier.** WebUI, desktop app, agentic terminal, and Kanban
   agent system are named in the vision but are not in this repository. Their
   internals are unknown from this tree and must not be assumed here.
-- **No platform datastore beyond shared quota.** The decided PostgreSQL store
-  exists and owns shared quota state; aggregated audit/usage records and
-  metering rollups are not built. Identity remains on its own local SQLite
-  database.
+- **No platform datastore beyond quota and stored evidence.** The decided
+  PostgreSQL store exists and owns shared quota state and the aggregated
+  audit/usage/receipt tables; metering rollups are not built, and nothing in
+  this tree collects the per-pod files into the store on a schedule. Identity
+  remains on its own local SQLite database.
 - **No observability stack.** Replica receipts, gateway audit/usage JSONL, and
-  tracing exist, but there is no durable aggregation, metrics backend,
-  centralized query surface, or health aggregation across replicas.
+  tracing exist, and the platform store can hold them joined on `request_id`,
+  but there is no metrics backend, centralized query surface, or health
+  aggregation across replicas.
 - **No single-box packaging.** No "run the whole platform on one machine"
   distribution (compose/bundle) that includes identity + gateway + apps.
 
@@ -218,7 +220,7 @@ tokens for one model"; everything multi-user is layered on top.
 | **Identity & Auth Service** | Users, orgs/teams, credentials, sessions, API tokens, roles/permissions. | Route inference or store conversation content. | **Partial** — local users, organizations, memberships, organization-scoped tokens, expiry, rotation, and revocation exist; no roles, sessions, remote refresh, or federation. |
 | **Model / Catalog Service** | Registry of available models, their files, and lifecycle (register, load target, retire); mapping model name → replica pool. | Serve inference itself. Own user data. | **Initial static slice** — the gateway owns an immutable startup catalog of exact backend model id → pool mappings and local discovery; pre-bind verification proves the id exists in its pool. There is no durable registry, lifecycle, health aggregation, or dynamic reload. |
 | **Application Tier** | End-user experiences: WebUI, desktop app, agentic terminal, Kanban agents. | Bypass the gateway to reach replicas directly. | **External** — not in this repo. |
-| **Platform Data + Observability** | Aggregated audit/usage records, metering rollups, shared quota state, receipts, metrics, and logs. | Own identity records. Be reached directly by replicas or clients. | **Partial** — the decided PostgreSQL store exists (`crates/platform-store`) and owns shared quota state; raw per-pod gateway logs, per-replica receipts, and stderr tracing exist, but audit/usage aggregation and metering rollups do not. |
+| **Platform Data + Observability** | Aggregated audit/usage records, metering rollups, shared quota state, receipts, metrics, and logs. | Own identity records. Be reached directly by replicas or clients. | **Partial** — the decided PostgreSQL store exists (`crates/platform-store`) and owns shared quota state plus the `gateway_audit`, `gateway_usage` and `replica_receipt` tables, joinable on `request_id`; ingestion is a library call, off the request path and idempotent per line. Collecting the per-pod files on a schedule, metering rollups, and a metrics backend do not exist. |
 
 ### 5.2 Boundaries that must NOT move
 
@@ -435,13 +437,16 @@ tokens for one model"; everything multi-user is layered on top.
   upload/registration workflow, dynamic reload, pool-health aggregation,
   failover, per-organization model policy, and a durable catalog store. The
   exact current routing contract is `gateway-model-catalog.md`.
-6. **Platform data + observability — not started, now unblocked.** Introduce the
-  durable aggregation store for audit/usage records, metering rollups, shared
-  quota state, receipts, metrics, and logs.
-  The store was blocked on an unanswered §7 question; that is now decided as
-  self-hosted PostgreSQL (`platform-datastore.md`), which also supplies the
-  shared, durable quota state Phase 4 could not provide in-process. Aggregation
-  still inherits the gateway logs' best-effort, lossy-on-exit contract: it reads
+6. **Platform data + observability — partial.** The store is decided and built
+  as self-hosted PostgreSQL (`platform-datastore.md`), supplying both the shared
+  durable quota state Phase 4 could not provide in-process and, at schema
+  version 2, the `gateway_audit`, `gateway_usage` and `replica_receipt` tables
+  that make the `request_id` join an ordinary query. Ingestion is a library call
+  rather than a request-path write, because the writers it reads from are
+  best-effort by design. Still missing: collection — nothing here decides which
+  files exist on which pod or re-reads them on a schedule — along with metering
+  rollups, a metrics backend and a centralized query surface. Aggregation still
+  inherits the gateway logs' best-effort, lossy-on-exit contract: it reads
   what survived and cannot retroactively complete it.
 7. **Application tier integration — not started.** Bring the external apps
   (WebUI, desktop, agentic terminal, Kanban) onto the gateway contract —
@@ -501,8 +506,10 @@ before the corresponding phase starts.
   status only, so a durable **metering** substrate (Phase 6) still needs
   stream-completion accounting and request/response byte counts the audit log
   itself does not capture. An identity-bound optional gateway usage log now
-  supplies those raw transport fields and terminal outcomes, but durable
-  aggregation, loss handling, and model-token accounting remain Phase 6 work.
+  supplies those raw transport fields and terminal outcomes, and the platform
+  store now holds all three streams joined on `request_id`. Loss handling and
+  model-token accounting remain Phase 6 work: the join answers what was served,
+  not how many tokens it cost.
 
 ---
 

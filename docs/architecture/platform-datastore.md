@@ -1,7 +1,8 @@
 # Platform datastore
 
-**Status:** decided; the store exists and owns shared quota state. Aggregation
-and metering are not built. Resolves the §7 open question *"What datastore
+**Status:** decided; the store exists and owns shared quota state and the
+aggregated evidence tables. Metering rollups are not built. Resolves the §7
+open question *"What datastore
 satisfies both 'one box under a desk' and 'data center scale' without an
 external managed dependency?"*
 
@@ -142,6 +143,14 @@ because identity already uses it".
   cannot answer. The `4 x limit` gap is closed for deployments that configure
   it; the in-process counter remains the default and remains correct only for
   one process.
+- Aggregated evidence — **built**, in the same crate, as schema version 2:
+  `gateway_audit`, `gateway_usage` and `replica_receipt`, each keeping the
+  record as `jsonb` and lifting out `request_id`, `organization` and `ts` so
+  the join the rest of this document describes is an ordinary one. Ingestion is
+  by line and is idempotent on the digest of the line as written, so reading a
+  growing file from the top converges instead of duplicating, and a torn final
+  line — what a killed pod leaves — is skipped rather than failing the file
+  behind it.
 - Metering built on the usage log's terminal records rather than on head status
 
 ## 6.1 What the first slice settled in practice
@@ -163,13 +172,22 @@ Measured while building it, and worth not rediscovering:
 
 ## 7. Bounds
 
-- Only shared quota state is built. Aggregation, metering rollups and receipt
-  joins are not, and nothing here makes the gateway's logs durable on their own.
+- Quota state and the evidence tables are built. Metering rollups are not, and
+  neither is anything that *reaches* the files: `ingest_evidence` is a library
+  call that takes the contents of one log, so deciding which files exist, when
+  to re-read them and how they are collected off a pod is still the operator's,
+  and is deliberately not this crate's.
+- Ingestion is off the request path on purpose. The gateway's writers are
+  best-effort so that logging cannot slow serving; making a request wait on
+  this database to record that it happened would spend exactly the property
+  those writers were shaped to protect.
 - Postgres does not make the gateway's logs durable on its own. Those writers
   are best-effort by design, and no shutdown behaviour turns a record the
   gateway dropped while running into one an aggregator can read. Aggregation
   reads what survived; it does not retroactively make it complete. The precise
   durability contract lives with the gateway, in `deploy/README.md`, rather
   than being restated here where it would drift.
+- Byte counts in `gateway_usage` are the bytes the gateway moved, not tokens.
+  Aggregating them does not turn them into a billing source.
 - Choosing Postgres says nothing about *when* identity migrates. Until it does,
   the single-writer constraints documented in `crates/identity` still apply.

@@ -1,107 +1,19 @@
 //! Integration tests against a real PostgreSQL.
 //!
-//! Set `CAMELID_TEST_PLATFORM_DATABASE_URL` to run them; without it every test
-//! here skips, because the workspace suite also runs on hosts and CI runners
-//! with no database. A skip that nobody notices is the same as no test at all,
-//! so `postgres_tests_are_not_silently_skipped` fails when
-//! `CAMELID_REQUIRE_PLATFORM_DATABASE_TESTS=1` — set only by the CI job that
-//! provides the service container — and no URL is configured.
+//! The database harness, and the reason these tests skip without a URL, live in
+//! `support`.
 
 use std::num::{NonZeroU32, NonZeroU64};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use camelid_enterprise_platform_store::{
     PlatformQuota, PlatformStore, PlatformStoreConfig, PlatformStoreError, QuotaConfiguration,
-    QuotaRefusal, SweepOutcome,
+    QuotaRefusal, SweepOutcome, PLATFORM_SCHEMA_VERSION,
 };
-use tokio_postgres::NoTls;
 
-const ADMIN_URL_VAR: &str = "CAMELID_TEST_PLATFORM_DATABASE_URL";
-const REQUIRE_VAR: &str = "CAMELID_REQUIRE_PLATFORM_DATABASE_TESTS";
-
-/// A database of its own per test: quota configuration and the schema version
-/// are deployment-wide singletons, so tests that share a database would be
-/// testing each other.
-struct TestDatabase {
-    admin_url: String,
-    name: String,
-    url: String,
-}
-
-impl TestDatabase {
-    async fn create() -> Option<Self> {
-        let admin_url = std::env::var(ADMIN_URL_VAR).ok()?;
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let name = format!(
-            "camelid_test_{}_{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
-        let admin = connect(&admin_url).await;
-        admin
-            .execute(&format!("CREATE DATABASE {name}"), &[])
-            .await
-            .expect("create test database");
-        let url = replace_database(&admin_url, &name);
-        Some(Self {
-            admin_url,
-            name,
-            url,
-        })
-    }
-
-    fn config(&self) -> PlatformStoreConfig {
-        let mut config = PlatformStoreConfig::new(self.url.clone());
-        config.acquire_timeout = Duration::from_secs(5);
-        // Every test in this file runs concurrently against one server, each
-        // holding its own pool. The production default of 8 would exhaust
-        // `max_connections` and surface as unrelated failures.
-        config.max_connections = 2;
-        config
-    }
-
-    async fn client(&self) -> tokio_postgres::Client {
-        connect(&self.url).await
-    }
-
-    async fn drop_database(self) {
-        let admin = connect(&self.admin_url).await;
-        let _ = admin
-            .execute(
-                &format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name),
-                &[],
-            )
-            .await;
-    }
-}
-
-async fn connect(url: &str) -> tokio_postgres::Client {
-    let (client, connection) = tokio_postgres::connect(url, NoTls)
-        .await
-        .expect("connect to the test database");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
-
-fn replace_database(url: &str, database: &str) -> String {
-    let (prefix, rest) = url.split_once("://").expect("a postgresql:// url");
-    let (authority, tail) = match rest.split_once('/') {
-        Some((authority, tail)) => (authority, tail),
-        None => (rest, ""),
-    };
-    let query = tail.split_once('?').map(|(_, query)| query);
-    match query {
-        Some(query) => format!("{prefix}://{authority}/{database}?{query}"),
-        None => format!("{prefix}://{authority}/{database}"),
-    }
-}
+mod support;
+use support::TestDatabase;
 
 fn limit(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).unwrap()
@@ -114,14 +26,7 @@ fn window(value: u64) -> NonZeroU64 {
 /// Guards against this whole file quietly becoming a no-op.
 #[tokio::test]
 async fn postgres_tests_are_not_silently_skipped() {
-    if std::env::var(REQUIRE_VAR).as_deref() != Ok("1") {
-        return;
-    }
-    assert!(
-        std::env::var(ADMIN_URL_VAR).is_ok(),
-        "{REQUIRE_VAR}=1 but {ADMIN_URL_VAR} is unset: the PostgreSQL integration tests \
-         would have skipped and CI would have stayed green"
-    );
+    support::assert_not_silently_skipped();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -321,7 +226,7 @@ async fn a_store_from_a_newer_gateway_is_refused() {
         error,
         PlatformStoreError::UnsupportedSchemaVersion {
             found: 99,
-            supported: 1
+            supported: PLATFORM_SCHEMA_VERSION,
         }
     ));
     database.drop_database().await;
@@ -364,7 +269,7 @@ async fn a_different_window_is_fatal_but_a_different_limit_is_not() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unreachable_store_is_refused_at_startup() {
-    if std::env::var(ADMIN_URL_VAR).is_err() {
+    if std::env::var(support::ADMIN_URL_VAR).is_err() {
         return;
     }
     let mut config = PlatformStoreConfig::new("postgresql://camelid@127.0.0.1:1/platform".into());
