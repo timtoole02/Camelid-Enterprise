@@ -304,7 +304,7 @@ crates/
 │                     quant/tensor kernels, deterministic decode. No host code.
 ├── engine-macos/     Apple Silicon backend — NEON / dot-product kernels.
 ├── engine-linux/     Linux backend — x86 AVX/VNNI and CUDA (in progress).
-├── engine-windows/   Windows backend (in progress).
+├── engine-windows/   Windows backend — x86-64 AVX2 Q8_0 kernel.
 ├── gateway/          Transparent streaming entry point in front of replicas.
 ├── identity/         Bearer token → opaque principal id, for the gateway.
 ├── replica-contract/ Dependency-free public route registry, shared by both.

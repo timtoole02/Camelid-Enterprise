@@ -209,12 +209,20 @@ async fn serve(
     // Platform crates may supply an accelerated kernel only through a seam that
     // is proven bit-identical to the portable implementation. Model ownership
     // remains in-tree and in-process; no load/unload control-plane router exists.
+    // Narrowed against every accelerated arm rather than left as `not(macos)`:
+    // with two live arms both `let`s would compile, and the replica would read a
+    // multi-gigabyte model twice and serve from whichever one won the shadowing.
     #[cfg(target_os = "macos")]
     let loaded_model = engine_core::runtime::LoadedModel::load_with_q8_projection(
         &model,
         engine_macos::q8_0_project_rows,
     )?;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    let loaded_model = engine_core::runtime::LoadedModel::load_with_q8_projection(
+        &model,
+        engine_windows::q8_0_project_rows,
+    )?;
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let loaded_model = engine_core::runtime::LoadedModel::load(&model)?;
 
     // Re-verify the digest and compose in the library, so the stack this process

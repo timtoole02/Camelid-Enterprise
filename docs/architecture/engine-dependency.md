@@ -23,9 +23,14 @@ The production path is:
 7. compose the in-tree public router with the served-model and route filters;
 8. apply attribution outermost and begin serving.
 
-On macOS the loader supplies `engine_macos::q8_0_dot_rows` through the runtime's
-explicit Q8_0 kernel seam. Its output is tested bit-for-bit against the portable
-implementation. Other supported hosts currently use the portable kernel.
+On macOS the loader supplies `engine_macos::q8_0_project_rows` through the
+runtime's explicit Q8_0 projection seam, and on Windows
+`engine_windows::q8_0_project_rows`. Both are tested bit-for-bit against the
+portable implementation, and both are built on engine-core's `project_rows`, so
+the row-splitting policy is shared and only the leaf kernel differs. The Windows
+kernel routes to AVX2 or to the portable reference itself, so a host without
+AVX2 reaches the same numbers by a different path. Linux currently uses the
+portable projection.
 
 ## Owned runtime
 
