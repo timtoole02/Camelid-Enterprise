@@ -85,9 +85,14 @@ const SWEEP_MAX_BATCHES: usize = 32;
 /// The limit is read from `quota_config` rather than bound from this process,
 /// so it is the deployment's and not the pod's. A pod still running an older
 /// limit therefore enforces the current one from the moment a newer pod records
-/// it, instead of over-admitting for the rest of the window. If that row were
-/// ever missing the comparison is `NULL`, which is not true, so the conflict
-/// path refuses — fail-closed, like every other unanswerable case here.
+/// it, instead of over-admitting for the rest of the window.
+///
+/// Both branches consult it. Guarding only the conflict path would leave the
+/// insert — every organization's *first* request in every window — admitting
+/// against no limit at all, so a missing configuration row would silently
+/// become "one request per organization per window" instead of an error. The
+/// row is returned as well, because a caller cannot otherwise tell a spent
+/// window from a store that cannot say what the limit is.
 const ADMIT_SQL: &str = "\
 WITH t AS (
   SELECT floor(extract(epoch FROM now()) / $2::bigint)::bigint * $2::bigint AS window_start,
@@ -95,6 +100,7 @@ WITH t AS (
 ), admitted AS (
   INSERT INTO quota_windows AS q (organization_id, window_start_epoch, request_count)
   SELECT $1::text, window_start, 1 FROM t
+  WHERE (SELECT request_limit FROM quota_config) IS NOT NULL
   ON CONFLICT (organization_id, window_start_epoch)
   DO UPDATE SET request_count = q.request_count + 1
   WHERE q.request_count < (SELECT request_limit FROM quota_config)
@@ -102,7 +108,8 @@ WITH t AS (
 )
 SELECT (SELECT count(*) FROM admitted) = 1 AS admitted,
        (SELECT (window_start + $2::bigint - now_epoch) FROM t)::double precision
-         AS retry_after_seconds";
+         AS retry_after_seconds,
+       (SELECT request_limit FROM quota_config) AS request_limit";
 
 const SWEEP_SQL: &str = "\
 DELETE FROM quota_windows WHERE ctid IN (
@@ -557,6 +564,14 @@ impl PlatformQuota {
         let admitted: bool = row.get(0);
         if admitted {
             return Ok(());
+        }
+        let configured_limit: Option<i64> = row.get(2);
+        if configured_limit.is_none() {
+            return Err(QuotaRefusal::Unavailable(PlatformStoreError::Database(
+                "the platform store has no quota configuration row, so no limit can be \
+                 enforced; restart a gateway against it to record one"
+                    .to_string(),
+            )));
         }
         let retry_after_seconds: f64 = row.get(1);
         Err(QuotaRefusal::Exceeded {
