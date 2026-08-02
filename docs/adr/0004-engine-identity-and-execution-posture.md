@@ -81,7 +81,11 @@ changes what it **is** (`config_sha256`).
 - It does not give the GPU posture an acceptance criterion. The model-backed
   parity gate asserts token-identity against the pinned oracle and belongs to
   the **CPU** posture. What bar a non-bit-identical posture must clear is open,
-  and is called out in the GPU scoping document.
+  and is called out in the GPU scoping document. The *shape* that bar has to
+  take — and the measurements from another campaign that make each of its terms
+  non-optional, including that token-identity alone measured 0/9 against a real
+  defect — is recorded in `docs/architecture/tolerance-bound-shape.md`. The
+  numbers still belong to whoever measures the backend.
 - It does not touch `ENGINE_PIN`, which still names the oracle. That field's
   name remains misleading and is left alone deliberately: renaming it is a
   cascade of its own and buys nothing while the pin is still the parity baseline.
