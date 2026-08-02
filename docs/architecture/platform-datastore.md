@@ -189,5 +189,27 @@ Measured while building it, and worth not rediscovering:
   than being restated here where it would drift.
 - Byte counts in `gateway_usage` are the bytes the gateway moved, not tokens.
   Aggregating them does not turn them into a billing source.
+- **Nothing deletes evidence.** `sweep` covers `quota_windows` only. At roughly
+  half a kilobyte per row including indexes, a deployment serving 1000 req/s
+  writes on the order of 100 GB a day across the three streams, and none of it
+  ages out. This is deliberate — how long audit evidence is kept is a policy
+  this crate should not pick a default for — but it has to be settled before
+  anything ingests on a schedule, which is the same slice that would do the
+  collecting.
+- **Identity by content cannot separate a re-read from a repeat.** Two lines
+  with the same bytes are one record, which is exactly what re-reading a file
+  produces. One stream can genuinely emit the same bytes twice: a receipt from a
+  directly-reached replica has no `request_id`, leaving `ts`, `method`, `path`
+  and `status` as its only per-request fields, and `ts` is `f64` seconds with
+  about 238ns of resolution at the current epoch. Two such requests finishing
+  inside one of those, on the same path with the same status, are stored once.
+  The gateway's streams are immune — every line carries a 128-bit `request_id`.
+  Closing it for receipts means giving them something per-request of their own,
+  which is a change to what a replica writes rather than to this schema.
+- **Rolling back past schema version 2 needs manual SQL.** A pod that only
+  understands version 1 refuses to start against a store a version 2 pod has
+  migrated, by the same fail-closed rule that protects every other version skew.
+  That is the intended behaviour, and it means a rollback is an operator action,
+  not a redeploy.
 - Choosing Postgres says nothing about *when* identity migrates. Until it does,
   the single-writer constraints documented in `crates/identity` still apply.

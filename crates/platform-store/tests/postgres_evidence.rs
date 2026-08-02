@@ -54,6 +54,65 @@ async fn postgres_evidence_tests_are_not_silently_skipped() {
     support::assert_not_silently_skipped();
 }
 
+/// `serde_json` accepts a `\u0000` escape and PostgreSQL will not store one, so
+/// validating in Rust and storing in SQL disagree about what a record is. It
+/// arrives two ways: decoded into a lifted column it rejects as a bind
+/// parameter, and left in the record for the `jsonb` cast to refuse. Whatever
+/// the database will not take is unreadable, or the lines behind it are lost on
+/// every retry rather than once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_the_database_refuses_does_not_bury_the_lines_behind_it() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let store = PlatformStore::connect(&database.config())
+        .await
+        .expect("store");
+    let behind = "req_dddddddddddddddddddddddddddddddd";
+    // Valid JSON by every Rust measure, and not a value PostgreSQL can hold.
+    let in_a_lifted_column =
+        audit_line("req_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Some("org_\\u0000"));
+    let in_the_record_only = audit_line("req_cccccccccccccccccccccccccccccccc", Some("org_a"))
+        .replace("/v1/chat/completions", "/v1/\\u0000");
+    let file = format!(
+        "{}\n{}\n{}\n{}\n",
+        audit_line(REQUEST, Some("org_a")),
+        in_a_lifted_column,
+        in_the_record_only,
+        audit_line(behind, Some("org_a")),
+    );
+
+    let summary = store
+        .ingest_evidence(EvidenceStream::GatewayAudit, &file)
+        .await
+        .expect("records the database refuses are not a failed file");
+
+    assert_eq!(
+        summary,
+        IngestSummary {
+            stored: 2,
+            already_present: 0,
+            unreadable: 2
+        }
+    );
+    let reached: i64 = database
+        .client()
+        .await
+        .query_one(
+            "SELECT count(*) FROM gateway_audit WHERE request_id = $1",
+            &[&behind],
+        )
+        .await
+        .expect("query")
+        .get(0);
+    assert_eq!(
+        reached, 1,
+        "the line after the unstorable ones was never ingested"
+    );
+
+    database.drop_database().await;
+}
+
 /// The point of the whole exercise: three files written by three processes that
 /// never spoke to each other become one row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -274,8 +333,59 @@ async fn an_audit_line_with_no_organization_is_still_stored() {
     database.drop_database().await;
 }
 
+/// Lines are sent to the database in batches, so a file has boundaries the
+/// caller never sees. Crossing several must not double-count or drop one, and a
+/// second pass over the same file must still find all of it already there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_spanning_several_batches_is_stored_exactly_once() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let store = PlatformStore::connect(&database.config())
+        .await
+        .expect("store");
+    // Deliberately not a multiple of the batch size, so the last batch is short.
+    const LINES: u64 = 2_501;
+    let file: String = (0..LINES)
+        .map(|n| audit_line(&format!("req_{n:032x}"), Some("org_a")) + "\n")
+        .collect();
+
+    let first = store
+        .ingest_evidence(EvidenceStream::GatewayAudit, &file)
+        .await
+        .expect("first pass");
+    let second = store
+        .ingest_evidence(EvidenceStream::GatewayAudit, &file)
+        .await
+        .expect("second pass");
+
+    assert_eq!(
+        first,
+        IngestSummary {
+            stored: LINES,
+            already_present: 0,
+            unreadable: 0
+        }
+    );
+    assert_eq!(
+        second,
+        IngestSummary {
+            stored: 0,
+            already_present: LINES,
+            unreadable: 0
+        }
+    );
+    assert_eq!(count(&database, "gateway_audit").await, LINES as i64);
+
+    database.drop_database().await;
+}
+
 /// The upgrade an existing deployment actually performs: a store already
 /// holding quota state gains the evidence tables and loses none of it.
+///
+/// Only forwards. Once a pod has migrated the store, one that understands only
+/// version 1 refuses to start against it, so rolling this back is manual SQL
+/// rather than a redeploy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_store_already_holding_quota_gains_the_evidence_tables() {
     let Some(database) = TestDatabase::create().await else {
