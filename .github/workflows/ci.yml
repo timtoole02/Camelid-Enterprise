@@ -27,6 +27,49 @@ jobs:
       - run: cargo clippy --workspace -- -D warnings
         continue-on-error: true # informational until the port stabilizes
 
+  # The shared quota is the first thing here whose correctness is a property of
+  # two processes and one database, and none of it can be observed without a
+  # real PostgreSQL: the `ON CONFLICT ... WHERE` re-evaluation, the advisory
+  # lock that keeps concurrent pods from colliding during migration, and the
+  # database-clock window alignment are all server behaviour.
+  #
+  # A separate job rather than a step in `test`: that job also runs on
+  # macos-latest, where service containers do not exist. The tests skip
+  # themselves when no URL is configured, which is what keeps the workspace
+  # suite runnable on a laptop — and is also exactly how a suite silently
+  # becomes zero tests. `CAMELID_REQUIRE_PLATFORM_DATABASE_TESTS` is set only
+  # here, and a test asserts on it, so a broken service container fails this
+  # job instead of passing it empty. (`CI` would not do: GitHub sets it in
+  # every job, including the ones with no database.)
+  platform-store:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: camelid
+          POSTGRES_PASSWORD: camelid
+          POSTGRES_DB: camelid_platform
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Each test creates and drops its own database on this server: quota
+      # configuration and the schema version are deployment-wide singletons, so
+      # tests sharing one database would be testing each other.
+      CAMELID_TEST_PLATFORM_DATABASE_URL: postgresql://camelid:camelid@127.0.0.1:5432/camelid_platform
+      CAMELID_REQUIRE_PLATFORM_DATABASE_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p camelid-enterprise-platform-store
+      - run: cargo test -p camelid-enterprise-gateway --test platform_quota
+
   # The only job that builds for Windows at all. Without it the server crate's
   # `#[cfg(windows)]` arms — the case-insensitive environment scan in the lane —
   # were compiled by nothing, and engine-windows's probe, which compiles

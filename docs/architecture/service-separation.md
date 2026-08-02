@@ -129,8 +129,9 @@ what the vision requires that is absent today:
   model-to-pool routing, admission control, per-organization request quotas,
   and raw terminal transport accounting exist, but the catalog is immutable at
   process start; it has no dynamic registration, health aggregation, failover,
-  or per-organization model policy. Quota state is per-process and byte counts
-  are not model-token accounting.
+  or per-organization model policy. Byte counts are not model-token accounting.
+  Quota state is shared across replicas when a platform database is configured
+  and per-process otherwise.
 - **No complete model management service.** A gateway static catalog maps public
   model ids to pools, but models are still mounted by path; there is no durable
   registry, upload, lifecycle API, or operator workflow beyond replica-local
@@ -138,9 +139,10 @@ what the vision requires that is absent today:
 - **No application tier.** WebUI, desktop app, agentic terminal, and Kanban
   agent system are named in the vision but are not in this repository. Their
   internals are unknown from this tree and must not be assumed here.
-- **No platform datastore.** Identity has a local SQLite database, but the
-  decided PostgreSQL store for aggregated audit/usage records, metering rollups,
-  and shared quota state is not built.
+- **No platform datastore beyond shared quota.** The decided PostgreSQL store
+  exists and owns shared quota state; aggregated audit/usage records and
+  metering rollups are not built. Identity remains on its own local SQLite
+  database.
 - **No observability stack.** Replica receipts, gateway audit/usage JSONL, and
   tracing exist, but there is no durable aggregation, metrics backend,
   centralized query surface, or health aggregation across replicas.
@@ -212,11 +214,11 @@ tokens for one model"; everything multi-user is layered on top.
 | Service | Owns | Must never | Exists today? |
 |---|---|---|---|
 | **Inference Replica Pool** | Producing attributed tokens for exactly one model, one generation at a time; lane guarantee; attribution stamping. | Know about users, auth, or other models. Hold cross-request state. | **Yes** — `crates/server`. Reuse as-is. |
-| **Gateway / Control Plane** | Terminating client connections, authenticating requests, routing to the right model pool, quotas, rate limiting, usage metering. | Run inference. Store user credentials (delegates to Identity). | **Partial** — transparent forwarding, immutable static exact-backend-id-to-pool routing with pre-bind verification, memory-bounded selector work, and an authenticated per-organization selector cap; admission control, opt-in bearer auth, per-organization request quotas, audit records, and raw terminal transport accounting exist. Dynamic catalog management, pool-health aggregation, per-organization model policy, durable shared quota state, and model-token metering do not. |
+| **Gateway / Control Plane** | Terminating client connections, authenticating requests, routing to the right model pool, quotas, rate limiting, usage metering. | Run inference. Store user credentials (delegates to Identity). | **Partial** — transparent forwarding, immutable static exact-backend-id-to-pool routing with pre-bind verification, memory-bounded selector work, and an authenticated per-organization selector cap; admission control, opt-in bearer auth, per-organization request quotas, audit records, and raw terminal transport accounting exist. Dynamic catalog management, pool-health aggregation, per-organization model policy, and model-token metering do not. |
 | **Identity & Auth Service** | Users, orgs/teams, credentials, sessions, API tokens, roles/permissions. | Route inference or store conversation content. | **Partial** — local users, organizations, memberships, organization-scoped tokens, expiry, rotation, and revocation exist; no roles, sessions, remote refresh, or federation. |
 | **Model / Catalog Service** | Registry of available models, their files, and lifecycle (register, load target, retire); mapping model name → replica pool. | Serve inference itself. Own user data. | **Initial static slice** — the gateway owns an immutable startup catalog of exact backend model id → pool mappings and local discovery; pre-bind verification proves the id exists in its pool. There is no durable registry, lifecycle, health aggregation, or dynamic reload. |
 | **Application Tier** | End-user experiences: WebUI, desktop app, agentic terminal, Kanban agents. | Bypass the gateway to reach replicas directly. | **External** — not in this repo. |
-| **Platform Data + Observability** | Aggregated audit/usage records, metering rollups, shared quota state, receipts, metrics, and logs. | Own identity records. Be reached directly by replicas or clients. | **Not built** — raw per-pod gateway logs, per-replica receipts, and stderr tracing exist, but the decided PostgreSQL aggregation store does not. |
+| **Platform Data + Observability** | Aggregated audit/usage records, metering rollups, shared quota state, receipts, metrics, and logs. | Own identity records. Be reached directly by replicas or clients. | **Partial** — the decided PostgreSQL store exists (`crates/platform-store`) and owns shared quota state; raw per-pod gateway logs, per-replica receipts, and stderr tracing exist, but audit/usage aggregation and metering rollups do not. |
 
 ### 5.2 Boundaries that must NOT move
 
@@ -349,14 +351,32 @@ tokens for one model"; everything multi-user is layered on top.
   gateway work, not a record of completed inference. Authentication must query
   SQLite before the organization is known, so the quota does not bound
   identity-store lookup load from a valid over-budget token; token caching is a
-  separate revocation-sensitive design problem. The counter is in-memory and
+  separate revocation-sensitive design problem. Where the counter lives is an
+  operator's choice. Without `--platform-database-url` it is in-memory and
   per-process — it resets on restart and is not shared across gateway replicas
-  behind the same Service, which is an explicit trade-off (a coarse per-tenant
-  cap, not a durable metering/billing substrate). The shipped gateway manifest
-  has two replicas: each process can admit under `2 × limit` in a short burst
-  across a fixed-window boundary, so the two-pod deployment can admit under
-  `4 × limit` for one organization in that span, distributed nondeterministically
-  by Kubernetes. With `--usage-log` plus `--identity-db`, each authenticated,
+  behind the same Service, so with the shipped two-replica manifest each
+  process can admit under `2 × limit` in a short burst across a fixed-window
+  boundary and the deployment can admit under `4 × limit` for one organization
+  in that span, distributed nondeterministically by Kubernetes. With
+  `--platform-database-url` the counter is one row in PostgreSQL, incremented
+  by a single atomic statement whose limit predicate is re-evaluated under the
+  row lock, so the deployment admits exactly `limit` per window however many
+  replicas are running. Those windows are anchored to the database clock rather
+  than to a pod's first request, which is what lets every replica compute the
+  same window and answer the same `Retry-After`; the in-process counter keeps
+  its first-request anchoring, because one process has nothing to agree with.
+  A store that cannot be reached fails closed with a typed `503` audited as
+  `quota_store_unavailable`, distinct from a spent quota's `429`, and never
+  falls back to per-pod counting. Every replica must use the same database and
+  the same window: a pod whose window disagrees with the recorded one refuses
+  to start, because pods that disagree enforce the sum of their limits, and
+  changing the window is an explicit `--reconfigure-quota-window` rollout that
+  discards the counters measured against the old one. The limit is read from
+  the store on every admission rather than bound from the process, so a lowered
+  limit binds every replica as soon as one records it instead of after the last
+  one restarts. The database has to be dedicated: rows are keyed by
+  organization and window and by nothing else, so two deployments sharing one
+  database share every counter. With `--usage-log` plus `--identity-db`, each authenticated,
   quota-admitted request also produces a separate best-effort terminal JSONL
   record with `started_ts`, `duration_ms`, `response_head_status`, opaque
   request/response byte counts, and a `stream_outcome`: `completed`,

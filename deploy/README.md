@@ -487,13 +487,73 @@ Adjust before applying:
   Replica availability is represented by the replica Deployment's own readiness
   and by typed gateway `502` responses, not by removing healthy gateway pods.
 - **Per-organization quota** — when you opt in with an identity database plus
-  `CAMELID_GATEWAY_ORG_REQUEST_QUOTA`, the counter is fixed-window, in-memory,
-  and local to each gateway process. The supplied manifest runs **two** gateway
-  replicas, so Kubernetes distributes an organization's traffic across two
-  independent counters: each process can admit under `2 × limit` in a short
-  fixed-window-boundary burst, making the deployment-wide worst case under
-  `4 × limit`. Size the per-pod value with that bound in mind. A strict global
-  organization quota needs durable, shared state and is not implemented.
+  `CAMELID_GATEWAY_ORG_REQUEST_QUOTA`, the counter is fixed-window and, by
+  default, in-memory and local to each gateway process. The supplied manifest
+  runs **two** gateway replicas, so Kubernetes distributes an organization's
+  traffic across two independent counters: each process can admit under
+  `2 × limit` in a short fixed-window-boundary burst, making the
+  deployment-wide worst case under `4 × limit`. Size the per-pod value with
+  that bound in mind, or configure the shared counter below.
+- **Shared quota (PostgreSQL)** — set `CAMELID_GATEWAY_PLATFORM_DATABASE_URL`
+  and the counter moves into a database every replica shares, so the limit is
+  the deployment's rather than each pod's. What this requires of an operator:
+
+  - **Every replica must use the same database and the same
+    `CAMELID_GATEWAY_ORG_REQUEST_QUOTA_WINDOW_SECONDS`.** Pods that disagree
+    about the window write to different rows and enforce the *sum* of their
+    limits, which is the defect this removes — so a pod whose window differs
+    from the one already recorded refuses to start rather than quietly
+    doubling the limit. To change the window, roll the new value out with
+    `CAMELID_GATEWAY_RECONFIGURE_QUOTA_WINDOW=true`, which rewrites the stored
+    window and discards the counters measured against the old one, then drop
+    the flag. During that rollout the replicas still on the previous window are
+    the split counter the refusal exists to prevent, so drain first if the
+    deployment cannot tolerate it.
+  - **The limit lives in the database, not in the pod.** Each replica records
+    its configured limit at startup and every replica enforces whatever is
+    recorded, so lowering a limit takes effect across the deployment as soon as
+    the first new pod starts rather than after the last old one restarts.
+    Replicas configured with different limits therefore converge on the most
+    recently started one; the new pod logs a warning naming both.
+  - **The database must be dedicated to one deployment.** Quota state is keyed
+    by organization and window and by nothing else, so a staging gateway
+    pointed at the production database silently spends production's budget.
+    Give each deployment its own database.
+  - **The gateway fails closed.** If the database cannot be reached or does not
+    answer within `CAMELID_GATEWAY_PLATFORM_DATABASE_ACQUIRE_TIMEOUT_MS`, the
+    request is refused with `503 gateway quota store unavailable` and audited
+    with `"reason":"quota_store_unavailable"` — distinct from a spent quota's
+    `429` and `"reason":"organization_quota_exceeded"`. It never falls back to
+    per-pod counting, because doing so would silently restore the behaviour the
+    shared counter exists to replace. A pod that cannot reach the store at
+    startup does not start.
+  - **The URL is a credential.** Pass it through the environment (from a
+    `Secret`), not `--platform-database-url`, so it stays out of shell history
+    and `ps`. The gateway logs only `host:port/database`.
+  - **TLS is off unless you supply a CA.** With
+    `CAMELID_GATEWAY_PLATFORM_DATABASE_CA_FILE` the connection is encrypted and
+    both the certificate chain and the hostname are verified; the server
+    certificate must be a normal end-entity certificate issued by that CA, not
+    a self-signed leaf. Without it the connection is cleartext, which is only
+    defensible when the database shares a host with the gateway — and a URL
+    whose `sslmode=require` asks for TLS without a CA is refused at startup
+    rather than quietly downgraded.
+  - **Sizing.** `CAMELID_GATEWAY_PLATFORM_DATABASE_MAX_CONNECTIONS` defaults to
+    8. Admissions for one organization serialize on one row, so raising it does
+    not raise a tenant's admission rate — measured at 256 concurrent
+    admissions, 32 and 64 connections were both slower than 8. Budget for the
+    round trip itself: every authenticated request now waits on one, about
+    1.4 ms against a database on the same host, and the tail grows with the
+    concurrency contending for a single organization's row and with the
+    distance to the database.
+  - **Retention.** Rows for elapsed windows are deleted by a periodic sweep
+    that runs off the request path, in whichever replica takes a database
+    advisory lock first. Nothing needs to be scheduled by the operator.
+
+  Windows are anchored to the database clock, not to a pod's first request, so
+  every replica computes the same window and hands a client the same
+  `Retry-After`. The store holds quota state only: principals, organizations and
+  tokens remain in the identity database.
 - **Transport usage log** — `CAMELID_GATEWAY_USAGE_LOG` requires
   `CAMELID_GATEWAY_IDENTITY_DB`; use a writable, durable mounted path if the
   JSONL evidence must survive pod replacement. The stock manifest supplies

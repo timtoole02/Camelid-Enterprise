@@ -1,0 +1,21 @@
+[package]
+name = "camelid-enterprise-platform-store"
+description = "PostgreSQL-backed platform state shared by every gateway replica."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+deadpool-postgres = "0.14"
+# `ring` rather than the default `aws-lc-rs`: the default needs a C toolchain,
+# which would break `aarch64-cross-check` and fatten the gateway image.
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+rustls-pemfile = "2"
+tokio = { version = "1", features = ["rt", "time"] }
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.13"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

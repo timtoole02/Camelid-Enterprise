@@ -21,6 +21,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "server-graceful", "service", "tokio"] }
 identity.workspace = true
 pin-project-lite = "0.2"
+platform-store.workspace = true
 # The public route surface, linked rather than restated. This crate is
 # dependency-free precisely so a gateway can take it without taking the engine.
 replica-contract.workspace = true
@@ -38,4 +39,6 @@ futures-util = "0.3"
 http-body-util = "0.1"
 rayon = "1"
 tempfile.workspace = true
+# Only to assert on the platform store's own rows from the gateway's tests.
+tokio-postgres = "0.7"
 tower = { version = "0.5", features = ["util"] }

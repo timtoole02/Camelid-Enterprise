@@ -6,6 +6,7 @@ use camelid_enterprise_gateway::{
 };
 use clap::{Parser, Subcommand};
 use identity::{OrganizationId, PrincipalId, RotationLifetime, SqliteIdentityStore, TokenLifetime};
+use platform_store::{PlatformQuota, PlatformStoreConfig, QuotaConfiguration, SweepOutcome};
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -20,6 +21,8 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// One value of this is parsed once, at startup, and immediately destructured.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Start a transparent single-upstream gateway or a static multi-model gateway.
     Serve {
@@ -127,6 +130,78 @@ enum Command {
             env = "CAMELID_GATEWAY_ORG_REQUEST_QUOTA_WINDOW_SECONDS"
         )]
         org_request_quota_window_seconds: NonZeroU64,
+        /// PostgreSQL connection URL for the platform store. When set, the
+        /// per-organization quota is counted in that database instead of in
+        /// this process, so the limit belongs to the deployment rather than to
+        /// each replica. Every replica must point at the same database and use
+        /// the same window, and the gateway refuses to start otherwise.
+        ///
+        /// The URL carries a password: prefer the environment variable, which
+        /// keeps it out of shell history and out of `ps`. It is never logged.
+        #[arg(
+            long,
+            env = "CAMELID_GATEWAY_PLATFORM_DATABASE_URL",
+            requires = "org_request_quota"
+        )]
+        platform_database_url: Option<String>,
+        /// PEM file holding the certificate authority that signed the platform
+        /// database's server certificate. Supplying it turns TLS on and makes
+        /// it mandatory; the chain and the hostname are both verified. Without
+        /// it the connection is cleartext, which is only defensible when the
+        /// database shares a host with the gateway.
+        #[arg(
+            long,
+            env = "CAMELID_GATEWAY_PLATFORM_DATABASE_CA_FILE",
+            requires = "platform_database_url"
+        )]
+        platform_database_ca_file: Option<PathBuf>,
+        /// Platform database connections held by this gateway process.
+        /// Admissions for one organization serialize on one row, so raising
+        /// this does not raise a tenant's admission rate; it was measured to
+        /// be no faster at 32 or 64 than at the default.
+        #[arg(
+            long,
+            default_value_t = PlatformStoreConfig::DEFAULT_MAX_CONNECTIONS,
+            env = "CAMELID_GATEWAY_PLATFORM_DATABASE_MAX_CONNECTIONS",
+            requires = "platform_database_url"
+        )]
+        platform_database_max_connections: usize,
+        /// How long a request may wait for a platform database connection
+        /// before the store is declared unavailable and the request is
+        /// refused. This bound is what stops a slow database from becoming an
+        /// unbounded queue of requests waiting ahead of admission control.
+        #[arg(
+            long,
+            default_value_t = PlatformStoreConfig::DEFAULT_ACQUIRE_TIMEOUT.as_millis() as u64,
+            env = "CAMELID_GATEWAY_PLATFORM_DATABASE_ACQUIRE_TIMEOUT_MS",
+            requires = "platform_database_url"
+        )]
+        platform_database_acquire_timeout_ms: u64,
+        /// Server-side `statement_timeout` applied to every platform database
+        /// connection, so a query that hangs is refused rather than held.
+        #[arg(
+            long,
+            default_value_t = PlatformStoreConfig::DEFAULT_STATEMENT_TIMEOUT.as_millis() as u64,
+            env = "CAMELID_GATEWAY_PLATFORM_DATABASE_STATEMENT_TIMEOUT_MS",
+            requires = "platform_database_url"
+        )]
+        platform_database_statement_timeout_ms: u64,
+        /// Rewrite the platform store's recorded quota window with this
+        /// gateway's, discarding the counters measured against the old one.
+        ///
+        /// Without this, a gateway whose window differs from the recorded one
+        /// refuses to start, because replicas that disagree about the window
+        /// enforce the sum of their limits. Changing the window is therefore an
+        /// explicit act: roll this flag out with the new value, then drop it.
+        /// Replicas still running the previous window during that rollout are
+        /// the split counter the refusal exists to prevent, so drain first if
+        /// the deployment cannot tolerate it.
+        #[arg(
+            long,
+            env = "CAMELID_GATEWAY_RECONFIGURE_QUOTA_WINDOW",
+            requires = "platform_database_url"
+        )]
+        reconfigure_quota_window: bool,
     },
     /// Create a user and its personal organization, then print the principal id.
     CreateUser {
@@ -236,13 +311,35 @@ enum Command {
     },
 }
 
+/// Returning `Box<dyn Error>` from `main` prints it with `Debug`, so every
+/// message this binary writes was a struct dump: `Database("...")` rather than
+/// the sentence telling an operator what to change. Refusing to start is only
+/// useful if the refusal says why.
+struct CliError(Box<dyn std::error::Error>);
+
+impl std::fmt::Debug for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(cause) = source {
+            write!(f, ": {cause}")?;
+            source = cause.source();
+        }
+        Ok(())
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), CliError> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    match Cli::parse().command {
+    run(Cli::parse().command).await.map_err(CliError)
+}
+
+async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
         Command::Serve {
             upstream,
             model_route,
@@ -257,6 +354,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             usage_log,
             org_request_quota,
             org_request_quota_window_seconds,
+            platform_database_url,
+            platform_database_ca_file,
+            platform_database_max_connections,
+            platform_database_acquire_timeout_ms,
+            platform_database_statement_timeout_ms,
+            reconfigure_quota_window,
         } => {
             serve(ServeArgs {
                 upstream,
@@ -275,6 +378,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 org_request_quota: OrgQuotaArgs {
                     limit: org_request_quota,
                     window_seconds: org_request_quota_window_seconds,
+                },
+                platform_database: PlatformDatabaseArgs {
+                    url: platform_database_url,
+                    ca_file: platform_database_ca_file,
+                    max_connections: platform_database_max_connections,
+                    acquire_timeout_ms: platform_database_acquire_timeout_ms,
+                    statement_timeout_ms: platform_database_statement_timeout_ms,
+                    reconfigure_quota_window,
                 },
             })
             .await
@@ -327,6 +438,17 @@ struct OrgQuotaArgs {
     window_seconds: NonZeroU64,
 }
 
+/// Where the shared quota is counted. `None` keeps counting in this process,
+/// which is what a single-box deployment has always done.
+struct PlatformDatabaseArgs {
+    url: Option<String>,
+    ca_file: Option<PathBuf>,
+    max_connections: usize,
+    acquire_timeout_ms: u64,
+    statement_timeout_ms: u64,
+    reconfigure_quota_window: bool,
+}
+
 /// Append-only gateway telemetry sinks. Audit remains a response-head and
 /// identity-correlation record; usage is a terminal raw-payload record.
 struct GatewayLogArgs {
@@ -348,6 +470,7 @@ struct ServeArgs {
     identity_db: Option<PathBuf>,
     logs: GatewayLogArgs,
     org_request_quota: OrgQuotaArgs,
+    platform_database: PlatformDatabaseArgs,
 }
 
 type GatewayLogs = (Option<Arc<GatewayLog>>, Option<Arc<GatewayLog>>);
@@ -425,6 +548,96 @@ fn open_gateway_logs(logs: &GatewayLogArgs) -> Result<GatewayLogs, Box<dyn std::
     Ok((audit, usage))
 }
 
+/// Builds the quota this gateway enforces: shared across replicas when a
+/// platform database is configured, counted in this process when it is not.
+async fn open_org_quota(
+    limit: NonZeroU32,
+    window_seconds: NonZeroU64,
+    platform_database: &PlatformDatabaseArgs,
+) -> Result<Arc<OrgQuota>, Box<dyn std::error::Error>> {
+    let Some(url) = platform_database.url.clone() else {
+        tracing::info!(
+            limit = limit.get(),
+            window_seconds = window_seconds.get(),
+            "gateway per-organization request quota enabled, counted in this process"
+        );
+        tracing::warn!(
+            "no --platform-database-url configured; this quota is per gateway process, so a \
+             deployment running N replicas admits up to N x the limit in a window and up to \
+             2N x the limit across a window boundary"
+        );
+        return Ok(Arc::new(OrgQuota::new(limit, window_seconds)));
+    };
+
+    let mut config = PlatformStoreConfig::new(url);
+    config.ca_file = platform_database.ca_file.clone();
+    config.max_connections = platform_database.max_connections;
+    config.acquire_timeout = Duration::from_millis(platform_database.acquire_timeout_ms);
+    config.statement_timeout = Duration::from_millis(platform_database.statement_timeout_ms);
+    if config.ca_file.is_none() {
+        tracing::warn!(
+            "no --platform-database-ca-file configured; the platform database connection is \
+             cleartext, and it carries the organization every request is charged to. Supply a \
+             CA file, or keep the database on the gateway's own host."
+        );
+    }
+
+    let (quota, configuration) = if platform_database.reconfigure_quota_window {
+        PlatformQuota::connect_reconfiguring_window(&config, limit, window_seconds).await?
+    } else {
+        PlatformQuota::connect(&config, limit, window_seconds).await?
+    };
+    match configuration {
+        QuotaConfiguration::Initialized | QuotaConfiguration::Unchanged => {}
+        QuotaConfiguration::LimitChanged { previous } => tracing::warn!(
+            previous,
+            limit = limit.get(),
+            "platform quota limit changed; every replica reads the limit from the store, so \
+             this takes effect immediately for all of them"
+        ),
+        QuotaConfiguration::WindowChanged { previous } => tracing::warn!(
+            previous,
+            window_seconds = window_seconds.get(),
+            "platform quota window rewritten and existing counters discarded; replicas still \
+             running the previous window count against a different one until they restart"
+        ),
+    }
+    tracing::info!(
+        limit = limit.get(),
+        window_seconds = window_seconds.get(),
+        database = %config.redacted_target(),
+        tls = config.ca_file.is_some(),
+        "gateway per-organization request quota enabled, shared across replicas"
+    );
+
+    let quota = Arc::new(quota);
+    spawn_quota_sweeper(Arc::clone(&quota));
+    Ok(Arc::new(OrgQuota::platform(quota)))
+}
+
+/// Removes quota rows for long-elapsed windows. Off the request path by
+/// construction, and guarded in the database so exactly one replica sweeps.
+fn spawn_quota_sweeper(quota: Arc<PlatformQuota>) {
+    let period = Duration::from_secs(quota.window().get().max(60));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick completes immediately; a sweep at startup would race
+        // every other replica starting in the same rollout for no benefit.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match quota.sweep().await {
+                Ok(SweepOutcome::Deleted(rows)) if rows > 0 => {
+                    tracing::debug!(rows, "swept elapsed quota windows")
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "quota window sweep failed"),
+            }
+        }
+    });
+}
+
 async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ServeArgs {
         upstream,
@@ -438,6 +651,7 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         identity_db,
         logs,
         org_request_quota,
+        platform_database,
     } = args;
     let configured_routing = parse_serve_routing(upstream, model_routes)?;
     let selection_limits = match &configured_routing {
@@ -476,14 +690,13 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                  token can be replayed until it is revoked or, if it was issued with \
                  --expires-in-seconds, until it expires."
             );
-            let quota = org_request_quota.limit.map(|limit| {
-                tracing::info!(
-                    limit = limit.get(),
-                    window_seconds = org_request_quota.window_seconds.get(),
-                    "gateway per-organization request quota enabled"
-                );
-                Arc::new(OrgQuota::new(limit, org_request_quota.window_seconds))
-            });
+            let quota = match org_request_quota.limit {
+                Some(limit) => Some(
+                    open_org_quota(limit, org_request_quota.window_seconds, &platform_database)
+                        .await?,
+                ),
+                None => None,
+            };
             GatewayAuth::RequireToken {
                 store: Arc::new(SqliteIdentityStore::open(&path)?),
                 quota,
@@ -1022,6 +1235,85 @@ mod tests {
             "http://127.0.0.1:8181",
             "--usage-log",
             "usage.jsonl",
+        ]);
+        assert!(result.is_err());
+    }
+
+    /// A platform database that nothing counts against is configuration that
+    /// looks like enforcement and is not.
+    #[test]
+    fn a_platform_database_requires_a_quota_to_count() {
+        let result = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+            "--identity-db",
+            "identity.sqlite",
+            "--platform-database-url",
+            "postgresql://camelid@127.0.0.1/platform",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn platform_database_tuning_requires_the_database() {
+        for flag in [
+            "--platform-database-ca-file",
+            "--platform-database-max-connections",
+            "--platform-database-acquire-timeout-ms",
+            "--platform-database-statement-timeout-ms",
+        ] {
+            let result = Cli::try_parse_from([
+                "camelid-enterprise-gateway",
+                "serve",
+                "--upstream",
+                "http://127.0.0.1:8181",
+                flag,
+                "8",
+            ]);
+            assert!(result.is_err(), "{flag} must require a platform database");
+        }
+    }
+
+    #[test]
+    fn a_platform_database_is_optional() {
+        let cli = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+            "--identity-db",
+            "identity.sqlite",
+            "--org-request-quota",
+            "10",
+        ])
+        .unwrap();
+        let Command::Serve {
+            platform_database_url,
+            platform_database_max_connections,
+            reconfigure_quota_window,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the parsed command to be Serve");
+        };
+        assert_eq!(platform_database_url, None);
+        assert_eq!(platform_database_max_connections, 8);
+        assert!(
+            !reconfigure_quota_window,
+            "rewriting a deployment's recorded quota window must be asked for"
+        );
+    }
+
+    #[test]
+    fn reconfiguring_the_quota_window_requires_the_database_that_records_it() {
+        let result = Cli::try_parse_from([
+            "camelid-enterprise-gateway",
+            "serve",
+            "--upstream",
+            "http://127.0.0.1:8181",
+            "--reconfigure-quota-window",
         ]);
         assert!(result.is_err());
     }
