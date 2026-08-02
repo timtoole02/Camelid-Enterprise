@@ -127,6 +127,14 @@ Verified by: a **restart-reproducibility** test (same request twice across a ful
 process restart, byte-identical), a comparison against the CPU posture on a
 committed prompt pack to quantify the divergence the posture is declaring, and
 the existing model-backed parity gate still passing **on the CPU posture**.
+
+What that comparison has to publish — a *relative* per-tensor bound, a
+per-position outlier factor, and top-1 agreement labelled as the outer gate — is
+in `docs/architecture/tolerance-bound-shape.md`, with the measurements from the
+sibling engine's campaign that make each term non-optional. Worth reading before
+designing the prompt pack rather than after: two of those terms exist because a
+bound without them failed, and one of them is the reason a pack designed around
+argmax outcomes would prove less than it looks like it proves.
 **Estimate: the bulk of the work.** Device/buffer/pipeline lifecycle, MSL source,
 and the residency question of when weights are uploaded relative to
 `LoadedModel::load`.
