@@ -48,9 +48,18 @@ jobs:
         run: git config --global core.longpaths true
       - uses: Swatinem/rust-cache@v2
       # engine-windows's tests are not gated on `target_os`, so they also run on
-      # the two runners above. Running them here is what makes them mean
-      # something: this is the only place `probe` resolves its features through
-      # the Windows detection backend rather than through HWCAP or Apple's.
+      # the two runners above. Running them here is what makes `probe` mean
+      # something: this is the only place it resolves its features through the
+      # Windows detection backend rather than through HWCAP or Apple's.
+      #
+      # The AVX2 Q8_0 kernel is a different story, and this job is not its only
+      # home: it is gated on `target_arch`, so its bit-identity tests execute on
+      # ubuntu-latest too, and the arch-gated module asserts the host advertises
+      # AVX2 rather than skipping quietly. What no runner executes is the
+      # forward-pass test in tests/forward_avx2.rs — it needs a local GGUF via
+      # CAMELID_ENTERPRISE_TEST_MODEL, which nothing here sets, exactly as on
+      # macOS. End-to-end token equality is a local claim; bit-identity at the
+      # seam is the CI-enforced one.
       - run: cargo test -p camelid-enterprise-engine-windows
       # The server crate has Windows-only code and, before this job, no target
       # that compiled it. `--all-targets` so the test files compile too.
