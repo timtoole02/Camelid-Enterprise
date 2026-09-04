@@ -384,6 +384,7 @@ dependencies = [
  "deadpool-postgres",
  "rustls",
  "rustls-pemfile",
+ "serde_json",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",

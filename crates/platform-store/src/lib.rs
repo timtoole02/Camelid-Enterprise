@@ -6,15 +6,27 @@
 //! those stay in `camelid-enterprise-identity` until that separate question is
 //! settled.
 //!
-//! Today it holds exactly one thing: the shared per-organization request quota.
-//! The gateway's in-process `OrgQuota` counter is correct for one process and
-//! wrong for a replica set — two pods each admit `limit` requests per window, so
-//! the deployed manifest's two replicas admit up to `2 x limit` in a window and
-//! up to `4 x limit` across a window boundary. Admission here is one atomic
-//! statement against one row, so the limit is the deployment's, not the pod's.
+//! It holds two things.
 //!
-//! Three properties are load-bearing and are asserted by the integration tests
-//! in `tests/postgres_quota.rs`:
+//! **Shared per-organization request quota.** The gateway's in-process
+//! `OrgQuota` counter is correct for one process and wrong for a replica set —
+//! two pods each admit `limit` requests per window, so the deployed manifest's
+//! two replicas admit up to `2 x limit` in a window and up to `4 x limit`
+//! across a window boundary. Admission here is one atomic statement against one
+//! row, so the limit is the deployment's, not the pod's.
+//!
+//! **Aggregated evidence.** The gateway writes an audit line and a usage line
+//! per request, and each replica writes a serving receipt; all three are
+//! per-pod JSONL files that nobody joins. [`PlatformStore::ingest_evidence`]
+//! reads what those files contain into three tables keyed so they can be joined
+//! on the gateway's `request_id`. Ingestion is deliberately *not* on the
+//! request path: those writers are best-effort by design, and making a serving
+//! request wait on this database would trade the property they were built to
+//! protect for the aggregate they feed. It reads what survived and cannot
+//! retroactively complete it.
+//!
+//! Three properties are load-bearing for quota and are asserted by the
+//! integration tests in `tests/postgres_quota.rs`:
 //!
 //! - **Atomic.** Admission is a single autocommit statement whose `ON CONFLICT
 //!   DO UPDATE ... WHERE` takes the row lock and re-evaluates the limit after
@@ -44,7 +56,7 @@ use tokio_postgres::NoTls;
 /// Schema version this build understands. A store stamped higher was written by
 /// a newer gateway; refusing it is the only safe reading, exactly as the
 /// identity store refuses a `user_version` it does not know.
-pub const PLATFORM_SCHEMA_VERSION: i32 = 1;
+pub const PLATFORM_SCHEMA_VERSION: i32 = 2;
 
 /// Serializes schema initialization and quota reconfiguration across pods.
 /// Advisory locks need no table, which is what makes them usable *before* the
@@ -68,6 +80,11 @@ const RETENTION_WINDOWS: i64 = 3;
 /// Upper bound on rows one `DELETE` may remove, so no single statement runs
 /// long enough to matter.
 const SWEEP_BATCH_ROWS: i64 = 10_000;
+
+/// Lines sent to the database in one `INSERT`. A round trip per line is roughly
+/// an eightieth of the throughput of a batched one, which put ingestion below
+/// the rate a single busy gateway writes evidence.
+const INGEST_BATCH_LINES: usize = 1_000;
 
 /// Batches one sweep may run. One bounded batch per sweep could not keep up
 /// with a deployment producing more than `SWEEP_BATCH_ROWS` organization
@@ -140,6 +157,69 @@ CREATE TABLE quota_windows (
 CREATE INDEX quota_windows_window_start_epoch_idx
   ON quota_windows (window_start_epoch);
 INSERT INTO platform_schema_version (version) VALUES (1);";
+
+/// The evidence tables, named for the relations
+/// `docs/architecture/service-separation.md` already joins on paper.
+///
+/// Each row keeps the record as `jsonb` and lifts out only what a query has to
+/// filter or join on. The alternative — a column per field — would need a
+/// migration every time a writer learns to say something new, and these writers
+/// do: `posture` and `engine_sha256` joined the receipt in ADR 0004. A record
+/// this store cannot fully describe is still evidence worth keeping.
+///
+/// `line_sha256` is the digest of the line *as written*, which is what makes
+/// re-reading a file cheap to make idempotent. Note that it is not a checksum
+/// of the stored `jsonb`: `jsonb` normalizes key order and whitespace, so the
+/// digest ties a row to the bytes it came from rather than to its own column.
+///
+/// Identity by content cannot distinguish a line read twice from the same line
+/// written twice, and one stream can produce the latter. A receipt from a
+/// directly-reached replica has no `request_id`, so its only per-request fields
+/// are `ts`, `method`, `path` and `status`; `ts` is `f64` seconds, whose spacing
+/// at the current epoch is about 238ns. Two such requests that finish within one
+/// of those and agree on path and status write one line, and the second is
+/// counted as already present. The gateway's own streams cannot do this — a
+/// 128-bit `request_id` is on every line. Removing it for receipts means giving
+/// them something per-request of their own, which is a change to what a replica
+/// writes and not to this schema.
+///
+/// Nothing here deletes evidence. `sweep` covers `quota_windows` only, and it is
+/// deliberate that these tables have no retention: how long audit evidence is
+/// kept is a policy this crate should not pick a default for. It becomes urgent
+/// as soon as something ingests on a schedule, which nothing yet does.
+///
+/// A receipt's `request_id` is nullable because a replica reached directly, not
+/// through a gateway, is never given one. Such a receipt still records what
+/// served the request; it simply cannot be joined.
+const SCHEMA_V2: &str = "\
+CREATE TABLE gateway_audit (
+  line_sha256  bytea PRIMARY KEY,
+  request_id   text NOT NULL,
+  organization text,
+  ts           double precision NOT NULL,
+  record       jsonb NOT NULL
+);
+CREATE INDEX gateway_audit_request_id_idx ON gateway_audit (request_id);
+CREATE INDEX gateway_audit_organization_idx ON gateway_audit (organization);
+CREATE TABLE gateway_usage (
+  line_sha256  bytea PRIMARY KEY,
+  request_id   text NOT NULL,
+  organization text,
+  ts           double precision NOT NULL,
+  record       jsonb NOT NULL
+);
+CREATE INDEX gateway_usage_request_id_idx ON gateway_usage (request_id);
+CREATE INDEX gateway_usage_organization_idx ON gateway_usage (organization);
+-- No organization column: identity never reaches a replica, so a receipt
+-- cannot name one without inventing it.
+CREATE TABLE replica_receipt (
+  line_sha256 bytea PRIMARY KEY,
+  request_id  text,
+  ts          double precision NOT NULL,
+  record      jsonb NOT NULL
+);
+CREATE INDEX replica_receipt_request_id_idx ON replica_receipt (request_id);
+UPDATE platform_schema_version SET version = 2;";
 
 /// How a gateway reaches the platform store.
 ///
@@ -305,6 +385,190 @@ pub enum SweepOutcome {
     Deleted(u64),
 }
 
+/// Which append-only JSONL stream a line was read from.
+///
+/// The three are separate relations rather than one table with a discriminator
+/// because they answer different questions and only one of them can be missing
+/// a correlation id. A gateway writes the first two; every replica writes the
+/// third.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvidenceStream {
+    /// `--audit-log`: one line per handled request, written once the response
+    /// status is known.
+    GatewayAudit,
+    /// `--usage-log`: one terminal line per request, written when the response
+    /// body finishes, errors, or is dropped.
+    GatewayUsage,
+    /// `--serving-receipts`: one line per request, naming the replica that
+    /// served it.
+    ReplicaReceipt,
+}
+
+impl EvidenceStream {
+    fn table(self) -> &'static str {
+        match self {
+            Self::GatewayAudit => "gateway_audit",
+            Self::GatewayUsage => "gateway_usage",
+            Self::ReplicaReceipt => "replica_receipt",
+        }
+    }
+
+    /// Whether a line without a `request_id` is a record or a defect. Only a
+    /// receipt may lack one, and only because a replica reached directly was
+    /// never given one.
+    fn correlation_is_optional(self) -> bool {
+        matches!(self, Self::ReplicaReceipt)
+    }
+
+    /// `sha256(...)` is computed by the database over the same parameter that
+    /// is cast to `jsonb`, so the digest cannot drift from the row it
+    /// identifies. `ON CONFLICT DO NOTHING` is what makes re-reading a file
+    /// safe; `RETURNING` is how the caller learns which happened, since a
+    /// conflict returns no row.
+    fn insert_sql(self) -> &'static str {
+        match self {
+            Self::GatewayAudit => {
+                "INSERT INTO gateway_audit (line_sha256, request_id, organization, ts, record) \
+                 VALUES (sha256(convert_to($1, 'UTF8')), $2, $3, $4, $1::jsonb) \
+                 ON CONFLICT (line_sha256) DO NOTHING RETURNING true"
+            }
+            Self::GatewayUsage => {
+                "INSERT INTO gateway_usage (line_sha256, request_id, organization, ts, record) \
+                 VALUES (sha256(convert_to($1, 'UTF8')), $2, $3, $4, $1::jsonb) \
+                 ON CONFLICT (line_sha256) DO NOTHING RETURNING true"
+            }
+            Self::ReplicaReceipt => {
+                "INSERT INTO replica_receipt (line_sha256, request_id, ts, record) \
+                 VALUES (sha256(convert_to($1, 'UTF8')), $2, $3, $1::jsonb) \
+                 ON CONFLICT (line_sha256) DO NOTHING RETURNING true"
+            }
+        }
+    }
+
+    /// The same statement over parallel arrays instead of one row.
+    ///
+    /// A round trip per line put ingestion an order of magnitude below what one
+    /// gateway emits, so a file could be read more slowly than it was written
+    /// and never catch up. Rows affected is the count actually inserted, so the
+    /// caller still learns how many of a batch were already there without a
+    /// second query.
+    fn insert_batch_sql(self) -> &'static str {
+        match self {
+            Self::GatewayAudit => {
+                "INSERT INTO gateway_audit (line_sha256, request_id, organization, ts, record) \
+                 SELECT sha256(convert_to(l, 'UTF8')), r, o, t, l::jsonb \
+                 FROM unnest($1::text[], $2::text[], $3::text[], $4::float8[]) AS s(l, r, o, t) \
+                 ON CONFLICT (line_sha256) DO NOTHING"
+            }
+            Self::GatewayUsage => {
+                "INSERT INTO gateway_usage (line_sha256, request_id, organization, ts, record) \
+                 SELECT sha256(convert_to(l, 'UTF8')), r, o, t, l::jsonb \
+                 FROM unnest($1::text[], $2::text[], $3::text[], $4::float8[]) AS s(l, r, o, t) \
+                 ON CONFLICT (line_sha256) DO NOTHING"
+            }
+            Self::ReplicaReceipt => {
+                "INSERT INTO replica_receipt (line_sha256, request_id, ts, record) \
+                 SELECT sha256(convert_to(l, 'UTF8')), r, t, l::jsonb \
+                 FROM unnest($1::text[], $2::text[], $3::float8[]) AS s(l, r, t) \
+                 ON CONFLICT (line_sha256) DO NOTHING"
+            }
+        }
+    }
+}
+
+/// Whether the database refused this *record* or failed to answer at all.
+///
+/// Class 22 is SQL's data exception: the value cannot be represented. That is a
+/// property of the line, so it makes the line unreadable rather than the store
+/// unavailable, and it is the only way the two can be told apart from here. A
+/// client-side error carries no code and is never a verdict on the record.
+fn is_unstorable_record(error: &tokio_postgres::Error) -> bool {
+    error
+        .code()
+        .is_some_and(|state| state.code().starts_with("22"))
+}
+
+/// What became of one line.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Ingested {
+    Stored,
+    /// A byte-identical line was already stored. Reading a file twice is an
+    /// expected way to run this, not an error.
+    AlreadyPresent,
+    /// The line is not a record this store can hold, either because it does not
+    /// parse or because the database refused the value. Reported rather than
+    /// returned as an error because the last line of an append-only log written
+    /// by a process that was killed is routinely half a record, and one such
+    /// line must not cost the operator the whole file behind it.
+    ///
+    /// The two conditions are one variant on purpose: `serde_json` and `jsonb`
+    /// do not agree on what a record is — a `\u0000` escape is a string to one
+    /// and unstorable to the other — and a caller that has to retry cannot use
+    /// the distinction, because neither will ever succeed.
+    Unreadable(String),
+}
+
+/// What became of a whole file.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IngestSummary {
+    pub stored: u64,
+    pub already_present: u64,
+    pub unreadable: u64,
+}
+
+impl IngestSummary {
+    fn count_unreadable(&mut self, stream: EvidenceStream, why: &str) {
+        self.unreadable += 1;
+        tracing::warn!(
+            target: "camelid_platform_store",
+            table = stream.table(),
+            why,
+            "skipped an unreadable evidence line"
+        );
+    }
+}
+
+/// The fields lifted out of a record so rows can be joined and filtered
+/// without opening the `jsonb` on every query.
+struct EvidenceKeys {
+    request_id: Option<String>,
+    organization: Option<String>,
+    ts: f64,
+}
+
+/// Reads the join key and timestamp out of one line, or says why it is not a
+/// record. Deliberately strict about only those: everything else is preserved
+/// verbatim and interpreted by whoever queries it.
+fn evidence_keys(stream: EvidenceStream, line: &str) -> Result<EvidenceKeys, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|error| format!("not JSON: {error}"))?;
+    let serde_json::Value::Object(record) = value else {
+        return Err("not a JSON object".to_string());
+    };
+
+    let ts = match record.get("ts").and_then(serde_json::Value::as_f64) {
+        Some(ts) if ts.is_finite() => ts,
+        _ => return Err("no finite numeric `ts`".to_string()),
+    };
+
+    let request_id = match record.get("request_id") {
+        Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id.clone()),
+        Some(serde_json::Value::Null) | None if stream.correlation_is_optional() => None,
+        _ => return Err("no non-empty string `request_id`".to_string()),
+    };
+
+    let organization = match record.get("organization") {
+        Some(serde_json::Value::String(organization)) => Some(organization.clone()),
+        _ => None,
+    };
+
+    Ok(EvidenceKeys {
+        request_id,
+        organization,
+        ts,
+    })
+}
+
 pub struct PlatformStore {
     pool: Pool,
 }
@@ -351,6 +615,12 @@ impl PlatformStore {
         if version < 1 {
             transaction
                 .batch_execute(SCHEMA_V1)
+                .await
+                .map_err(database_error)?;
+        }
+        if version < 2 {
+            transaction
+                .batch_execute(SCHEMA_V2)
                 .await
                 .map_err(database_error)?;
         }
@@ -480,6 +750,153 @@ impl PlatformStore {
         }
         transaction.commit().await.map_err(database_error)?;
         Ok(SweepOutcome::Deleted(deleted))
+    }
+
+    /// Stores one JSONL line of evidence.
+    ///
+    /// A line already present is reported, not an error: the intended way to
+    /// run this is repeatedly over a growing file, and re-reading one must
+    /// converge rather than duplicate. A line that is not a record is reported
+    /// too, for the same reason the caller should not have to care — see
+    /// [`Ingested::Unreadable`].
+    pub async fn ingest_evidence_line(
+        &self,
+        stream: EvidenceStream,
+        line: &str,
+    ) -> Result<Ingested, PlatformStoreError> {
+        let keys = match evidence_keys(stream, line) {
+            Ok(keys) => keys,
+            Err(why) => return Ok(Ingested::Unreadable(why)),
+        };
+        self.insert_evidence(stream, line, &keys).await
+    }
+
+    async fn insert_evidence(
+        &self,
+        stream: EvidenceStream,
+        line: &str,
+        keys: &EvidenceKeys,
+    ) -> Result<Ingested, PlatformStoreError> {
+        let client = self.client().await?;
+        let stored = match stream {
+            EvidenceStream::GatewayAudit | EvidenceStream::GatewayUsage => {
+                client
+                    .query_opt(
+                        stream.insert_sql(),
+                        &[&line, &keys.request_id, &keys.organization, &keys.ts],
+                    )
+                    .await
+            }
+            EvidenceStream::ReplicaReceipt => {
+                client
+                    .query_opt(stream.insert_sql(), &[&line, &keys.request_id, &keys.ts])
+                    .await
+            }
+        };
+        match stored {
+            Ok(Some(_)) => Ok(Ingested::Stored),
+            Ok(None) => Ok(Ingested::AlreadyPresent),
+            Err(error) if is_unstorable_record(&error) => {
+                Ok(Ingested::Unreadable(error.to_string()))
+            }
+            Err(error) => Err(database_error(error)),
+        }
+    }
+
+    /// Stores every line of one evidence file.
+    ///
+    /// Takes the file's contents rather than a path so this crate stays out of
+    /// the business of finding, rotating and following logs, which is where the
+    /// deployment-shaped decisions live.
+    pub async fn ingest_evidence(
+        &self,
+        stream: EvidenceStream,
+        contents: &str,
+    ) -> Result<IngestSummary, PlatformStoreError> {
+        let mut summary = IngestSummary::default();
+        let mut batch: Vec<(&str, EvidenceKeys)> = Vec::new();
+        for line in contents.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match evidence_keys(stream, line) {
+                Ok(keys) => batch.push((line, keys)),
+                Err(why) => summary.count_unreadable(stream, &why),
+            }
+            if batch.len() == INGEST_BATCH_LINES {
+                self.ingest_batch(stream, &batch, &mut summary).await?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.ingest_batch(stream, &batch, &mut summary).await?;
+        }
+        Ok(summary)
+    }
+
+    /// One statement for up to [`INGEST_BATCH_LINES`] lines, falling back to one
+    /// statement per line only when the batch is refused.
+    ///
+    /// The fallback is what keeps a record the database will not take from
+    /// costing the whole batch. Retrying line by line is expensive, and it is
+    /// supposed to be: it happens once per batch that contains such a line, and
+    /// the alternative is discarding lines that are perfectly storable.
+    async fn ingest_batch(
+        &self,
+        stream: EvidenceStream,
+        batch: &[(&str, EvidenceKeys)],
+        summary: &mut IngestSummary,
+    ) -> Result<(), PlatformStoreError> {
+        let lines: Vec<&str> = batch.iter().map(|(line, _)| *line).collect();
+        let request_ids: Vec<Option<&str>> = batch
+            .iter()
+            .map(|(_, keys)| keys.request_id.as_deref())
+            .collect();
+        let timestamps: Vec<f64> = batch.iter().map(|(_, keys)| keys.ts).collect();
+
+        let client = self.client().await?;
+        let inserted = match stream {
+            EvidenceStream::GatewayAudit | EvidenceStream::GatewayUsage => {
+                let organizations: Vec<Option<&str>> = batch
+                    .iter()
+                    .map(|(_, keys)| keys.organization.as_deref())
+                    .collect();
+                client
+                    .execute(
+                        stream.insert_batch_sql(),
+                        &[&lines, &request_ids, &organizations, &timestamps],
+                    )
+                    .await
+            }
+            EvidenceStream::ReplicaReceipt => {
+                client
+                    .execute(
+                        stream.insert_batch_sql(),
+                        &[&lines, &request_ids, &timestamps],
+                    )
+                    .await
+            }
+        };
+        drop(client);
+
+        match inserted {
+            Ok(stored) => {
+                summary.stored += stored;
+                summary.already_present += batch.len() as u64 - stored;
+                Ok(())
+            }
+            Err(error) if is_unstorable_record(&error) => {
+                for (line, keys) in batch {
+                    match self.insert_evidence(stream, line, keys).await? {
+                        Ingested::Stored => summary.stored += 1,
+                        Ingested::AlreadyPresent => summary.already_present += 1,
+                        Ingested::Unreadable(why) => summary.count_unreadable(stream, &why),
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => Err(database_error(error)),
+        }
     }
 }
 

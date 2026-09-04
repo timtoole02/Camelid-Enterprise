@@ -12,6 +12,7 @@ deadpool-postgres = "0.14"
 # which would break `aarch64-cross-check` and fatten the gateway image.
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-pemfile = "2"
+serde_json.workspace = true
 tokio = { version = "1", features = ["rt", "time"] }
 tokio-postgres = "0.7"
 tokio-postgres-rustls = "0.13"
