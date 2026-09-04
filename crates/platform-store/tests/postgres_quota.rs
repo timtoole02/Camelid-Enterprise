@@ -600,6 +600,37 @@ async fn the_limit_is_the_stores_and_not_the_pods() {
     database.drop_database().await;
 }
 
+/// A limit nobody can read is an outage, not a spent window. Guarding only the
+/// conflict path left the insert branch — every organization's first request in
+/// every window — admitting against no limit at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_with_no_quota_configuration_admits_nobody() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let (quota, _) = PlatformQuota::connect(&database.config(), limit(10), window(3600))
+        .await
+        .expect("store");
+    quota.admit("org_seen").await.expect("admit");
+    database
+        .client()
+        .await
+        .execute("DELETE FROM quota_config", &[])
+        .await
+        .expect("lose the configuration");
+
+    for organization in ["org_seen", "org_never_seen"] {
+        match quota.admit(organization).await {
+            Err(QuotaRefusal::Unavailable(_)) => {}
+            Ok(()) => panic!("{organization} was admitted against no limit at all"),
+            Err(QuotaRefusal::Exceeded { .. }) => {
+                panic!("{organization} was told it had spent a quota nobody can read")
+            }
+        }
+    }
+    database.drop_database().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_window_can_be_reconfigured_but_only_on_purpose() {
     let Some(database) = TestDatabase::create().await else {
